@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/booking"
-	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/mailer"
 )
 
@@ -65,14 +65,7 @@ func (c *captureMailer) recipients() []string {
 // of the language the attendee actually booked in — even though the free-booking path (same
 // dispatchBookingConfirmation) got this right. See stripe_booking.go's SELECT.
 func TestConfirmPaidBooking_usesAttendeeLocale(t *testing.T) {
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	defer database.Close()
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("db.Migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 
 	h := New(database, slog.Default())
 	cap := &captureMailer{}

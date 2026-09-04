@@ -8,18 +8,13 @@ import (
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/handler"
 )
 
 func newTestHandler(t *testing.T) *handler.Handler {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("db.Migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	t.Cleanup(func() { database.Close() })
 	return handler.New(database, slog.Default())
 }

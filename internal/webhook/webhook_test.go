@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/webhook"
 )
 
@@ -23,13 +24,7 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("db.Migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	t.Cleanup(func() { database.Close() })
 
 	ctx := context.Background()
@@ -53,8 +48,7 @@ func newEnv(t *testing.T) *env {
 // ---------------------------------------------------------------------------
 
 func TestNew_badKeyReturnsError(t *testing.T) {
-	database, _ := db.OpenDB("sqlite://:memory:")
-	database.Migrate()
+	database := dbtest.Open(t)
 	defer database.Close()
 
 	if _, err := webhook.New(database, "not-hex"); err == nil {
@@ -66,8 +60,7 @@ func TestNew_badKeyReturnsError(t *testing.T) {
 }
 
 func TestNew_emptyKeyUsesEphemeral(t *testing.T) {
-	database, _ := db.OpenDB("sqlite://:memory:")
-	database.Migrate()
+	database := dbtest.Open(t)
 	defer database.Close()
 
 	svc, err := webhook.New(database, "")

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 )
 
 // TestHostAvailability_includesAdjacentUTCDayBooking is the regression guard for
@@ -16,14 +16,7 @@ import (
 // generation would offer a slot the host is already booked for (then 409 at
 // booking time). Everything is stored UTC — this guards the fetch *window*.
 func TestHostAvailability_includesAdjacentUTCDayBooking(t *testing.T) {
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer database.Close()
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	h := New(database, slog.New(slog.DiscardHandler))
 
 	// Host in NZ; a booking at 18 Jun 10:00 NZST = 17 Jun 22:00Z (previous UTC day).
@@ -60,14 +53,7 @@ func TestHostAvailability_includesAdjacentUTCDayBooking(t *testing.T) {
 // bookings.host_id) — otherwise their slots on other events stay open and they
 // get double-booked.
 func TestHostAvailability_includesNonPrimaryGroupSeat(t *testing.T) {
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer database.Close()
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	h := New(database, slog.New(slog.DiscardHandler))
 
 	database.Exec(`INSERT INTO users (id,email,name,iana_timezone,is_admin,is_owner) VALUES ('u1','a@example.com','A','UTC',1,1)`)

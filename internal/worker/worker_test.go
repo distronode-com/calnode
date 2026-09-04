@@ -14,19 +14,14 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/webhook"
 	"github.com/calnode/calnode/internal/worker"
 )
 
 func setup(t *testing.T) (*db.DB, *webhook.Service) {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("db.Migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	t.Cleanup(func() { database.Close() })
 
 	// Insert users so FK constraints are satisfied.

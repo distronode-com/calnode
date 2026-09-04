@@ -67,15 +67,32 @@ app you must `pnpm build` in `frontend/` **and** rebuild/restart the Go binary
 
 ---
 
-## 4. Persistence (SQLite) — and the single-connection rule
+## 4. Persistence (SQLite or PostgreSQL) — and the single-connection rule
 
-- `internal/db`: opens SQLite with **`SetMaxOpenConns(1)`** + `SetMaxIdleConns(1)`,
-  **WAL** journal mode, `busy_timeout=5000`. One writer connection by design.
-- Migrations: **goose** SQL files in `internal/db/migrations/` (00001→00029). Run
-  automatically on startup. `ALTER TABLE ADD COLUMN` is reversible-by-convention
-  only (SQLite can't easily drop columns).
+- `internal/db`: `OpenDB(DATABASE_URL)` picks the engine from the URL scheme. A
+  `postgres://` URL selects PostgreSQL; everything else (`sqlite://./rel`,
+  `sqlite:///abs`, `:memory:`, a bare path) selects SQLite, so every configuration
+  that worked before still works unchanged.
+- SQLite: **`SetMaxOpenConns(1)`** + `SetMaxIdleConns(1)`, **WAL** journal mode,
+  `busy_timeout=5000`. One writer connection by design.
+- PostgreSQL: a normal pool (10 open / 5 idle). The single connection above is a
+  SQLite constraint, not a Calnode design choice, and carrying it over would
+  serialise the whole instance on an engine with its own concurrency control.
+- The handle rebinds placeholders: Calnode's SQL is written once with `?` and
+  rewritten to `$1…$n` on PostgreSQL. ⚠️ `db.DB` embeds `*sql.DB` and the field is
+  exported, so `h.DB.Query(...)` compiles and **skips rebinding** — it passes on
+  SQLite and fails on PostgreSQL with a syntax error far from the edit. Call the
+  wrapper's own methods. The handful of statements no single spelling covers use
+  `Dialect.SQL(sqlite, postgres)`.
+- Timestamps are computed in Go (`internal/dbtime`) rather than by the engine;
+  `datetime('now')` and `strftime` do not exist in PostgreSQL. `dbtime` keeps the
+  two layouts the schema already stores, byte-identical to what SQLite wrote.
+- Migrations: **goose** SQL files in `internal/db/migrations/{sqlite,postgres}/` —
+  one schema, two spellings, same version numbers. Run automatically on startup.
+  `ALTER TABLE ADD COLUMN` is reversible-by-convention only (SQLite can't easily
+  drop columns).
 
-### ⚠️ The single-connection gotcha (bit us once)
+### ⚠️ The single-connection gotcha (bit us once) — SQLite only
 
 With one connection, **never run a query while a `rows` cursor from the same pool
 is still open** (i.e. inside a `for rows.Next()` loop). The open cursor holds the
@@ -85,9 +102,32 @@ exceeded` (not "database is locked"). **Pattern:** read the cursor fully into a
 slice, close it, then loop. See `Handler.assignedHosts`, the calendar reconciler,
 `Reschedule`. (Memory: `sqlite-single-connection`.)
 
-Bonus property: because booking transactions serialize on the single connection,
-the app-level overlap check reliably guards **all** hosts (not just the one the
-partial unique index covers) — no TOCTOU between concurrent bookings.
+This is a consequence of the single connection, so it does not apply on
+PostgreSQL — but the materialise-first pattern must stay, because it is the only
+thing keeping those three paths working on SQLite.
+
+### The double-booking guarantee, per engine
+
+The app-level overlap check reads "is this host free?" and then writes on the
+answer. What keeps that free of TOCTOU races differs:
+
+- **SQLite** — booking transactions serialize on the single connection, so the
+  check reliably guards **all** hosts, not just the one the partial unique index
+  covers.
+- **PostgreSQL** — the pool has many connections, so two overlapping bookings could
+  both clear the check. `booking.lockHosts` takes **`pg_advisory_xact_lock`** on
+  each host id before the first overlap read, in `Create`, `Reschedule` and
+  `ReassignHost`. The key is SHA-256 of `"calnode:booking:host:" + hostID`, first
+  eight bytes as an int64; ids are locked in sorted order so two transactions
+  needing the same pair cannot deadlock. The lock ends with the transaction, so
+  there is nothing to release. On SQLite it is a no-op.
+
+Both engines also carry the partial unique index
+`idx_bookings_no_double (host_id, start_at) WHERE status != 'cancelled'`. It catches
+an **identical** start time and nothing else — a partial overlap is two distinct
+keys — which is why the app-level check and the lock exist and why all three stay.
+Measured on PostgreSQL, 40 races between overlapping-but-not-identical slots: with
+the lock, 0 double bookings; without it, 39, of which the index caught one.
 
 ### Data model (key tables)
 
@@ -264,7 +304,7 @@ members.
   mode (role-tagged), then loads each host's availability **concurrently**
   (goroutines) — the slow part is one Google free/busy round-trip per host, so
   parallelizing turns N sequential calls into ~one call's latency. DB queries
-  serialize on the single connection (fast); only the network overlaps. Response
+  serialize on SQLite's single connection (fast); only the network overlaps. Response
   includes a `hosts` metadata map (id→name/avatar) for rendering faces.
 - **Busy** for a host = every non-cancelled booking they attend, via
   `booking_hosts` (NOT just `bookings.host_id`) — so a non-primary Group/fixed seat
@@ -704,7 +744,9 @@ as the desired state:
 ## 17. Cross-cutting gotchas (read before editing)
 
 1. **SQLite single connection** — never query inside an open cursor; materialize
-   first (§4).
+   first (§4). Harmless on PostgreSQL, but the pattern stays either way.
+   On PostgreSQL the same single connection is also what the booking overlap check
+   loses, which `pg_advisory_xact_lock` replaces (§4).
 2. **All times UTC** in storage; convert at the edges. The slot busy-window must be
    widened for tz boundaries.
 3. **Frontend is embedded at compile time** — `pnpm build` + rebuild Go to see

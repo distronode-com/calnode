@@ -14,19 +14,14 @@ import (
 
 	"github.com/calnode/calnode/internal/calendar"
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 )
 
 const testKeyHex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	t.Cleanup(func() { database.Close() })
 	return database
 }

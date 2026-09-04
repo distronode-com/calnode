@@ -7,19 +7,13 @@ import (
 
 	"github.com/calnode/calnode/internal/booking"
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/uid"
 )
 
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open test db: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate test db: %v", err)
-	}
+	database := dbtest.Open(t)
 	return database
 }
 

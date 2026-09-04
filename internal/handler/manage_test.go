@@ -12,6 +12,7 @@ import (
 
 	"github.com/calnode/calnode/internal/booking"
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/handler"
 	"github.com/calnode/calnode/internal/uid"
 )
@@ -20,13 +21,7 @@ import (
 // underlying DB so tests can interact with the DB directly (e.g. to issue tokens).
 func newTestHandlerDB(t *testing.T) (*handler.Handler, *db.DB) {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("db.Open: %v", err)
-	}
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("db.Migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	t.Cleanup(func() { database.Close() })
 	return handler.New(database, slog.Default()), database
 }

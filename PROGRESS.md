@@ -91,7 +91,7 @@ The negative control is the point: unlocked, the partial unique index caught 1 o
 through `dbtest.RequirePostgres`, and skips on SQLite saying the single-connection
 pool makes the race impossible.
 
-## Boundary 4 — Postgres test harness, docs, CI — IN PROGRESS
+## Boundary 4 — Postgres test harness, docs, CI — DONE
 
 `internal/dbtest` landed with Boundary 3 because the concurrency test needs it.
 `Open(t)` returns in-memory SQLite unless `CALNODE_TEST_POSTGRES_DSN` is set, in
@@ -101,9 +101,45 @@ which `dbtest_test.go` verifies against a live server rather than assuming
 (`TestSearchPathIsolation` passes; it also asserts the schema is invisible from the
 default path).
 
+- **22 test helpers across 18 files** repointed from `db.OpenDB("sqlite://:memory:")`
+  + `Migrate()` onto `dbtest.Open(t)`, so the whole suite follows the environment.
+  Deliberately left on SQLite: `dbtime_test.go` (it pins SQLite's own output),
+  `hostlock_internal_test.go` (it asserts the lock is a no-op there),
+  `connstore/destination_test.go` (bare driver, bespoke fragment schema), and the
+  `health_test.go` cases that want an *unmigrated* database.
+  `keyvault_test.go` keeps `sqlite://file::memory:?cache=shared&_fk=1` — a different
+  DSN for a reason, not a candidate for a blanket rewrite.
+- `docs/ARCHITECTURE.md` §4 amended in place, not appended to: the heading is now
+  both engines, the pool difference and the rebinding trap are stated, the cursor
+  gotcha is scoped to SQLite with the reason the pattern must stay anyway, and a new
+  "double-booking guarantee, per engine" subsection carries the single connection on
+  SQLite and the advisory lock on Postgres, with the index's real scope. §17's
+  gotcha 1 and one now-conditional aside in §8 follow it.
+- `.github/workflows/ci.yml` gains a `postgres` job: `postgres:17` service with a
+  `pg_isready` health check, the same steps as `check` minus `svelte-check`, and
+  `CALNODE_TEST_POSTGRES_DSN` set for `go test ./...`. Additive — with the variable
+  unset nothing about an existing run changes.
+
 ## Blocked on the database layer
 
 `internal/db/migrations/postgres` does not exist yet (`db.go` embeds
-`migrations/sqlite/*.sql` only), so nothing can migrate on Postgres and no
-Postgres-side run can be verified from this branch yet. The harness added in
-Boundary 4 calls `h.Migrate()` and starts working the moment those land.
+`migrations/sqlite/*.sql` only), so nothing can migrate on Postgres. Measured, not
+assumed: with the DSN set, `dbtest.Open` fails with
+`migrate postgres: run migrations: migrations/postgres directory does not exist`.
+Everything on this branch is written against `h.Migrate()` and starts working the
+moment those land; until then the new `postgres` CI job will be red for that reason
+and the Boundary 3 proof stands on the temporary hand-written schema recorded above.
+
+## Findings for whoever owns the schema
+
+1. **Booleans.** The tree stores them as `INTEGER` and compares them literally —
+   `email_login = 1`, `is_organizer = 1`, `is_destination = 1`, `boolToInt(...)`.
+   If the Postgres migrations declare those columns `BOOLEAN`, every one of those
+   comparisons is a type error. `SMALLINT`/`INTEGER` keeps the whole tree working
+   unchanged.
+2. **Text timestamp collation.** Timestamps are `TEXT` and compared
+   lexicographically on purpose (the recordings consent window, the job queue's
+   `run_at <= ?`). That is byte ordering under SQLite. Under a non-`C` Postgres
+   collation, ordering of mixed shapes (a space-separated `run_at` against a
+   `T`-separated one) is not guaranteed to match. Worth either `COLLATE "C"` on
+   those columns or a deliberate decision that it is safe.

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 	"github.com/calnode/calnode/internal/secret"
 )
 
@@ -17,13 +18,7 @@ const testKeyHex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead
 
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("newTestDB: open: %v", err)
-	}
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("newTestDB: migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	t.Cleanup(func() { database.Close() })
 	return database
 }

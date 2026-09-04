@@ -64,3 +64,59 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+  # The same suite against PostgreSQL. Separate job rather than a matrix on `check`
+  # because only the Go half is engine-dependent: svelte-check and pnpm build would
+  # run twice for no reason. The frontend build is still needed here, since the Go
+  # binary go:embeds frontend/build and `go build` fails without it.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: calnode_ci
+          POSTGRES_DB: calnode
+        ports:
+          - 5432:5432
+        # Without a health check the first connection races the server's startup,
+        # which fails as "connection refused" and reads like a bad DSN.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (required by the Go embed)
+        working-directory: frontend
+        run: pnpm build
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # CALNODE_TEST_POSTGRES_DSN is what switches internal/dbtest onto Postgres.
+      # Unset — which is every other job and every local run — the suite uses
+      # in-memory SQLite exactly as before, so this job is additive: it cannot change
+      # what a contributor sees.
+      - name: go test (PostgreSQL)
+        env:
+          CALNODE_TEST_POSTGRES_DSN: postgres://postgres:calnode_ci@127.0.0.1:5432/calnode?sslmode=disable
+        run: go test ./...

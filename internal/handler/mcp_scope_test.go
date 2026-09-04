@@ -11,20 +11,13 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/booking"
-	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 )
 
 // verifies MCP tools scope by role: a member sees/controls only the bookings they host,
 // while an admin/owner (and the unauthenticated stdio operator) see the whole workspace.
 func TestMCP_roleScoping(t *testing.T) {
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("db open: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	h := New(database, slog.Default())
 
 	// Owner (first user → owner+admin).

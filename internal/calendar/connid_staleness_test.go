@@ -7,19 +7,13 @@ import (
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 )
 
 // newTestDB opens a migrated in-memory DB with one user.
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	if _, err := database.Exec(
 		`INSERT INTO users (id, email, name, iana_timezone, is_admin, created_at)
 		 VALUES ('u1','u1@x.test','U','UTC',0,'2026-01-01T00:00:00Z')`); err != nil {

@@ -4,18 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtest"
 )
 
 func TestCanAutoGenerate(t *testing.T) {
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer database.Close()
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	ctx := context.Background()
 
 	seed := func(userID, provider, kind string) {
@@ -66,14 +59,7 @@ func TestCanAutoGenerate(t *testing.T) {
 // TestConnectionManagement covers the multi-calendar Service helpers: listing connections,
 // switching the single destination, and promoting a survivor when the destination is removed.
 func TestConnectionManagement(t *testing.T) {
-	database, err := db.OpenDB("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer database.Close()
-	if err := database.Migrate(); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	database := dbtest.Open(t)
 	ctx := context.Background()
 	if _, err := database.ExecContext(ctx,
 		`INSERT INTO users (id, email, name, iana_timezone, is_admin, created_at)
