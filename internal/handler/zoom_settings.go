@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/zoom"
 )
@@ -97,8 +98,8 @@ func (h *Handler) PatchZoomSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  zoom_client_id = '', zoom_client_secret_enc = '',
-			  updated_at = datetime('now')
-			WHERE id = 1`); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "zoom settings: clear", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -118,8 +119,8 @@ func (h *Handler) PatchZoomSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err = h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  zoom_client_id = ?, zoom_client_secret_enc = ?,
-			  updated_at = datetime('now')
-			WHERE id = 1`, req.ClientID, enc); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, req.ClientID, enc, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "zoom settings: update", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -128,8 +129,8 @@ func (h *Handler) PatchZoomSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  zoom_client_id = ?,
-			  updated_at = datetime('now')
-			WHERE id = 1`, req.ClientID); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, req.ClientID, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "zoom settings: update (keep secret)", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return

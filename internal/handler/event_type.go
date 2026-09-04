@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/uid"
 )
 
@@ -596,9 +597,10 @@ func (h *Handler) PatchEventType(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Archived != nil {
 		if *req.Archived {
-			// strftime literal (no bound value) — matches the DB's timestamp format;
-			// also force is_active off so the archived type stops taking bookings.
-			setClauses = append(setClauses, "archived_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+			// Bound value in the DB's millisecond timestamp format, which is what
+			// strftime('%Y-%m-%dT%H:%M:%fZ','now') wrote here before; also force
+			// is_active off so the archived type stops taking bookings.
+			set("archived_at", dbtime.NowMilli())
 			set("is_active", 0)
 		} else {
 			setClauses = append(setClauses, "archived_at = NULL")

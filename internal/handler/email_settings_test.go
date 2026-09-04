@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/mailer"
 )
 
@@ -61,7 +62,7 @@ func TestGetEmailSettings_nonAdminForbidden(t *testing.T) {
 	rawKey := "non-admin-get-email-test-key"
 	hash := sha256HexForTest(rawKey)
 	db.Exec(`INSERT INTO users (id, email, name, iana_timezone, is_admin) VALUES ('u4','other3@example.com','Other3','UTC',0)`)
-	db.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k4','u4','test',?,datetime('now'))`, hash)
+	db.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k4','u4','test',?,?)`, hash, dbtime.Now())
 
 	req := authReq(http.MethodGet, "/v1/settings/email", "", rawKey)
 	rec := httptest.NewRecorder()
@@ -216,7 +217,7 @@ func TestPatchEmailSettings_nonAdminForbidden(t *testing.T) {
 	rawKey := "non-admin-test-key-xyz"
 	hash := sha256HexForTest(rawKey)
 	db.Exec(`INSERT INTO users (id, email, name, iana_timezone, is_admin) VALUES ('u2','other@example.com','Other','UTC',0)`)
-	db.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k2','u2','test',?,datetime('now'))`, hash)
+	db.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k2','u2','test',?,?)`, hash, dbtime.Now())
 
 	req := authReq(http.MethodPatch, "/v1/settings/email", `{"smtp_host":"evil.smtp.example.com"}`, rawKey)
 	rec := httptest.NewRecorder()
@@ -286,7 +287,7 @@ func TestTestEmailConnection_nonAdminForbidden(t *testing.T) {
 	rawKey := "non-admin-conn-test-key"
 	hash := sha256HexForTest(rawKey)
 	db.Exec(`INSERT INTO users (id, email, name, iana_timezone, is_admin) VALUES ('u3','other2@example.com','Other2','UTC',0)`)
-	db.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k3','u3','test',?,datetime('now'))`, hash)
+	db.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k3','u3','test',?,?)`, hash, dbtime.Now())
 
 	req := authReq(http.MethodPost, "/v1/settings/email/test", "", rawKey)
 	rec := httptest.NewRecorder()

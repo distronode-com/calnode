@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/uid"
 	"github.com/calnode/calnode/internal/webhook"
@@ -117,10 +118,13 @@ func (h *Handler) RecordStart(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger.InfoContext(r.Context(), "livekit: egress started", "room", room, "egress_id", egressID, "filepath", filepath)
 	bookingID := strings.TrimPrefix(room, "booking-")
+	// created_at keeps the datetime('now') shape: parseRecordingTime reads it back
+	// and consentWindow turns it into the millisecond form the consent rows use.
+	now := dbtime.Now()
 	if _, err := h.db.ExecContext(r.Context(), `
 		INSERT INTO recordings (id, booking_id, room, egress_id, status, object_key, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 'active', ?, datetime('now'), datetime('now'))`,
-		uid.New(), bookingID, room, egressID, filepath); err != nil {
+		VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+		uid.New(), bookingID, room, egressID, filepath, now, now); err != nil {
 		h.logger.ErrorContext(r.Context(), "livekit: save recording", "error", err)
 	}
 	h.mergeRoomMeta(r.Context(), room, "recording", true) // drives the consent banner
@@ -167,8 +171,8 @@ func (h *Handler) finalizeActiveRecording(ctx context.Context, room string) {
 		h.logger.ErrorContext(ctx, "livekit: stop egress", "error", err, "egress", egressID)
 	}
 	if _, err := h.db.ExecContext(ctx,
-		`UPDATE recordings SET status = 'complete', updated_at = datetime('now')
-		 WHERE room = ? AND status = 'active'`, room); err != nil {
+		`UPDATE recordings SET status = 'complete', updated_at = ?
+		 WHERE room = ? AND status = 'active'`, dbtime.Now(), room); err != nil {
 		h.logger.ErrorContext(ctx, "livekit: close recording row", "error", err, "room", room)
 	}
 }
@@ -211,8 +215,8 @@ func (h *Handler) RecordConsent(w http.ResponseWriter, r *http.Request) {
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(room, participant_identity) DO UPDATE SET
 			name = excluded.name, decision = excluded.decision,
-			decided_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-		room, identity, name, decision); err != nil {
+			decided_at = ?`,
+		room, identity, name, decision, dbtime.NowMilli()); err != nil {
 		h.logger.ErrorContext(r.Context(), "livekit: record consent", "error", err, "room", room)
 		h.writeError(w, http.StatusInternalServerError, "could not record consent")
 		return
@@ -603,8 +607,8 @@ func (h *Handler) LiveKitWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE recordings SET status = ?, object_key = COALESCE(NULLIF(?,''), object_key),
-			       duration_s = ?, updated_at = datetime('now') WHERE egress_id = ?`,
-			status, key, durSec, info.EgressID); err != nil {
+			       duration_s = ?, updated_at = ? WHERE egress_id = ?`,
+			status, key, durSec, dbtime.Now(), info.EgressID); err != nil {
 			h.logger.ErrorContext(r.Context(), "livekit: finalize recording", "error", err)
 		}
 		if info.RoomName != "" {

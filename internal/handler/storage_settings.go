@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/calnode/calnode/internal/dbtime"
 )
 
 // The Storage settings page surfaces both object-storage uses in one place: the Litestream DB
@@ -54,7 +56,7 @@ func (h *Handler) PatchStorageSettings(w http.ResponseWriter, r *http.Request) {
 		v = 1
 	}
 	if _, err := h.db.ExecContext(r.Context(),
-		`UPDATE server_settings SET recordings_enabled = ?, updated_at = datetime('now') WHERE id = 1`, v); err != nil {
+		`UPDATE server_settings SET recordings_enabled = ?, updated_at = ? WHERE id = 1`, v, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "storage settings: update", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return

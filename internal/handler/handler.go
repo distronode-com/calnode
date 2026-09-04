@@ -12,6 +12,7 @@ import (
 	"github.com/calnode/calnode/internal/booking"
 	"github.com/calnode/calnode/internal/calendar"
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/mailer"
@@ -62,7 +63,8 @@ func (h *Handler) SetLiveKit(c *livekit.Client) {
 	// is no longer tracked), and would otherwise block the idempotent guard on its room forever.
 	if c != nil {
 		if _, err := h.db.Exec(
-			`UPDATE recordings SET status = 'complete', updated_at = datetime('now') WHERE status = 'active'`); err != nil {
+			`UPDATE recordings SET status = 'complete', updated_at = ? WHERE status = 'active'`,
+			dbtime.Now()); err != nil {
 			h.logger.Warn("livekit: sweep stale recordings", "error", err)
 		}
 	}

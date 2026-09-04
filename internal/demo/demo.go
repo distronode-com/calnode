@@ -8,6 +8,7 @@ package demo
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/calnode/calnode/internal/db"
@@ -36,8 +37,11 @@ func Seed(ctx context.Context, db *db.DB) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
+	// ON CONFLICT DO NOTHING rather than SQLite's INSERT OR IGNORE: both engines
+	// accept it. The conflict target is omitted, which covers any unique
+	// constraint, exactly as OR IGNORE did.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO server_settings (id) VALUES (1)`); err != nil {
+		`INSERT INTO server_settings (id) VALUES (1) ON CONFLICT DO NOTHING`); err != nil {
 		return fmt.Errorf("demo seed: server_settings: %w", err)
 	}
 
@@ -187,19 +191,27 @@ func Reset(ctx context.Context, db *db.DB) (err error) {
 		return err
 	}
 
-	// foreign_keys is connection-scoped and can't be toggled mid-transaction,
-	// so it's set here, before BeginTx — safe only because the pool is a
-	// single persistent connection (db.SetMaxOpenConns(1), internal/db/db.go).
-	// Needed because the delete order below is arbitrary relative to the
-	// schema's 46 migrations' worth of foreign-key relationships.
-	if _, ferr := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); ferr != nil {
-		return fmt.Errorf("demo reset: disable foreign keys: %w", ferr)
-	}
-	defer func() {
-		if _, ferr := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); ferr != nil && err == nil {
-			err = fmt.Errorf("demo reset: re-enable foreign keys: %w", ferr)
+	// The wipe order below is arbitrary relative to the schema's 46 migrations'
+	// worth of foreign keys, so referential integrity has to be stood down for it.
+	// The engines do that differently and neither way exists on the other:
+	//
+	//   SQLite — PRAGMA foreign_keys is connection-scoped and cannot be toggled
+	//   mid-transaction, so it is set before BeginTx. Safe only because the pool
+	//   is one persistent connection (db.SetMaxOpenConns(1), internal/db/db.go).
+	//
+	//   Postgres — there is no equivalent switch short of superuser rights, so a
+	//   single TRUNCATE naming every table CASCADEs through the foreign keys
+	//   instead. TRUNCATE is transactional there, so it stays inside the tx.
+	if isSQLite(db) {
+		if _, ferr := db.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); ferr != nil {
+			return fmt.Errorf("demo reset: disable foreign keys: %w", ferr)
 		}
-	}()
+		defer func() {
+			if _, ferr := db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); ferr != nil && err == nil {
+				err = fmt.Errorf("demo reset: re-enable foreign keys: %w", ferr)
+			}
+		}()
+	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -207,9 +219,21 @@ func Reset(ctx context.Context, db *db.DB) (err error) {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	for _, t := range tables {
-		if _, err = tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %q`, t)); err != nil {
-			return fmt.Errorf("demo reset: delete from %s: %w", t, err)
+	if isSQLite(db) {
+		for _, t := range tables {
+			if _, err = tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %q`, t)); err != nil {
+				return fmt.Errorf("demo reset: delete from %s: %w", t, err)
+			}
+		}
+	} else if len(tables) > 0 {
+		quoted := make([]string, len(tables))
+		for i, t := range tables {
+			quoted[i] = `"` + t + `"`
+		}
+		// #nosec G202 -- every name came from pg_tables in this schema, not from a request.
+		if _, err = tx.ExecContext(ctx,
+			`TRUNCATE TABLE `+strings.Join(quoted, ", ")+` CASCADE`); err != nil {
+			return fmt.Errorf("demo reset: truncate: %w", err)
 		}
 	}
 	if err = tx.Commit(); err != nil {
@@ -219,10 +243,20 @@ func Reset(ctx context.Context, db *db.DB) (err error) {
 	return Seed(ctx, db)
 }
 
+// isSQLite is a free function rather than an inline comparison because Reset and
+// listTables both name their handle "db", which shadows the package the Dialect
+// constants live in.
+func isSQLite(h *db.DB) bool { return h.Dialect() == db.DialectSQLite }
+
 func listTables(ctx context.Context, db *db.DB) ([]string, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT name FROM sqlite_master
-		WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'goose_db_version'`)
+	// sqlite_master has no Postgres counterpart. pg_tables scoped to
+	// current_schema() is the equivalent, and honouring the current schema is what
+	// lets a test run inside its own isolated one.
+	rows, err := db.QueryContext(ctx, db.Dialect().SQL(
+		`SELECT name FROM sqlite_master
+		 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'goose_db_version'`,
+		`SELECT tablename FROM pg_tables
+		 WHERE schemaname = current_schema() AND tablename != 'goose_db_version'`))
 	if err != nil {
 		return nil, fmt.Errorf("demo reset: list tables: %w", err)
 	}

@@ -734,7 +734,7 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 		if err := h.db.QueryRowContext(r.Context(), `
 			SELECT COUNT(*) FROM bookings b
 			JOIN booking_attendees a ON a.booking_id = b.id AND a.is_organizer = 1
-			WHERE a.email = ? COLLATE NOCASE AND b.created_at > ?`,
+			WHERE LOWER(a.email) = LOWER(?) AND b.created_at > ?`,
 			req.Email, windowStart).Scan(&recent); err != nil {
 			h.logger.ErrorContext(r.Context(), "create booking: per-email throttle", "error", err)
 		} else if recent >= maxBookingsPerEmailPerHour {
@@ -1862,9 +1862,13 @@ func (h *Handler) enqueueReminder(ctx context.Context, bookingID string, startAt
 		return fmt.Errorf("enqueue reminder: marshal payload: %w", err)
 	}
 
+	// ON CONFLICT DO NOTHING is the portable spelling of SQLite's INSERT OR
+	// IGNORE, and drops the duplicate that jobs' UNIQUE(type, payload) rejects
+	// when the same reminder is enqueued twice.
 	_, err = h.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
-		VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)`,
+		INSERT INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
+		VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)
+		ON CONFLICT DO NOTHING`,
 		uid.New(), string(payload), runAt.Format(time.RFC3339))
 	return err
 }
@@ -1953,8 +1957,9 @@ func (h *Handler) replaceReminderJobs(ctx context.Context, bookingID, etID strin
 			return fmt.Errorf("replace reminder jobs: marshal payload: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
-			VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)`,
+			INSERT INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
+			VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)
+			ON CONFLICT DO NOTHING`,
 			uid.New(), string(payload), runAt.Format(time.RFC3339)); err != nil {
 			return fmt.Errorf("replace reminder jobs: insert: %w", err)
 		}

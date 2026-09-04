@@ -9,6 +9,7 @@ import (
 
 	"github.com/calnode/calnode/internal/calendar"
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/gcal"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -98,8 +99,8 @@ func (h *Handler) PatchGoogleSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  google_client_id = '', google_client_secret_enc = '',
-			  updated_at = datetime('now')
-			WHERE id = 1`); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "google settings: clear", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -122,8 +123,8 @@ func (h *Handler) PatchGoogleSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err = h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  google_client_id = ?, google_client_secret_enc = ?,
-			  updated_at = datetime('now')
-			WHERE id = 1`, req.ClientID, enc); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, req.ClientID, enc, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "google settings: update", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -132,8 +133,8 @@ func (h *Handler) PatchGoogleSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  google_client_id = ?,
-			  updated_at = datetime('now')
-			WHERE id = 1`, req.ClientID); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, req.ClientID, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "google settings: update (keep secret)", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return

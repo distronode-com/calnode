@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/secret"
 )
 
@@ -57,7 +58,7 @@ func (h *Handler) PatchNotetakerSettings(w http.ResponseWriter, r *http.Request)
 			v = 1
 		}
 		if _, err := h.db.ExecContext(r.Context(),
-			`UPDATE server_settings SET notetaker_enabled = ?, updated_at = datetime('now') WHERE id = 1`, v); err != nil {
+			`UPDATE server_settings SET notetaker_enabled = ?, updated_at = ? WHERE id = 1`, v, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "notetaker settings: update enabled", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -72,7 +73,7 @@ func (h *Handler) PatchNotetakerSettings(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			if _, err := h.db.ExecContext(r.Context(),
-				`UPDATE server_settings SET stt_api_key_enc = ?, updated_at = datetime('now') WHERE id = 1`, enc); err != nil {
+				`UPDATE server_settings SET stt_api_key_enc = ?, updated_at = ? WHERE id = 1`, enc, dbtime.Now()); err != nil {
 				h.logger.ErrorContext(r.Context(), "notetaker settings: update key", "error", err)
 				h.writeError(w, http.StatusInternalServerError, "internal error")
 				return

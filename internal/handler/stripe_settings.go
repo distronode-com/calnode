@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/stripe"
 )
@@ -98,8 +99,8 @@ func (h *Handler) PatchStripeSettings(w http.ResponseWriter, r *http.Request) {
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET
 			  stripe_secret_key_enc = '', stripe_publishable_key = '', stripe_webhook_secret_enc = '',
-			  updated_at = datetime('now')
-			WHERE id = 1`); err != nil {
+			  updated_at = ?
+			WHERE id = 1`, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "stripe settings: clear", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -112,8 +113,8 @@ func (h *Handler) PatchStripeSettings(w http.ResponseWriter, r *http.Request) {
 	// Update publishable key (plain — it's a public value) when provided.
 	if req.PublishableKey != nil {
 		if _, err := h.db.ExecContext(r.Context(),
-			`UPDATE server_settings SET stripe_publishable_key = ?, updated_at = datetime('now') WHERE id = 1`,
-			*req.PublishableKey); err != nil {
+			`UPDATE server_settings SET stripe_publishable_key = ?, updated_at = ? WHERE id = 1`,
+			*req.PublishableKey, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "stripe settings: update pub key", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -128,7 +129,7 @@ func (h *Handler) PatchStripeSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := h.db.ExecContext(r.Context(),
-			`UPDATE server_settings SET stripe_secret_key_enc = ?, updated_at = datetime('now') WHERE id = 1`, enc); err != nil {
+			`UPDATE server_settings SET stripe_secret_key_enc = ?, updated_at = ? WHERE id = 1`, enc, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "stripe settings: update secret key", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -142,7 +143,7 @@ func (h *Handler) PatchStripeSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := h.db.ExecContext(r.Context(),
-			`UPDATE server_settings SET stripe_webhook_secret_enc = ?, updated_at = datetime('now') WHERE id = 1`, enc); err != nil {
+			`UPDATE server_settings SET stripe_webhook_secret_enc = ?, updated_at = ? WHERE id = 1`, enc, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "stripe settings: update webhook secret", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return

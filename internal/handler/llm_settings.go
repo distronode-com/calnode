@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -155,8 +156,11 @@ func (h *Handler) PatchLLMSettings(w http.ResponseWriter, r *http.Request) {
 		args = append(args, v)
 	}
 	if len(set) > 0 {
+		// updated_at's placeholder trails every "col = ?" in set, so its value
+		// trails every value in args.
+		args = append(args, dbtime.Now())
 		if _, err := h.db.ExecContext(r.Context(),
-			`UPDATE server_settings SET `+strings.Join(set, ", ")+`, updated_at = datetime('now') WHERE id = 1`, args...); err != nil { // #nosec G202 -- set is built above from hardcoded "col = ?" literals only; every value is bound via args...
+			`UPDATE server_settings SET `+strings.Join(set, ", ")+`, updated_at = ? WHERE id = 1`, args...); err != nil { // #nosec G202 -- set is built above from hardcoded "col = ?" literals only; every value is bound via args...
 			h.llmDBError(w, r, err)
 			return
 		}

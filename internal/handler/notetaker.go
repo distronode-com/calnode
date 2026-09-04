@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/stt"
@@ -59,13 +60,18 @@ func (h *Handler) deepgramKey(ctx context.Context) string {
 // reminders/webhooks enqueue via their own paths.)
 func (h *Handler) enqueueJob(ctx context.Context, typ string, payload any) error {
 	b, _ := json.Marshal(payload)
+	// run_at keeps the datetime('now') shape it has always had here. It is
+	// deliberately not the RFC 3339 the reminder path writes: the worker's
+	// "run_at <= ?" compares text, and the space-separated form sorts before any
+	// T-separated one, which is what makes these jobs due immediately.
+	now := dbtime.Now()
 	_, err := h.db.ExecContext(ctx, `
 		INSERT INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
-		VALUES (?, ?, ?, datetime('now'), 'pending', 0, 3)
+		VALUES (?, ?, ?, ?, 'pending', 0, 3)
 		ON CONFLICT(type, payload) DO UPDATE SET
-			status = 'pending', run_at = datetime('now'), attempts = 0,
+			status = 'pending', run_at = ?, attempts = 0,
 			last_error = NULL, locked_until = NULL`,
-		uid.New(), typ, string(b))
+		uid.New(), typ, string(b), now, now)
 	return err
 }
 
@@ -212,16 +218,16 @@ func (h *Handler) summarizeBooking(ctx context.Context, bookingID string) (strin
 		_, _ = h.db.ExecContext(ctx, `
 			INSERT INTO notes (id, booking_id, content, status)
 			VALUES (?, ?, '', 'empty')
-			ON CONFLICT(booking_id) DO UPDATE SET status = 'empty', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-			uid.New(), bookingID)
+			ON CONFLICT(booking_id) DO UPDATE SET status = 'empty', updated_at = ?`,
+			uid.New(), bookingID, dbtime.NowMilli())
 		return "", nil
 	}
 	if _, err := h.db.ExecContext(ctx, `
 		INSERT INTO notes (id, booking_id, content, status)
 		VALUES (?, ?, ?, 'complete')
 		ON CONFLICT(booking_id) DO UPDATE SET
-			content = excluded.content, status = 'complete', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-		uid.New(), bookingID, content); err != nil {
+			content = excluded.content, status = 'complete', updated_at = ?`,
+		uid.New(), bookingID, content, dbtime.NowMilli()); err != nil {
 		return "", err
 	}
 	h.logger.InfoContext(ctx, "notetaker: notes generated", "booking_id", bookingID, "chars", len(content))

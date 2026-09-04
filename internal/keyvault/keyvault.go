@@ -24,6 +24,7 @@ import (
 	"log/slog"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -224,16 +225,17 @@ func insertKeystoreRow(db *db.DB, label string, dek [32]byte, secret string) err
 	if err != nil {
 		return fmt.Errorf("keyvault: wrap DEK for %s: %w", label, err)
 	}
+	now := dbtime.Now()
 	_, err = db.Exec(`
 		INSERT INTO crypto_keystore
 		  (label, wrapped_dek, kdf, kdf_salt, kdf_params, dek_version, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+		VALUES (?, ?, ?, ?, ?, 1, ?, ?)
 		ON CONFLICT(label) DO UPDATE SET
 		  wrapped_dek = excluded.wrapped_dek,
 		  kdf_salt    = excluded.kdf_salt,
 		  kdf_params  = excluded.kdf_params,
 		  updated_at  = excluded.updated_at`,
-		label, wrapped, kdfArgon2id, salt, string(paramsJSON))
+		label, wrapped, kdfArgon2id, salt, string(paramsJSON), now, now)
 	return err
 }
 

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/calnode/calnode/internal/dbtime"
 )
 
 // Google tag ID formats. The ID is interpolated into a <script> URL, so it MUST be validated
@@ -189,10 +191,10 @@ func (h *Handler) PatchTrackingSettings(w http.ResponseWriter, r *http.Request) 
 	if _, err := h.db.ExecContext(r.Context(), `
 		UPDATE server_settings SET head_html = ?, tracking_csp_allow = ?,
 		       datalayer_enabled = ?, datalayer_fields = ?,
-		       gtm_container_id = ?, ga4_measurement_id = ?, updated_at = datetime('now')
+		       gtm_container_id = ?, ga4_measurement_id = ?, updated_at = ?
 		WHERE id = 1`,
 		req.HeadHTML, strings.TrimSpace(req.CSPAllow), enabled, string(fieldsJSON),
-		gtmID, ga4ID); err != nil {
+		gtmID, ga4ID, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "tracking settings: update", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return

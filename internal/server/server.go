@@ -20,6 +20,7 @@ import (
 	"github.com/calnode/calnode/internal/secret"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/stripe"
 	"github.com/calnode/calnode/internal/webhook"
 	"github.com/calnode/calnode/internal/worker"
@@ -564,11 +565,11 @@ func seedSMTPToDB(db *db.DB, cfg *config.Config, encKey [32]byte, logger *slog.L
 		  smtp_host = ?, smtp_port = ?, smtp_user = ?, smtp_pass_enc = ?,
 		  smtp_tls = ?, smtp_starttls = ?,
 		  email_from = ?, email_from_name = ?,
-		  updated_at = datetime('now')
+		  updated_at = ?
 		WHERE id = 1 AND smtp_host = ''`,
 		cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, passEnc,
 		boolToInt(cfg.SMTPTLS), boolToInt(cfg.SMTPStartTLS),
-		cfg.EmailFrom, cfg.EmailFromName)
+		cfg.EmailFrom, cfg.EmailFromName, dbtime.Now())
 	if err != nil {
 		logger.Warn("mailer: seed to database failed", "error", err)
 		return

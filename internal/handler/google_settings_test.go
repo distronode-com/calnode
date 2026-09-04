@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/handler"
 )
 
@@ -80,7 +81,7 @@ func TestGetGoogleSettings_nonAdminForbidden(t *testing.T) {
 	rawKey := "non-admin-google-test-key"
 	hash := sha256HexForTest(rawKey)
 	database.Exec(`INSERT INTO users (id, email, name, iana_timezone, is_admin) VALUES ('u-ng','ng@example.com','NG','UTC',0)`)
-	database.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k-ng','u-ng','test',?,datetime('now'))`, hash)
+	database.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k-ng','u-ng','test',?,?)`, hash, dbtime.Now())
 
 	req := authReq(http.MethodGet, "/v1/settings/google", "", rawKey)
 	rec := httptest.NewRecorder()
@@ -245,7 +246,7 @@ func TestPatchGoogleSettings_nonAdminForbidden(t *testing.T) {
 	rawKey := "non-admin-patch-google-key"
 	hash := sha256HexForTest(rawKey)
 	database.Exec(`INSERT INTO users (id, email, name, iana_timezone, is_admin) VALUES ('u-npg','npg@example.com','NPG','UTC',0)`)
-	database.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k-npg','u-npg','test',?,datetime('now'))`, hash)
+	database.Exec(`INSERT INTO api_keys (id, user_id, name, key_hash, created_at) VALUES ('k-npg','u-npg','test',?,?)`, hash, dbtime.Now())
 
 	rec := patchGoogleSettings(t, h, `{"client_id":"evil","client_secret":"evil"}`, rawKey)
 	if rec.Code != http.StatusForbidden {

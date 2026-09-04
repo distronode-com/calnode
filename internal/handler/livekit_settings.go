@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -91,7 +92,7 @@ func (h *Handler) PatchLiveKitSettings(w http.ResponseWriter, r *http.Request) {
 	if req.URL == "" {
 		if _, err := h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET livekit_url = '', livekit_api_key = '',
-			  livekit_api_secret_enc = '', updated_at = datetime('now') WHERE id = 1`); err != nil {
+			  livekit_api_secret_enc = '', updated_at = ? WHERE id = 1`, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "livekit settings: clear", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -119,15 +120,15 @@ func (h *Handler) PatchLiveKitSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, err = h.db.ExecContext(r.Context(), `
 			UPDATE server_settings SET livekit_url = ?, livekit_api_key = ?,
-			  livekit_api_secret_enc = ?, updated_at = datetime('now') WHERE id = 1`,
-			req.URL, req.APIKey, enc); err != nil {
+			  livekit_api_secret_enc = ?, updated_at = ? WHERE id = 1`,
+			req.URL, req.APIKey, enc, dbtime.Now()); err != nil {
 			h.logger.ErrorContext(r.Context(), "livekit settings: update", "error", err)
 			h.writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 	} else if _, err := h.db.ExecContext(r.Context(), `
 		UPDATE server_settings SET livekit_url = ?, livekit_api_key = ?,
-		  updated_at = datetime('now') WHERE id = 1`, req.URL, req.APIKey); err != nil {
+		  updated_at = ? WHERE id = 1`, req.URL, req.APIKey, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "livekit settings: update (keep secret)", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return

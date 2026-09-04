@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/i18n"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/disintegration/imaging"
@@ -219,8 +220,8 @@ func (h *Handler) PatchBranding(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.db.ExecContext(r.Context(), `
 		UPDATE server_settings SET business_name = ?, logo_height = ?, logo_opacity = ?,
-		       banner_opacity = ?, privacy_url = ?, terms_url = ?, fallback_locale = ?, updated_at = datetime('now')
-		WHERE id = 1`, req.BusinessName, req.LogoHeight, req.LogoOpacity, req.BannerOpacity, privacyURL, termsURL, req.FallbackLocale); err != nil {
+		       banner_opacity = ?, privacy_url = ?, terms_url = ?, fallback_locale = ?, updated_at = ?
+		WHERE id = 1`, req.BusinessName, req.LogoHeight, req.LogoOpacity, req.BannerOpacity, privacyURL, termsURL, req.FallbackLocale, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "branding settings: update", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
@@ -316,7 +317,7 @@ func (h *Handler) UploadBrandingLogo(w http.ResponseWriter, r *http.Request) {
 
 	logoURL := fmt.Sprintf("%s?v=%d", logoServePath, time.Now().Unix())
 	if _, err := h.db.ExecContext(r.Context(),
-		`UPDATE server_settings SET logo_url = ?, updated_at = datetime('now') WHERE id = 1`, logoURL); err != nil {
+		`UPDATE server_settings SET logo_url = ?, updated_at = ? WHERE id = 1`, logoURL, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "logo: update db", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
@@ -331,7 +332,7 @@ func (h *Handler) DeleteBrandingLogo(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = os.Remove(filepath.Join(h.brandingDir(), "logo.png"))
 	if _, err := h.db.ExecContext(r.Context(),
-		`UPDATE server_settings SET logo_url = '', updated_at = datetime('now') WHERE id = 1`); err != nil {
+		`UPDATE server_settings SET logo_url = '', updated_at = ? WHERE id = 1`, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "logo: delete db", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
@@ -443,7 +444,7 @@ func (h *Handler) UploadBrandingBanner(w http.ResponseWriter, r *http.Request) {
 
 	bannerURL := fmt.Sprintf("%s?v=%d", bannerServePath, time.Now().Unix())
 	if _, err := h.db.ExecContext(r.Context(),
-		`UPDATE server_settings SET banner_url = ?, updated_at = datetime('now') WHERE id = 1`, bannerURL); err != nil {
+		`UPDATE server_settings SET banner_url = ?, updated_at = ? WHERE id = 1`, bannerURL, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "banner: update db", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
@@ -458,7 +459,7 @@ func (h *Handler) DeleteBrandingBanner(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = os.Remove(filepath.Join(h.brandingDir(), "banner.png"))
 	if _, err := h.db.ExecContext(r.Context(),
-		`UPDATE server_settings SET banner_url = '', updated_at = datetime('now') WHERE id = 1`); err != nil {
+		`UPDATE server_settings SET banner_url = '', updated_at = ? WHERE id = 1`, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "banner: delete db", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return

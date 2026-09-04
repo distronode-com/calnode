@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -186,14 +187,14 @@ func (h *Handler) storeEmailSecret(ctx context.Context, db execer, which emailSe
 	var q string
 	switch which {
 	case secretResendAPIKey:
-		q = `UPDATE server_settings SET resend_api_key_enc = ?, updated_at = datetime('now') WHERE id = 1`
+		q = `UPDATE server_settings SET resend_api_key_enc = ?, updated_at = ? WHERE id = 1`
 	case secretSMTPPass:
-		q = `UPDATE server_settings SET smtp_pass_enc = ?, updated_at = datetime('now') WHERE id = 1`
+		q = `UPDATE server_settings SET smtp_pass_enc = ?, updated_at = ? WHERE id = 1`
 	default:
 		return fmt.Errorf("unknown email secret %d", int(which))
 	}
 
-	if _, err := db.ExecContext(ctx, q, enc); err != nil {
+	if _, err := db.ExecContext(ctx, q, enc, dbtime.Now()); err != nil {
 		return fmt.Errorf("store %s: %w", which, err)
 	}
 	return nil
@@ -266,11 +267,11 @@ func (h *Handler) PatchEmailSettings(w http.ResponseWriter, r *http.Request) {
 		  smtp_host = ?, smtp_port = ?, smtp_user = ?,
 		  smtp_tls = ?, smtp_starttls = ?,
 		  email_from = ?, email_from_name = ?,
-		  updated_at = datetime('now')
+		  updated_at = ?
 		WHERE id = 1`,
 		req.SMTPHost, req.SMTPPort, req.SMTPUser,
 		boolToInt(req.SMTPTLS), boolToInt(req.SMTPStartTLS),
-		req.EmailFrom, req.EmailFromName); err != nil {
+		req.EmailFrom, req.EmailFromName, dbtime.Now()); err != nil {
 		h.logger.ErrorContext(r.Context(), "email settings: update", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return

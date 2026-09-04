@@ -125,7 +125,7 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (*Booking, error) 
 			SELECT COUNT(*) FROM bookings b
 			JOIN booking_attendees a ON a.booking_id = b.id AND a.is_organizer = 1
 			WHERE b.event_type_id = ? AND b.status != 'cancelled'
-			  AND b.end_at > ? AND a.email = ? COLLATE NOCASE`,
+			  AND b.end_at > ? AND LOWER(a.email) = LOWER(?)`,
 			p.EventTypeID, now, p.Organizer.Email).Scan(&active); err != nil {
 			return nil, fmt.Errorf("booking: active-limit check: %w", err)
 		}
