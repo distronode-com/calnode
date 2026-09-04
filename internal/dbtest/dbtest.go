@@ -9,11 +9,13 @@
 package dbtest
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/calnode/calnode/internal/db"
 )
@@ -88,7 +90,7 @@ func openPostgres(t *testing.T, dsn string) *db.DB {
 	// below has been closed.
 	t.Cleanup(func() {
 		defer admin.Close()
-		if _, err := admin.Exec(`DROP SCHEMA ` + quoteIdent(schema) + ` CASCADE`); err != nil {
+		if err := dropSchema(admin, schema); err != nil {
 			t.Errorf("dbtest: drop schema %s: %v", schema, err)
 		}
 	})
@@ -103,6 +105,51 @@ func openPostgres(t *testing.T, dsn string) *db.DB {
 		t.Fatalf("dbtest: migrate postgres: %v", err)
 	}
 	return h
+}
+
+// dropSchema drops the test's schema, retrying while work the test started is still
+// finishing.
+//
+// Calnode's handlers do several things fire-and-forget: a booking spawns goroutines
+// to notify hosts, enqueue the webhook and enqueue reminders. Those outlive the test
+// BODY, and closing the pool does not stop them — database/sql closes idle
+// connections and lets in-flight statements run to completion. DROP SCHEMA CASCADE
+// needs an exclusive lock on every object in the schema, so it meets those
+// statements and PostgreSQL reports "deadlock detected" (SQLSTATE 40P01). It showed
+// up only under `go test ./...`, where packages run concurrently and everything is
+// slower — two handler tests out of several hundred, in a different pair each run.
+//
+// lock_timeout is what makes retrying viable: without it the DROP either waits
+// indefinitely or is chosen as a deadlock victim. With it the attempt fails fast and
+// cheaply, and the background work it was contending with has finished by the next
+// one. The budget is bounded so a schema that genuinely cannot be dropped is
+// reported rather than waited on forever — a leaked schema accumulates on a shared
+// server, so it is worth failing the test over.
+//
+// The statements run on ONE pinned connection because lock_timeout is per-session
+// and the pool would otherwise be free to apply the SET to a different connection
+// than the DROP. Neither statement has placeholders, so nothing needs rebinding.
+func dropSchema(admin *db.DB, schema string) error {
+	ctx := context.Background()
+	conn, err := admin.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close() //nolint:errcheck // returning the drop's error is more useful
+
+	if _, err := conn.ExecContext(ctx, `SET lock_timeout = '250ms'`); err != nil {
+		return err
+	}
+
+	const attempts = 20 // ~5s of wall clock, against background work that takes ms
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if _, lastErr = conn.ExecContext(ctx, `DROP SCHEMA `+quoteIdent(schema)+` CASCADE`); lastErr == nil {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return lastErr
 }
 
 // withSearchPath returns dsn with search_path pointed at schema. pgx passes

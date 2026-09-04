@@ -43,6 +43,31 @@ func TestConstraintPredicates(t *testing.T) {
 		assertOnly(t, err, "unique", db.IsUniqueViolation)
 	})
 
+	// ⛔ The case that distinguishes a correct implementation from a plausible one.
+	//
+	// SQLite reports a PRIMARY KEY collision as SQLITE_CONSTRAINT_PRIMARYKEY (1555),
+	// NOT as SQLITE_CONSTRAINT_UNIQUE (2067) — while still saying "UNIQUE constraint
+	// failed" in the message. So a predicate matching only 2067 passes the subtest
+	// above and fails here, and the old text match passed both by accident.
+	//
+	// This is not a theoretical shape: idempotency_keys.idempotency_key is a bare
+	// PRIMARY KEY, so claimIdempotencyKey's entire replay path depends on 1555 being
+	// classified as a unique violation. PostgreSQL reports 23505 for both, so this
+	// subtest is redundant there — and it runs there anyway, because "redundant on
+	// one engine" is exactly the assumption worth re-checking after a driver bump.
+	t.Run("unique via primary key", func(t *testing.T) {
+		key := uid.New()
+		if _, err := h.Exec(
+			`INSERT INTO idempotency_keys (idempotency_key, request_hash, created_at) VALUES (?, 'h', ?)`,
+			key, "2026-06-01T00:00:00Z"); err != nil {
+			t.Fatalf("seed idempotency key: %v", err)
+		}
+		_, err := h.Exec(
+			`INSERT INTO idempotency_keys (idempotency_key, request_hash, created_at) VALUES (?, 'h', ?)`,
+			key, "2026-06-01T00:00:00Z")
+		assertOnly(t, err, "primary key", db.IsUniqueViolation)
+	})
+
 	t.Run("check", func(t *testing.T) {
 		// bookings.status has CHECK (status IN ('confirmed','cancelled')).
 		_, err := h.Exec(`
@@ -73,6 +98,47 @@ func TestConstraintPredicates(t *testing.T) {
 		assertNone(t, errors.New("some unrelated failure"), "plain error")
 		assertNone(t, nil, "nil")
 	})
+
+	t.Run("unhandled constraint class", func(t *testing.T) {
+		// A NOT NULL violation is a constraint violation of a class nothing here
+		// classifies (SQLite 1299, PostgreSQL 23502). It must match none of the
+		// three, so a caller cannot turn it into a 409 by accident.
+		_, err := h.Exec(
+			`INSERT INTO users (id, email, name, iana_timezone) VALUES (?, ?, NULL, 'UTC')`,
+			uid.New(), uid.New()+"@example.com")
+		if err == nil {
+			t.Fatal("expected a NOT NULL violation")
+		}
+		assertNone(t, err, "not-null violation")
+	})
+}
+
+// TestConstraintTextFallback covers the branch no live engine reaches: an error that
+// arrives without its driver type still attached.
+//
+// It is engine-independent, so it needs no database. The branch exists for a driver
+// release that changes its error type, or a layer that reformats an error into a
+// plain one rather than wrapping it — in which case the message is the only signal
+// left, and answering from it beats returning a 500. Without this test the fallback
+// would be unexecuted code that reads like an accident.
+func TestConstraintTextFallback(t *testing.T) {
+	cases := []struct {
+		text string
+		want func(error) bool
+		name string
+	}{
+		{"boom: UNIQUE constraint failed: t.a", db.IsUniqueViolation, "unique"},
+		{"boom: CHECK constraint failed: n > 0", db.IsCheckViolation, "check"},
+		{"boom: FOREIGN KEY constraint failed", db.IsForeignKeyViolation, "foreign key"},
+	}
+	for _, c := range cases {
+		err := errors.New(c.text)
+		if !c.want(err) {
+			t.Errorf("%s: fallback did not recognise %q", c.name, c.text)
+		}
+	}
+	// And the fallback is still discriminating, not a catch-all.
+	assertNone(t, errors.New("NOT NULL constraint failed: t.a"), "not-null text")
 }
 
 // assertOnly checks that want recognises err and the other two predicates do not:
