@@ -10,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/slots"
 )
 
@@ -82,13 +83,13 @@ type Provider interface {
 // Service holds the configured providers and dispatches per-user operations to
 // whichever provider that user has connected.
 type Service struct {
-	db        *sql.DB
+	db        *db.DB
 	providers map[string]Provider
 	primary   string // default provider for new connections (first registered)
 }
 
 // NewService returns an empty Service. Register one provider per configured backend.
-func NewService(db *sql.DB) *Service {
+func NewService(db *db.DB) *Service {
 	return &Service{db: db, providers: map[string]Provider{}}
 }
 

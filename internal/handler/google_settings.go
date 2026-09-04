@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/calnode/calnode/internal/calendar"
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/gcal"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -21,7 +22,7 @@ type GoogleOAuthConfig struct {
 
 // LoadGoogleSettingsFromDB reads Google OAuth credentials from server_settings
 // and decrypts the client secret. Returns nil (not an error) when client_id is empty.
-func LoadGoogleSettingsFromDB(db *sql.DB, encKey [32]byte) (*GoogleOAuthConfig, error) {
+func LoadGoogleSettingsFromDB(db *db.DB, encKey [32]byte) (*GoogleOAuthConfig, error) {
 	var clientID, secretEnc string
 	err := db.QueryRow(`
 		SELECT google_client_id, google_client_secret_enc

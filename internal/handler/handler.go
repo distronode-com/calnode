@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"database/sql"
 	"encoding/hex"
 	"log/slog"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/calnode/calnode/internal/booking"
 	"github.com/calnode/calnode/internal/calendar"
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/mailer"
@@ -21,7 +21,7 @@ import (
 )
 
 type Handler struct {
-	db                *sql.DB
+	db                *db.DB
 	logger            *slog.Logger
 	bookingSvc        *booking.Service
 	mailer            mailer.Mailer
@@ -121,7 +121,7 @@ func (h *Handler) getLLM() *llm.Client {
 	return h.llm
 }
 
-func New(db *sql.DB, logger *slog.Logger) *Handler {
+func New(db *db.DB, logger *slog.Logger) *Handler {
 	whs, _ := webhook.New(db, "") // ephemeral key when no encryption key configured
 	return &Handler{
 		db:         db,

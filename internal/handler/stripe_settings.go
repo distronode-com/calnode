@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/stripe"
 )
@@ -19,7 +20,7 @@ type StripeConfig struct {
 
 // LoadStripeSettingsFromDB reads Stripe credentials from server_settings and decrypts the
 // secret key + webhook secret. Returns nil (not an error) when the secret key is unset.
-func LoadStripeSettingsFromDB(db *sql.DB, encKey [32]byte) (*StripeConfig, error) {
+func LoadStripeSettingsFromDB(db *db.DB, encKey [32]byte) (*StripeConfig, error) {
 	var secretEnc, pubKey, whEnc string
 	err := db.QueryRow(`
 		SELECT stripe_secret_key_enc, stripe_publishable_key, stripe_webhook_secret_enc

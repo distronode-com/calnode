@@ -1,7 +1,6 @@
 package keyvault_test
 
 import (
-	"database/sql"
 	"encoding/hex"
 	"testing"
 
@@ -9,13 +8,13 @@ import (
 	"github.com/calnode/calnode/internal/keyvault"
 )
 
-func newTestDB(t *testing.T) *sql.DB {
+func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.Open("sqlite://file::memory:?cache=shared&_fk=1")
+	database, err := db.OpenDB("sqlite://file::memory:?cache=shared&_fk=1")
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate test db: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })

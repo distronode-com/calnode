@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"net/http"
 	"time"
@@ -20,6 +19,7 @@ import (
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/secret"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/stripe"
 	"github.com/calnode/calnode/internal/webhook"
 	"github.com/calnode/calnode/internal/worker"
@@ -36,7 +36,7 @@ import (
 // uses it to back the HTTP server; the `calnode mcp` subcommand uses it to serve the
 // MCP server over stdio. The returned drain func blocks until the background worker
 // has finished its current poll cycle.
-func BuildHandler(ctx context.Context, cfg *config.Config, db *sql.DB, logger *slog.Logger) (*handler.Handler, func()) {
+func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger) (*handler.Handler, func()) {
 	h := handler.New(db, logger)
 	h.SetBaseURL(cfg.BaseURL)
 	h.SetPublicBaseURL(cfg.PublicBaseURL)
@@ -248,7 +248,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *sql.DB, logger *s
 
 // New wires services via BuildHandler, then registers all HTTP routes. It returns the
 // http.Handler and the worker drain func.
-func New(ctx context.Context, cfg *config.Config, db *sql.DB, logger *slog.Logger) (http.Handler, func()) {
+func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger) (http.Handler, func()) {
 	h, drain := BuildHandler(ctx, cfg, db, logger)
 	mux := http.NewServeMux()
 
@@ -542,7 +542,7 @@ func New(ctx context.Context, cfg *config.Config, db *sql.DB, logger *slog.Logge
 // seedSMTPToDB writes env-var SMTP settings into the DB on first boot so they
 // appear in the UI. Uses WHERE smtp_host = ” to avoid a check-then-act race
 // and to never overwrite settings the user has already saved via the UI.
-func seedSMTPToDB(db *sql.DB, cfg *config.Config, encKey [32]byte, logger *slog.Logger) {
+func seedSMTPToDB(db *db.DB, cfg *config.Config, encKey [32]byte, logger *slog.Logger) {
 	var passEnc string
 	if cfg.SMTPPass != "" {
 		enc, err := secret.Encrypt(encKey, cfg.SMTPPass)

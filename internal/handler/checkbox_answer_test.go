@@ -1,7 +1,6 @@
 package handler_test
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/handler"
 )
 
@@ -118,7 +118,7 @@ func TestCheckboxAnswer_normalisedToYesNo(t *testing.T) {
 }
 
 // ownerIDOf returns the sole workspace user's id.
-func ownerIDOf(t *testing.T, database *sql.DB) string {
+func ownerIDOf(t *testing.T, database *db.DB) string {
 	t.Helper()
 	var id string
 	if err := database.QueryRow(`SELECT id FROM users ORDER BY created_at LIMIT 1`).Scan(&id); err != nil {

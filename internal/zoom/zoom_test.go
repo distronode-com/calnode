@@ -2,7 +2,6 @@ package zoom
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -16,13 +15,13 @@ import (
 
 const testKeyHex = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
-func newTestDB(t *testing.T) *sql.DB {
+func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("newTestDB: open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("newTestDB: migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
@@ -38,7 +37,7 @@ func newTestClient(t *testing.T) *Client {
 	return c
 }
 
-func seedUser(t *testing.T, database *sql.DB, userID string) {
+func seedUser(t *testing.T, database *db.DB, userID string) {
 	t.Helper()
 	_, err := database.ExecContext(context.Background(), `
 		INSERT INTO users (id, email, name, iana_timezone, is_admin, created_at)
@@ -50,7 +49,7 @@ func seedUser(t *testing.T, database *sql.DB, userID string) {
 }
 
 // connectZoom inserts a non-expired Zoom token row for userID.
-func connectZoom(t *testing.T, database *sql.DB, userID, accessToken string) {
+func connectZoom(t *testing.T, database *db.DB, userID, accessToken string) {
 	t.Helper()
 	key, _ := secret.ParseKey(testKeyHex)
 	enc, err := secret.Encrypt(key, accessToken)

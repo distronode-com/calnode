@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -34,7 +35,7 @@ type LLMConfig struct {
 
 // LoadLLMSettingsFromDB reads the optional LLM settings from server_settings and decrypts
 // the api key. Returns nil (not an error) when the endpoint is empty (unconfigured).
-func LoadLLMSettingsFromDB(db *sql.DB, encKey [32]byte) (*LLMConfig, error) {
+func LoadLLMSettingsFromDB(db *db.DB, encKey [32]byte) (*LLMConfig, error) {
 	var endpoint, model, keyEnc string
 	var enabled int
 	err := db.QueryRow(`

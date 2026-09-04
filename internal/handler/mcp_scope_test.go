@@ -17,12 +17,12 @@ import (
 // verifies MCP tools scope by role: a member sees/controls only the bookings they host,
 // while an admin/owner (and the unauthenticated stdio operator) see the whole workspace.
 func TestMCP_roleScoping(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db open: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	h := New(database, slog.Default())

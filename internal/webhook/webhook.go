@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/uid"
 )
 
@@ -128,13 +129,13 @@ type BookingPayload struct {
 }
 
 type Service struct {
-	db  *sql.DB
+	db  *db.DB
 	key [32]byte
 }
 
 // New creates a Service. If encKeyHex is empty an ephemeral key is generated
 // (secrets won't survive restarts but the server still works in dev/test).
-func New(db *sql.DB, encKeyHex string) (*Service, error) {
+func New(db *db.DB, encKeyHex string) (*Service, error) {
 	s := &Service{db: db}
 	if encKeyHex != "" {
 		b, err := hex.DecodeString(encKeyHex)

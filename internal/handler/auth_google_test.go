@@ -2,7 +2,6 @@ package handler_test
 
 import (
 	"context"
-	"database/sql"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,13 +14,13 @@ import (
 
 // authTestSetup opens an in-memory DB, runs migrations, seeds one user, and
 // returns the handler, database handle, and the seeded user ID.
-func authTestSetup(t *testing.T) (*handler.Handler, *sql.DB, string) {
+func authTestSetup(t *testing.T) (*handler.Handler, *db.DB, string) {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
@@ -35,7 +34,7 @@ func authTestSetup(t *testing.T) (*handler.Handler, *sql.DB, string) {
 }
 
 // seedSession inserts a session row and returns the session id (cookie value).
-func seedSession(t *testing.T, db *sql.DB, userID string, ttl time.Duration) string {
+func seedSession(t *testing.T, db *db.DB, userID string, ttl time.Duration) string {
 	t.Helper()
 	sessID := "test-session-" + userID
 	expiresAt := time.Now().UTC().Add(ttl).Format(time.RFC3339)

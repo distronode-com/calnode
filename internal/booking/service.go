@@ -13,16 +13,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/uid"
 )
 
 // Service handles booking creation and lifecycle.
 type Service struct {
-	db *sql.DB
+	db *db.DB
 }
 
 // New returns a Service backed by db.
-func New(db *sql.DB) *Service {
+func New(db *db.DB) *Service {
 	return &Service{db: db}
 }
 
@@ -279,7 +280,7 @@ const bookingColumns = `id, event_type_id, host_id, start_at, end_at, status,
 // than matching bookings.host_id (which would miss a Group/fixed-host attendee).
 // excludeBookingID excludes the booking being modified from its own overlap check
 // (Reschedule/ReassignHost); pass "" when there's no booking yet to exclude (Create).
-func hostBusy(ctx context.Context, tx *sql.Tx, hostID, start, end, excludeBookingID string) (bool, error) {
+func hostBusy(ctx context.Context, tx *db.Tx, hostID, start, end, excludeBookingID string) (bool, error) {
 	var n int
 	err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM bookings b
@@ -377,7 +378,7 @@ func (s *Service) ValidateManageToken(ctx context.Context, rawToken string) (*Bo
 // be in priority order (lowest priority number first). "priority" takes the first
 // free host; "even" (and "soonest", which has no meaning once the slot is fixed)
 // take the least-loaded one.
-func pickRotationHost(ctx context.Context, tx *sql.Tx, eventTypeID, strategy string, free []string, now string) (string, error) {
+func pickRotationHost(ctx context.Context, tx *db.Tx, eventTypeID, strategy string, free []string, now string) (string, error) {
 	if strategy == "priority" {
 		return free[0], nil
 	}
@@ -387,7 +388,7 @@ func pickRotationHost(ctx context.Context, tx *sql.Tx, eventTypeID, strategy str
 // leastLoadedHost returns the candidate with the fewest upcoming (non-cancelled,
 // not-yet-ended) bookings for this event type — even-distribution round-robin.
 // Ties are broken by the order of candidates (caller passes them in priority order).
-func leastLoadedHost(ctx context.Context, tx *sql.Tx, eventTypeID string, candidates []string, now string) (string, error) {
+func leastLoadedHost(ctx context.Context, tx *db.Tx, eventTypeID string, candidates []string, now string) (string, error) {
 	ph := make([]string, len(candidates))
 	args := make([]any, 0, len(candidates)+2)
 	args = append(args, eventTypeID, now)

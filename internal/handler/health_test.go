@@ -13,11 +13,11 @@ import (
 
 func newTestHandler(t *testing.T) *handler.Handler {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
@@ -76,7 +76,7 @@ func TestReadyz_returns200_whenDBHealthy(t *testing.T) {
 func TestReadyz_returns503_whenNotMigrated(t *testing.T) {
 	// Open a DB but do NOT migrate it — the goose bookkeeping table is absent,
 	// so the schema-readiness gate must report not-ready.
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestVersion_returns200(t *testing.T) {
 }
 
 func TestReadyz_returns503_whenDBClosed(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}

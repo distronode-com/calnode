@@ -10,14 +10,14 @@ import (
 )
 
 // newTestDB opens a migrated in-memory DB with one user.
-func newTestDB(t *testing.T) *sql.DB {
+func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	if _, err := database.Exec(
@@ -28,7 +28,7 @@ func newTestDB(t *testing.T) *sql.DB {
 	return database
 }
 
-func seedConn(t *testing.T, database *sql.DB, id, userID, provider, email string, check, dest int) {
+func seedConn(t *testing.T, database *db.DB, id, userID, provider, email string, check, dest int) {
 	t.Helper()
 	if _, err := database.Exec(
 		`INSERT INTO calendar_connections
@@ -50,7 +50,7 @@ func seedConn(t *testing.T, database *sql.DB, id, userID, provider, email string
 
 // refreshToken reproduces what a provider does on token refresh: same account, brand new
 // row id.
-func refreshToken(t *testing.T, db *sql.DB, userID, provider, email, newID string) {
+func refreshToken(t *testing.T, db *db.DB, userID, provider, email, newID string) {
 	t.Helper()
 	var dest, check int
 	if err := db.QueryRow(

@@ -59,14 +59,14 @@ func main() {
 		slog.Warn("Google OAuth NOT configured — GOOGLE_CLIENT_ID is empty")
 	}
 
-	database, err := db.Open(cfg.DatabaseURL)
+	database, err := db.OpenDB(cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("failed to open database", "error", err)
 		os.Exit(1)
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		logger.Error("failed to run migrations", "error", err)
 		os.Exit(1)
 	}

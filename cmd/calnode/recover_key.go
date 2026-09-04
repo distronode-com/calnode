@@ -36,7 +36,7 @@ func runRecoverKey(args []string) {
 		dbURL = "sqlite://./data/calnode.db"
 	}
 
-	database, err := db.Open(dbURL)
+	database, err := db.OpenDB(dbURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: open database: %v\n", err)
 		os.Exit(1)

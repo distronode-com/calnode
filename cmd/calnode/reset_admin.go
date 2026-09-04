@@ -33,7 +33,7 @@ func runResetAdmin(args []string) {
 
 	cfg := config.Load()
 
-	database, err := db.Open(cfg.DatabaseURL)
+	database, err := db.OpenDB(cfg.DatabaseURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to open database: %v\n", err)
 		os.Exit(1)

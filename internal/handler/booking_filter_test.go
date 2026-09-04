@@ -1,13 +1,13 @@
 package handler_test
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/handler"
 )
 
@@ -53,7 +53,7 @@ func listIDs(r listResp) []string {
 }
 
 // seedBooking inserts one booking directly. start/end are RFC3339 UTC.
-func seedBooking(t *testing.T, db *sql.DB, id, etID, hostID, start, end, status string) {
+func seedBooking(t *testing.T, db *db.DB, id, etID, hostID, start, end, status string) {
 	t.Helper()
 	if _, err := db.Exec(
 		`INSERT INTO bookings (id, event_type_id, host_id, start_at, end_at, status)

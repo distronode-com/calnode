@@ -8,12 +8,12 @@ import (
 )
 
 func TestCanAutoGenerate(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	defer database.Close()
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	ctx := context.Background()
@@ -66,12 +66,12 @@ func TestCanAutoGenerate(t *testing.T) {
 // TestConnectionManagement covers the multi-calendar Service helpers: listing connections,
 // switching the single destination, and promoting a survivor when the destination is removed.
 func TestConnectionManagement(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	defer database.Close()
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	ctx := context.Background()

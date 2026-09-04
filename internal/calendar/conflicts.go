@@ -2,7 +2,8 @@ package calendar
 
 import (
 	"context"
-	"database/sql"
+
+	"github.com/calnode/calnode/internal/db"
 )
 
 // ConflictCalendarIDs resolves which calendar IDs of one connected account must be checked for
@@ -17,7 +18,7 @@ import (
 //
 // The caller must have no open rows cursor on the shared DB pool when calling this (the pool is
 // single-connection): drain and Close() any cursor first.
-func ConflictCalendarIDs(ctx context.Context, db *sql.DB, provider, userID, accountEmail, fallbackCalID string) ([]string, error) {
+func ConflictCalendarIDs(ctx context.Context, db *db.DB, provider, userID, accountEmail, fallbackCalID string) ([]string, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT calendar_id, check_conflicts FROM connection_calendars
 		 WHERE user_id = ? AND provider = ? AND account_email = ?`,

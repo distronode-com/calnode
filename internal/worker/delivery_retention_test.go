@@ -2,15 +2,16 @@ package worker_test
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 	"time"
+
+	"github.com/calnode/calnode/internal/db"
 )
 
 // seedDelivery inserts one webhook_deliveries row with an explicit status and
 // last_attempted_at. A nil attemptedAt leaves the column NULL, which is what a
 // delivery that has never been tried looks like.
-func seedDelivery(t *testing.T, database *sql.DB, id, webhookID, status string, attemptedAt *time.Time) {
+func seedDelivery(t *testing.T, database *db.DB, id, webhookID, status string, attemptedAt *time.Time) {
 	t.Helper()
 	var at any
 	if attemptedAt != nil {
@@ -24,7 +25,7 @@ func seedDelivery(t *testing.T, database *sql.DB, id, webhookID, status string, 
 	}
 }
 
-func deliveryExists(t *testing.T, database *sql.DB, id string) bool {
+func deliveryExists(t *testing.T, database *db.DB, id string) bool {
 	t.Helper()
 	var n int
 	if err := database.QueryRow(

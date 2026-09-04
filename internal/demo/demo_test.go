@@ -2,27 +2,26 @@ package demo_test
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/demo"
 )
 
-func newMigratedDB(t *testing.T) *sql.DB {
+func newMigratedDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 	return database
 }
 
-func assertCount(t *testing.T, ctx context.Context, database *sql.DB, table string, want int) {
+func assertCount(t *testing.T, ctx context.Context, database *db.DB, table string, want int) {
 	t.Helper()
 	var got int
 	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table).Scan(&got); err != nil {

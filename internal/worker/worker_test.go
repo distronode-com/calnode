@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -19,13 +18,13 @@ import (
 	"github.com/calnode/calnode/internal/worker"
 )
 
-func setup(t *testing.T) (*sql.DB, *webhook.Service) {
+func setup(t *testing.T) (*db.DB, *webhook.Service) {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
@@ -49,7 +48,7 @@ func setup(t *testing.T) (*sql.DB, *webhook.Service) {
 	return database, svc
 }
 
-func newWorker(t *testing.T, database *sql.DB, svc *webhook.Service) *worker.Worker {
+func newWorker(t *testing.T, database *db.DB, svc *webhook.Service) *worker.Worker {
 	t.Helper()
 	// Tests use a local httptest.Server, so bypass the production SSRF guard.
 	return worker.New(database, svc, slog.Default(),

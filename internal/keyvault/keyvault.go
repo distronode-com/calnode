@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/calnode/calnode/internal/db"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -69,7 +70,7 @@ func (v *Vault) DEKHex() string { return hex.EncodeToString(v.dek[:]) }
 //     working; wrap and store it.
 //  4. platformSecret empty + devMode → ephemeral random DEK; warn; never stored.
 //  5. platformSecret empty + !devMode → fatal error.
-func Open(db *sql.DB, platformSecret, recoverySecret string, devMode bool) (*Vault, error) {
+func Open(db *db.DB, platformSecret, recoverySecret string, devMode bool) (*Vault, error) {
 	if platformSecret == "" {
 		if devMode {
 			slog.Warn("keyvault: CALNODE_ENCRYPTION_KEY is not set — using an ephemeral key that will change on restart; stored secrets will become unreadable")
@@ -115,7 +116,7 @@ func Open(db *sql.DB, platformSecret, recoverySecret string, devMode bool) (*Vau
 
 // RotatePrimary re-wraps the DEK under a new platform secret. The data columns
 // are never touched. oldSecret must match the current CALNODE_ENCRYPTION_KEY.
-func RotatePrimary(db *sql.DB, oldSecret, newSecret string) error {
+func RotatePrimary(db *db.DB, oldSecret, newSecret string) error {
 	row := db.QueryRow(`
 		SELECT wrapped_dek, kdf_salt, kdf_params
 		FROM crypto_keystore WHERE label = ?`, labelPrimary)
@@ -137,7 +138,7 @@ func RotatePrimary(db *sql.DB, oldSecret, newSecret string) error {
 
 // RecoverPrimary uses the recovery secret (CALNODE_RECOVERY_SECRET) to
 // establish a new platform secret when the old one is lost.
-func RecoverPrimary(db *sql.DB, recoverySecret, newPlatformSecret string) error {
+func RecoverPrimary(db *db.DB, recoverySecret, newPlatformSecret string) error {
 	row := db.QueryRow(`
 		SELECT wrapped_dek, kdf_salt, kdf_params
 		FROM crypto_keystore WHERE label = ?`, labelRecovery)
@@ -171,7 +172,7 @@ func openExisting(platformSecret string, wrappedDEK, kdfSalt []byte, paramsJSON 
 	return &Vault{dek: dek}, nil
 }
 
-func freshInstall(db *sql.DB, platformSecret, recoverySecret string) (*Vault, error) {
+func freshInstall(db *db.DB, platformSecret, recoverySecret string) (*Vault, error) {
 	var dek [32]byte
 	if _, err := rand.Read(dek[:]); err != nil {
 		return nil, fmt.Errorf("keyvault: generate DEK: %w", err)
@@ -182,7 +183,7 @@ func freshInstall(db *sql.DB, platformSecret, recoverySecret string) (*Vault, er
 	return &Vault{dek: dek}, nil
 }
 
-func migrateLegacy(db *sql.DB, platformSecret, recoverySecret string) (*Vault, error) {
+func migrateLegacy(db *db.DB, platformSecret, recoverySecret string) (*Vault, error) {
 	// The existing deployment used platformSecret directly as the raw AES-256 key.
 	// Adopt that value as the DEK so all existing *_enc ciphertext keeps decrypting.
 	raw, err := hex.DecodeString(platformSecret)
@@ -197,7 +198,7 @@ func migrateLegacy(db *sql.DB, platformSecret, recoverySecret string) (*Vault, e
 	return &Vault{dek: dek}, nil
 }
 
-func storeKeystore(db *sql.DB, dek [32]byte, platformSecret, recoverySecret string) error {
+func storeKeystore(db *db.DB, dek [32]byte, platformSecret, recoverySecret string) error {
 	if err := insertKeystoreRow(db, labelPrimary, dek, platformSecret); err != nil {
 		return err
 	}
@@ -209,7 +210,7 @@ func storeKeystore(db *sql.DB, dek [32]byte, platformSecret, recoverySecret stri
 	return nil
 }
 
-func insertKeystoreRow(db *sql.DB, label string, dek [32]byte, secret string) error {
+func insertKeystoreRow(db *db.DB, label string, dek [32]byte, secret string) error {
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return fmt.Errorf("keyvault: generate salt for %s: %w", label, err)
@@ -291,7 +292,7 @@ func unwrapDEK(kek [32]byte, wrapped []byte) ([32]byte, error) {
 
 // hasEncryptedData returns true if any *_enc column contains data, which
 // signals a legacy deployment that used a raw key rather than the vault.
-func hasEncryptedData(db *sql.DB) (bool, error) {
+func hasEncryptedData(db *db.DB) (bool, error) {
 	checks := []string{
 		`SELECT 1 FROM server_settings WHERE smtp_pass_enc != '' AND smtp_pass_enc IS NOT NULL LIMIT 1`,
 		`SELECT 1 FROM server_settings WHERE google_client_secret_enc != '' AND google_client_secret_enc IS NOT NULL LIMIT 1`,

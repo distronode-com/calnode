@@ -65,12 +65,12 @@ func (c *captureMailer) recipients() []string {
 // of the language the attendee actually booked in — even though the free-booking path (same
 // dispatchBookingConfirmation) got this right. See stripe_booking.go's SELECT.
 func TestConfirmPaidBooking_usesAttendeeLocale(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
 	defer database.Close()
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 

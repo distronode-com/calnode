@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/zoom"
 )
@@ -20,7 +21,7 @@ type ZoomOAuthConfig struct {
 
 // LoadZoomSettingsFromDB reads the Zoom OAuth app credentials from server_settings and
 // decrypts the client secret. Returns nil (not an error) when client_id is empty.
-func LoadZoomSettingsFromDB(db *sql.DB, encKey [32]byte) (*ZoomOAuthConfig, error) {
+func LoadZoomSettingsFromDB(db *db.DB, encKey [32]byte) (*ZoomOAuthConfig, error) {
 	var clientID, secretEnc string
 	err := db.QueryRow(`
 		SELECT zoom_client_id, zoom_client_secret_enc

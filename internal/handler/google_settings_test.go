@@ -1,19 +1,19 @@
 package handler_test
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/handler"
 )
 
 // newGoogleHandler sets up a handler with a valid enc key and returns it
 // alongside the DB and API key for an admin user.
-func newGoogleHandler(t *testing.T) (*handler.Handler, *sql.DB, string) {
+func newGoogleHandler(t *testing.T) (*handler.Handler, *db.DB, string) {
 	t.Helper()
 	h, database, apiKey, _ := setupWorkspaceWithDB(t)
 	// Use the same key as calendar tests so gcal.New works if needed.

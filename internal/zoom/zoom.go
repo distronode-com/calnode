@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/oauth2"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/oauthstore"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -28,14 +29,14 @@ import (
 type Client struct {
 	config  *oauth2.Config
 	key     [32]byte
-	db      *sql.DB
+	db      *db.DB
 	logger  *slog.Logger
 	apiBase string // https://api.zoom.us/v2; overridable in tests
 }
 
 // New builds a Client from the instance's Zoom OAuth app credentials. encKeyHex is the
 // 64-char hex AES-256 server key (same one used for calendar tokens).
-func New(db *sql.DB, clientID, clientSecret, redirectURL, encKeyHex string) (*Client, error) {
+func New(db *db.DB, clientID, clientSecret, redirectURL, encKeyHex string) (*Client, error) {
 	key, err := secret.ParseKey(encKeyHex)
 	if err != nil {
 		return nil, fmt.Errorf("zoom: invalid encryption key: %w", err)

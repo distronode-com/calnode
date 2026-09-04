@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"testing"
 
@@ -19,16 +18,16 @@ const (
 
 type env struct {
 	svc *webhook.Service
-	db  *sql.DB
+	db  *db.DB
 }
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
@@ -54,8 +53,8 @@ func newEnv(t *testing.T) *env {
 // ---------------------------------------------------------------------------
 
 func TestNew_badKeyReturnsError(t *testing.T) {
-	database, _ := db.Open("sqlite://:memory:")
-	db.Migrate(database)
+	database, _ := db.OpenDB("sqlite://:memory:")
+	database.Migrate()
 	defer database.Close()
 
 	if _, err := webhook.New(database, "not-hex"); err == nil {
@@ -67,8 +66,8 @@ func TestNew_badKeyReturnsError(t *testing.T) {
 }
 
 func TestNew_emptyKeyUsesEphemeral(t *testing.T) {
-	database, _ := db.Open("sqlite://:memory:")
-	db.Migrate(database)
+	database, _ := db.OpenDB("sqlite://:memory:")
+	database.Migrate()
 	defer database.Close()
 
 	svc, err := webhook.New(database, "")

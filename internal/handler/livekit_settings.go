@@ -8,6 +8,7 @@ import (
 
 	"encoding/json"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -21,7 +22,7 @@ type LiveKitConfig struct {
 
 // LoadLiveKitSettingsFromDB reads the LiveKit server config from server_settings and decrypts
 // the API secret. Returns nil (not an error) when the URL or key is empty (= not configured).
-func LoadLiveKitSettingsFromDB(db *sql.DB, encKey [32]byte) (*LiveKitConfig, error) {
+func LoadLiveKitSettingsFromDB(db *db.DB, encKey [32]byte) (*LiveKitConfig, error) {
 	var url, apiKey, secretEnc string
 	err := db.QueryRow(`
 		SELECT livekit_url, livekit_api_key, livekit_api_secret_enc

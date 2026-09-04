@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/i18n"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/netutil"
@@ -25,7 +26,7 @@ const webhookDeliveryRetention = 30 * 24 * time.Hour
 
 // Worker polls the jobs table and processes pending jobs (webhooks, reminders).
 type Worker struct {
-	db         *sql.DB
+	db         *db.DB
 	svc        *webhook.Service
 	mailer     mailer.Mailer
 	logger     *slog.Logger
@@ -51,7 +52,7 @@ func WithMailer(m mailer.Mailer) func(*Worker) {
 	return func(w *Worker) { w.mailer = m }
 }
 
-func New(db *sql.DB, svc *webhook.Service, logger *slog.Logger, opts ...func(*Worker)) *Worker {
+func New(db *db.DB, svc *webhook.Service, logger *slog.Logger, opts ...func(*Worker)) *Worker {
 	w := &Worker{
 		db:       db,
 		svc:      svc,

@@ -32,7 +32,10 @@ func (h *Handler) Readyz(w http.ResponseWriter, r *http.Request) {
 	// Gate readiness on migrations: report not-ready until the schema is at the
 	// embedded target version, so a provisioner polling /readyz never routes
 	// traffic to an instance still mid-migration (or one that failed to migrate).
-	ready, err := db.SchemaReady(r.Context(), h.db)
+	//
+	// SchemaReady takes the bare pool: its one statement carries no placeholders,
+	// so there is nothing for the wrapper to rebind.
+	ready, err := db.SchemaReady(r.Context(), h.db.DB)
 	if err != nil || !ready {
 		if err != nil {
 			h.logger.ErrorContext(r.Context(), "readyz: migration check failed", "error", err)

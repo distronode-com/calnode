@@ -13,7 +13,7 @@ import (
 	"fmt"
 )
 
-// Execer is satisfied by both *sql.DB and *sql.Tx — ResolveFlags runs inside whichever
+// Execer is satisfied by both *db.DB and *db.Tx — ResolveFlags runs inside whichever
 // transaction the caller already opened for its own upsert.
 type Execer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row

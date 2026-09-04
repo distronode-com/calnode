@@ -27,6 +27,7 @@ import (
 
 	"github.com/calnode/calnode/internal/calendar"
 	"github.com/calnode/calnode/internal/connstore"
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/netutil"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/uid"
@@ -37,7 +38,7 @@ var _ calendar.Provider = (*Client)(nil)
 
 // Client manages CalDAV connections (encrypted app-password credentials) and access.
 type Client struct {
-	db     *sql.DB
+	db     *db.DB
 	key    [32]byte
 	logger *slog.Logger
 	hc     *http.Client
@@ -45,7 +46,7 @@ type Client struct {
 
 // New creates a Client. encKeyHex is the 64-char hex AES-256 encryption key (the same
 // instance key used to encrypt the other providers' tokens).
-func New(db *sql.DB, encKeyHex string) (*Client, error) {
+func New(db *db.DB, encKeyHex string) (*Client, error) {
 	b, err := hex.DecodeString(encKeyHex)
 	if err != nil || len(b) != 32 {
 		return nil, fmt.Errorf("caldav: invalid encryption key")

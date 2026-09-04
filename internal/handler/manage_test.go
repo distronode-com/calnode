@@ -2,7 +2,6 @@ package handler_test
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -19,13 +18,13 @@ import (
 
 // newTestHandlerDB creates a test handler and returns both the handler and the
 // underlying DB so tests can interact with the DB directly (e.g. to issue tokens).
-func newTestHandlerDB(t *testing.T) (*handler.Handler, *sql.DB) {
+func newTestHandlerDB(t *testing.T) (*handler.Handler, *db.DB) {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
@@ -33,7 +32,7 @@ func newTestHandlerDB(t *testing.T) (*handler.Handler, *sql.DB) {
 }
 
 // setupWorkspaceWithDB bootstraps a workspace and returns (handler, db, apiKey, userID).
-func setupWorkspaceWithDB(t *testing.T) (*handler.Handler, *sql.DB, string, string) {
+func setupWorkspaceWithDB(t *testing.T) (*handler.Handler, *db.DB, string, string) {
 	t.Helper()
 	h, database := newTestHandlerDB(t)
 
@@ -59,7 +58,7 @@ func setupWorkspaceWithDB(t *testing.T) (*handler.Handler, *sql.DB, string, stri
 // seedFullAvailabilityDB is seedFullAvailability's DB-direct sibling, for secondary
 // hosts (e.g. a round-robin rotation member) inserted straight into the DB rather than
 // through /v1/setup — they have no API key of their own to call the HTTP endpoint with.
-func seedFullAvailabilityDB(t *testing.T, database *sql.DB, userID string) {
+func seedFullAvailabilityDB(t *testing.T, database *db.DB, userID string) {
 	t.Helper()
 	for day := 0; day < 7; day++ {
 		if _, err := database.Exec(
@@ -95,7 +94,7 @@ func createBookingViaHTTP(t *testing.T, h *handler.Handler, slug, startAt string
 }
 
 // issueTestToken issues a manage token for bookingID via the booking service.
-func issueTestToken(t *testing.T, database *sql.DB, bookingID string) string {
+func issueTestToken(t *testing.T, database *db.DB, bookingID string) string {
 	t.Helper()
 	svc := booking.New(database)
 	tok, err := svc.IssueManageToken(context.Background(), bookingID)

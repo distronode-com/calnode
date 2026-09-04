@@ -7,10 +7,10 @@ package demo
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/uid"
 )
 
@@ -29,7 +29,7 @@ const (
 // Monday-Friday availability, and a few upcoming sample bookings. Rows are
 // inserted directly via SQL, bypassing the HTTP layer — the same pattern
 // already used by this package's handler test fixtures.
-func Seed(ctx context.Context, db *sql.DB) error {
+func Seed(ctx context.Context, db *db.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("demo seed: begin tx: %w", err)
@@ -181,7 +181,7 @@ func nextWeekdayAt(now time.Time, minDaysOut, hour int) time.Time {
 // dynamically rather than hardcoded, since this actively deletes data —
 // see docs/ARCHITECTURE.md's hardcoded-column-count incident for why a
 // stale hardcoded list is worth avoiding here specifically.
-func Reset(ctx context.Context, db *sql.DB) (err error) {
+func Reset(ctx context.Context, db *db.DB) (err error) {
 	tables, err := listTables(ctx, db)
 	if err != nil {
 		return err
@@ -219,7 +219,7 @@ func Reset(ctx context.Context, db *sql.DB) (err error) {
 	return Seed(ctx, db)
 }
 
-func listTables(ctx context.Context, db *sql.DB) ([]string, error) {
+func listTables(ctx context.Context, db *db.DB) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT name FROM sqlite_master
 		WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'goose_db_version'`)

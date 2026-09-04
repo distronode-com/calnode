@@ -30,14 +30,14 @@ func runMCPStdio(_ []string) {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
-	database, err := db.Open(cfg.DatabaseURL)
+	database, err := db.OpenDB(cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("mcp: failed to open database", "error", err)
 		os.Exit(1)
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		logger.Error("mcp: failed to run migrations", "error", err)
 		os.Exit(1)
 	}

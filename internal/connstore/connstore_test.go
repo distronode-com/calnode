@@ -2,26 +2,25 @@ package connstore
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
 )
 
-func newTestDB(t *testing.T) *sql.DB {
+func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("newTestDB: open: %v", err)
 	}
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("newTestDB: migrate: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
 	return database
 }
 
-func seedUser(t *testing.T, database *sql.DB, userID string) {
+func seedUser(t *testing.T, database *db.DB, userID string) {
 	t.Helper()
 	if _, err := database.ExecContext(context.Background(), `
 		INSERT INTO users (id, email, name, iana_timezone, is_admin, created_at)
@@ -31,7 +30,7 @@ func seedUser(t *testing.T, database *sql.DB, userID string) {
 	}
 }
 
-func seedConnection(t *testing.T, database *sql.DB, userID, provider, accountEmail string, checkConflicts, isDestination int) {
+func seedConnection(t *testing.T, database *db.DB, userID, provider, accountEmail string, checkConflicts, isDestination int) {
 	t.Helper()
 	if _, err := database.ExecContext(context.Background(), `
 		INSERT INTO calendar_connections

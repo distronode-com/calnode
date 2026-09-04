@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/secret"
 )
@@ -67,7 +68,7 @@ func BuildMailer(cfg SMTPConfig) (mailer.Mailer, EmailTransport) {
 // LoadEmailSettingsFromDB reads SMTP settings from server_settings and decrypts
 // the password. Returns nil (not an error) when smtp_host is empty — meaning
 // the settings have not been configured yet.
-func LoadEmailSettingsFromDB(db *sql.DB, encKey [32]byte) (*SMTPConfig, error) {
+func LoadEmailSettingsFromDB(db *db.DB, encKey [32]byte) (*SMTPConfig, error) {
 	var host, port, user, passEnc, from, fromName, resendEnc string
 	var smtpTLS, startTLS int
 	err := db.QueryRow(`
@@ -163,7 +164,7 @@ func (s emailSecret) String() string {
 	return "smtp_pass_enc"
 }
 
-// execer is the subset of *sql.DB / *sql.Tx the settings writes need, so they can be run
+// execer is the subset of *db.DB / *db.Tx the settings writes need, so they can be run
 // inside a transaction. Saving email settings touches up to three columns across separate
 // statements; without a transaction a failure partway leaves the instance holding, say, a
 // new SMTP host with the previous password.

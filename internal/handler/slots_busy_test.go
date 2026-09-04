@@ -16,12 +16,12 @@ import (
 // generation would offer a slot the host is already booked for (then 409 at
 // booking time). Everything is stored UTC — this guards the fetch *window*.
 func TestHostAvailability_includesAdjacentUTCDayBooking(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer database.Close()
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	h := New(database, slog.New(slog.DiscardHandler))
@@ -60,12 +60,12 @@ func TestHostAvailability_includesAdjacentUTCDayBooking(t *testing.T) {
 // bookings.host_id) — otherwise their slots on other events stay open and they
 // get double-booked.
 func TestHostAvailability_includesNonPrimaryGroupSeat(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer database.Close()
-	if err := db.Migrate(database); err != nil {
+	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	h := New(database, slog.New(slog.DiscardHandler))

@@ -20,6 +20,7 @@ import (
 
 	"github.com/calnode/calnode/internal/calendar"
 	"github.com/calnode/calnode/internal/connstore"
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/oauthstore"
 	"github.com/calnode/calnode/internal/secret"
 	"github.com/calnode/calnode/internal/uid"
@@ -39,13 +40,13 @@ func (c *Client) InvitesGuests() bool { return true }
 type Client struct {
 	config  *oauth2.Config
 	key     [32]byte
-	db      *sql.DB
+	db      *db.DB
 	logger  *slog.Logger
 	apiBase string // base URL for Calendar API; overridable in tests
 }
 
 // New creates a Client. encKeyHex is the 64-char hex AES-256 encryption key.
-func New(db *sql.DB, clientID, clientSecret, redirectURL, encKeyHex string) (*Client, error) {
+func New(db *db.DB, clientID, clientSecret, redirectURL, encKeyHex string) (*Client, error) {
 	b, err := hex.DecodeString(encKeyHex)
 	if err != nil || len(b) != 32 {
 		return nil, fmt.Errorf("gcal: invalid encryption key")
