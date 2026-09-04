@@ -159,6 +159,42 @@ causes — not the one the first triage suggested.
 
 Both suites green in one commit: 28/28 packages on SQLite, 28/28 on PostgreSQL.
 
+## Boundary 6 — constraint codes on BOTH engines — DONE
+
+The first version of `constraint.go` claimed modernc.org/sqlite exposes no error
+codes and matched SQLite on message text. That was false: it defines `type Error`
+with `Code()`, populated for every constraint class. Measured, not read:
+
+| violation | SQLite `Code()` | PostgreSQL SQLSTATE |
+|---|---|---|
+| UNIQUE | 2067 | 23505 |
+| PRIMARY KEY | **1555** | 23505 |
+| CHECK | 275 | 23514 |
+| FOREIGN KEY | 787 | 23503 |
+| NOT NULL | 1299 | 23502 |
+
+⛔ A PRIMARY KEY collision is **1555, not 2067**, while its message still reads
+"UNIQUE constraint failed". The text match caught both by accident;
+`Code() == 2067` alone would not. `idempotency_keys.idempotency_key` is a bare
+PRIMARY KEY, so the whole idempotent-replay path depends on 1555. Proved by
+deleting 1555 and re-running: the new `unique via primary key` subtest fails naming
+the code and the table, and `TestCreateBooking_idempotentReplay` returns
+`replay: 500`. `IsUniqueViolation` matches both codes; PostgreSQL needed no change.
+
+The text comparison is now a fallback only, for an error arriving without its
+driver type attached, and `TestConstraintTextFallback` executes that branch so it
+is not dead code. A driver error whose code does not match is a definite no and
+does not fall through — falling through would readmit a 1555 by its message after
+excluding it by code.
+
+Also fixed: the two intermittent handler failures under `go test ./...` were a flake
+in **my** `dbtest` harness, not the application. Handler goroutines are
+fire-and-forget (notify hosts, enqueue webhook, enqueue reminders) and outlive the
+test body; closing the pool does not stop an in-flight statement; `DROP SCHEMA
+CASCADE` needs an exclusive lock on every object and deadlocks against them
+(SQLSTATE 40P01). The drop now runs on a pinned connection with `lock_timeout` and
+retries within a bounded budget. Three consecutive full PostgreSQL runs clean.
+
 1. **Booleans — resolved.** The Postgres migrations declare them `SMALLINT`, so the
    tree's `= 1` comparisons and `boolToInt(...)` work unchanged. Only *computed*
    boolean expressions in SELECT lists needed a fix (Boundary 5, cause 2).
