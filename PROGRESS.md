@@ -49,9 +49,57 @@ clients verbatim, so folding them into one would change SQLite's stored bytes.
 
 Gates: `go build ./...`, `go vet ./...`, `gofmt -l`, `go test ./...` clean on SQLite.
 
-## Boundary 3 — advisory lock replacing the single-writer guarantee — TODO
+## Boundary 3 — advisory lock replacing the single-writer guarantee — DONE
 
-## Boundary 4 — Postgres test harness, docs, CI — TODO
+`internal/booking/hostlock.go`. `lockHosts` takes `pg_advisory_xact_lock` on each
+host whose availability the transaction is about to decide, at the start of the
+transaction and before the first `hostBusy` read. On SQLite it returns immediately
+and the `SetMaxOpenConns(1)` guarantee stands untouched.
+
+- **Key derivation**: `int64(binary.BigEndian.Uint64(sha256.Sum256("calnode:booking:host:" + hostID)[:8]))`.
+  Domain-separated so a future advisory lock on another entity cannot collide by
+  hashing the same raw id. A collision between two hosts would cost an unnecessary
+  serialisation, never a wrong answer, so stability and spread are what matter.
+  `hostlock_internal_test.go` pins two values computed independently of the code.
+- **Deadlock**: ids are sorted and deduplicated on a copy before locking, so two
+  transactions needing the same pair cannot take them in opposite orders. The copy
+  matters because `Create`'s `HostIDs` arrive in round-robin priority order.
+- **Three call sites, not two.** `Create` and `Reschedule` as specified, plus
+  `ReassignHost`, which has the identical check-then-write shape (`hostBusy`'s own
+  doc names all three). Leaving it out would have left a known hole.
+- `Reschedule` locks the primary host *before* reading `booking_hosts`, not after: a
+  concurrent `ReassignHost` holds that same key, and that ordering is what stops a
+  reassignment committing between the host-list read and the `UPDATE`.
+- `isUniqueViolation` now recognises Postgres by SQLSTATE 23505 (`pgconn.PgError`)
+  as well as SQLite by message. Without it the index's backstop returned a 500
+  instead of `ErrDoubleBooked` on Postgres.
+- The materialise-into-a-slice patterns in `Reschedule` and the calendar reconciler
+  are untouched; they are still required on SQLite.
+
+**Measured, against the live PostgreSQL 17 on 127.0.0.1:55432**, with a temporary
+hand-written minimal schema because `migrations/postgres` does not exist yet. Two
+goroutines race overlapping-but-not-identical slots (10:00–10:30 against
+10:15–10:45, so `idx_bookings_no_double` cannot catch it), 40 rounds:
+
+| | created | conflicts | overlapping pairs in the DB |
+|---|---|---|---|
+| lock in place | 40 | 40 | **0** |
+| lock disabled | 79 | 1 | **39** |
+
+The negative control is the point: unlocked, the partial unique index caught 1 of
+40. The committed test (`internal/booking/concurrency_test.go`) is the same race
+through `dbtest.RequirePostgres`, and skips on SQLite saying the single-connection
+pool makes the race impossible.
+
+## Boundary 4 — Postgres test harness, docs, CI — IN PROGRESS
+
+`internal/dbtest` landed with Boundary 3 because the concurrency test needs it.
+`Open(t)` returns in-memory SQLite unless `CALNODE_TEST_POSTGRES_DSN` is set, in
+which case each test gets its own `calnode_test_<random>` schema, created before
+the migrations and dropped after. Isolation rides on `search_path` in the DSN,
+which `dbtest_test.go` verifies against a live server rather than assuming
+(`TestSearchPathIsolation` passes; it also asserts the schema is invisible from the
+default path).
 
 ## Blocked on the database layer
 

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/uid"
 )
@@ -45,6 +47,17 @@ func (s *Service) Create(ctx context.Context, p CreateParams) (*Booking, error) 
 		return nil, fmt.Errorf("booking: begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	// Before the first overlap read: every host whose availability this
+	// transaction is about to decide on. See lockHosts — on SQLite it does
+	// nothing, on Postgres it is what makes the checks below race-free.
+	lockIDs := make([]string, 0, len(p.HostIDs)+len(p.RequiredHosts)+len(p.OptionalHosts))
+	lockIDs = append(lockIDs, p.HostIDs...)
+	lockIDs = append(lockIDs, p.RequiredHosts...)
+	lockIDs = append(lockIDs, p.OptionalHosts...)
+	if err := lockHosts(ctx, tx, lockIDs...); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
@@ -450,6 +463,15 @@ func (s *Service) Reschedule(ctx context.Context, bookingID string, newStart, ne
 		return nil, ErrAlreadyCancelled
 	}
 
+	// The primary host is locked before the host list is read, not after. A
+	// concurrent ReassignHost locks the booking's current primary too, so holding it
+	// here is what stops that reassignment committing between this read of
+	// booking_hosts and the UPDATE below — which would move the booking to a host
+	// whose availability was never checked.
+	if err := lockHosts(ctx, tx, b.HostID); err != nil {
+		return nil, err
+	}
+
 	// Every host on this booking keeps their seat through a reschedule, so each
 	// must be free at the new time — not just the primary. Read the host list
 	// fully before the per-host overlap queries (single-connection pool).
@@ -469,6 +491,12 @@ func (s *Service) Reschedule(ctx context.Context, bookingID string, newStart, ne
 	hostRows.Close()       // #nosec G104 -- rows already fully consumed above; nothing actionable on close error
 	if len(hostIDs) == 0 { // legacy booking with no booking_hosts rows
 		hostIDs = []string{b.HostID}
+	}
+	// Now the rest of the seat holders, still before any overlap check. Re-locking
+	// the primary is free: an advisory lock already held by this transaction is
+	// re-entrant and is released once, at commit.
+	if err := lockHosts(ctx, tx, hostIDs...); err != nil {
+		return nil, err
 	}
 	for _, hid := range hostIDs {
 		busy, err := hostBusy(ctx, tx, hid, startStr, endStr, bookingID)
@@ -527,6 +555,13 @@ func (s *Service) ReassignHost(ctx context.Context, bookingID, newHostID string)
 
 	startStr := b.StartAt.UTC().Format(time.RFC3339Nano)
 	endStr := b.EndAt.UTC().Format(time.RFC3339Nano)
+
+	// Both hosts: the new one because its availability is being decided, the old
+	// one because a concurrent Reschedule of this booking holds that same key and
+	// must not interleave with the host change.
+	if err := lockHosts(ctx, tx, b.HostID, newHostID); err != nil {
+		return nil, err
+	}
 
 	// The new host must be free at this time across everything they attend.
 	busy, err := hostBusy(ctx, tx, newHostID, startStr, endStr, bookingID)
@@ -653,7 +688,19 @@ func scanBooking(s scanner) (*Booking, error) {
 	return &b, nil
 }
 
-// isUniqueViolation reports whether err is a SQLite UNIQUE constraint failure.
+// isUniqueViolation reports whether err is a unique-constraint violation — on this
+// booking path, idx_bookings_no_double rejecting an exact start-time collision that
+// the app-level overlap check did not catch. Both engines are recognised: Postgres
+// by SQLSTATE 23505, which is the only stable handle on it (the message text is
+// localised by the server's lc_messages), and SQLite by its message, which is what
+// modernc.org/sqlite surfaces.
 func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgUniqueViolation
+	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
+
+// pgUniqueViolation is PostgreSQL's SQLSTATE for unique_violation.
+const pgUniqueViolation = "23505"
