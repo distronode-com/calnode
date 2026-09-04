@@ -3,10 +3,12 @@ package db_test
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"testing"
 
 	"github.com/calnode/calnode/internal/db"
@@ -488,4 +490,127 @@ func TestPostgres_partialUniqueIndexEnforced(t *testing.T) {
 		"b3", "e1", "h1", "2026-01-01T10:00:00.000Z", "2026-01-01T10:30:00.000Z"); err != nil {
 		t.Errorf("re-booking a cancelled slot was refused: %v", err)
 	}
+}
+
+// TestPostgres_schemaMatchesSQLite migrates both engines and compares the result,
+// table by table and column by column. It is the check the translation actually
+// needs: every other test here says a specific thing survived, and this one says
+// nothing was quietly dropped, renamed or added along the way.
+//
+// Names only, not types: TEXT versus text and SMALLINT versus integer are the
+// translation working as intended, and the types that do matter are pinned by
+// TestPostgres_flagColumnsStayIntegers.
+func TestPostgres_schemaMatchesSQLite(t *testing.T) {
+	postgres := openTestPostgres(t)
+	if err := postgres.Migrate(); err != nil {
+		t.Fatalf("Migrate(postgres): %v", err)
+	}
+
+	sqlite, err := db.OpenDB("sqlite://:memory:")
+	if err != nil {
+		t.Fatalf("db.OpenDB(sqlite): %v", err)
+	}
+	defer sqlite.Close()
+	if err := sqlite.Migrate(); err != nil {
+		t.Fatalf("Migrate(sqlite): %v", err)
+	}
+
+	sqliteSchema := sqliteColumns(t, sqlite)
+	postgresSchema := postgresColumns(t, postgres)
+
+	// Guard against a vacuous pass: an empty map on either side would satisfy
+	// every comparison below.
+	if len(sqliteSchema) < 30 {
+		t.Fatalf("only %d tables found on SQLite; the comparison would prove nothing", len(sqliteSchema))
+	}
+
+	for table, want := range sqliteSchema {
+		got, ok := postgresSchema[table]
+		if !ok {
+			t.Errorf("table %q exists on SQLite and not on Postgres", table)
+			continue
+		}
+		if !slices.Equal(want, got) {
+			t.Errorf("table %q columns differ\n sqlite: %v\n  pgsql: %v", table, want, got)
+		}
+	}
+	for table := range postgresSchema {
+		if _, ok := sqliteSchema[table]; !ok {
+			t.Errorf("table %q exists on Postgres and not on SQLite", table)
+		}
+	}
+}
+
+// sqliteColumns maps table name to sorted column names, skipping SQLite's own
+// bookkeeping tables (sqlite_sequence appears because goose's version table uses
+// AUTOINCREMENT).
+func sqliteColumns(t *testing.T, handle *db.DB) map[string][]string {
+	t.Helper()
+
+	rows, err := handle.Query(
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		t.Fatalf("list sqlite tables: %v", err)
+	}
+	tables := scanStrings(t, rows)
+
+	schema := make(map[string][]string, len(tables))
+	for _, table := range tables {
+		// PRAGMA table_info takes no placeholder; the name comes from
+		// sqlite_master, not from input.
+		rows, err := handle.Query(`SELECT name FROM pragma_table_info('` + table + `')`)
+		if err != nil {
+			t.Fatalf("columns of %q: %v", table, err)
+		}
+		cols := scanStrings(t, rows)
+		slices.Sort(cols)
+		schema[table] = cols
+	}
+	return schema
+}
+
+// postgresColumns maps table name to sorted column names for the test schema.
+func postgresColumns(t *testing.T, handle *db.DB) map[string][]string {
+	t.Helper()
+
+	rows, err := handle.Query(
+		`SELECT table_name FROM information_schema.tables
+		 WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+		 ORDER BY table_name`)
+	if err != nil {
+		t.Fatalf("list postgres tables: %v", err)
+	}
+	tables := scanStrings(t, rows)
+
+	schema := make(map[string][]string, len(tables))
+	for _, table := range tables {
+		rows, err := handle.Query(
+			`SELECT column_name FROM information_schema.columns
+			 WHERE table_schema = current_schema() AND table_name = ?`, table)
+		if err != nil {
+			t.Fatalf("columns of %q: %v", table, err)
+		}
+		cols := scanStrings(t, rows)
+		slices.Sort(cols)
+		schema[table] = cols
+	}
+	return schema
+}
+
+func scanStrings(t *testing.T, rows *sql.Rows) []string {
+	t.Helper()
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	return out
 }
