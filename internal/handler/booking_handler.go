@@ -15,6 +15,7 @@ import (
 
 	"github.com/calnode/calnode/internal/booking"
 	"github.com/calnode/calnode/internal/calendar"
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/i18n"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/slots"
@@ -1843,10 +1844,9 @@ func (h *Handler) loadHostPrefs(ctx context.Context, hostID string) (hostPrefs, 
 	return p, nil
 }
 
-// isForeignKeyViolation reports whether err is a SQLite FOREIGN KEY constraint failure.
-func isForeignKeyViolation(err error) bool {
-	return strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
-}
+// isForeignKeyViolation reports whether err is a foreign-key violation, on either
+// engine. A thin wrapper so the two call sites keep reading as a local predicate.
+func isForeignKeyViolation(err error) bool { return db.IsForeignKeyViolation(err) }
 
 // enqueueReminder inserts a reminder.send job scheduled hoursBefore hours before startAt.
 // If the computed run_at has already passed, the job fires on the next poll cycle.

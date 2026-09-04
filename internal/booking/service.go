@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
-
 	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/uid"
 )
@@ -690,17 +688,9 @@ func scanBooking(s scanner) (*Booking, error) {
 
 // isUniqueViolation reports whether err is a unique-constraint violation — on this
 // booking path, idx_bookings_no_double rejecting an exact start-time collision that
-// the app-level overlap check did not catch. Both engines are recognised: Postgres
-// by SQLSTATE 23505, which is the only stable handle on it (the message text is
-// localised by the server's lc_messages), and SQLite by its message, which is what
-// modernc.org/sqlite surfaces.
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code == pgUniqueViolation
-	}
-	return strings.Contains(err.Error(), "UNIQUE constraint failed")
-}
-
-// pgUniqueViolation is PostgreSQL's SQLSTATE for unique_violation.
-const pgUniqueViolation = "23505"
+// the app-level overlap check did not catch.
+//
+// A thin wrapper over db.IsUniqueViolation, kept only because three call sites read
+// better with the local name and the doc comment above belongs to this path rather
+// than to the shared helper.
+func isUniqueViolation(err error) bool { return db.IsUniqueViolation(err) }
