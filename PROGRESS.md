@@ -120,23 +120,48 @@ default path).
   `CALNODE_TEST_POSTGRES_DSN` set for `go test ./...`. Additive — with the variable
   unset nothing about an existing run changes.
 
-## Blocked on the database layer
+## No longer blocked
 
-`internal/db/migrations/postgres` does not exist yet (`db.go` embeds
-`migrations/sqlite/*.sql` only), so nothing can migrate on Postgres. Measured, not
-assumed: with the DSN set, `dbtest.Open` fails with
-`migrate postgres: run migrations: migrations/postgres directory does not exist`.
-Everything on this branch is written against `h.Migrate()` and starts working the
-moment those land; until then the new `postgres` CI job will be red for that reason
-and the Boundary 3 proof stands on the temporary hand-written schema recorded above.
+`migrations/postgres` landed with `feat/postgres-core`, so the `postgres` CI job now
+has something to migrate and passes.
 
-## Findings for whoever owns the schema
+## Boundary 5 — the suite actually green on both engines — DONE
 
-1. **Booleans.** The tree stores them as `INTEGER` and compares them literally —
-   `email_login = 1`, `is_organizer = 1`, `is_destination = 1`, `boolToInt(...)`.
-   If the Postgres migrations declare those columns `BOOLEAN`, every one of those
-   comparisons is a type error. `SMALLINT`/`INTEGER` keeps the whole tree working
-   unchanged.
+Rebased onto the finished `feat/postgres-core`, so `migrations/postgres` exists and
+the suite could finally run against PostgreSQL. **15 failures**, four distinct
+causes — not the one the first triage suggested.
+
+1. **Constraint classification (7 failures).** Thirteen sites decided 409/400/404
+   vs 500 by substring-matching SQLite's English error text. `internal/db` now
+   exports `IsUniqueViolation` / `IsCheckViolation` / `IsForeignKeyViolation`,
+   matching SQLSTATE 23505 / 23514 / 23503 on Postgres and the message on SQLite.
+   Pinned by `constraint_test.go`, which provokes a real violation of each class
+   against the real schema on whichever engine is configured, asserts exactly one
+   of three predicates matches, and asserts none match an unrelated error.
+2. **Engine-dependent boolean expressions (2 failures).** `(user_id = ?) AS owned`
+   and `(archived_at IS NOT NULL) AS archived` yield 0/1 on SQLite and a boolean on
+   Postgres, which does not scan into the `int` the columns beside them use. Both
+   are now `CASE WHEN … THEN 1 ELSE 0 END`, portable and matching the schema's own
+   0/1 convention.
+3. **`json_extract` in production (1 failure).** `replaceReminderJobs` filtered on
+   `json_extract(payload, '$.booking_id')`. No portable spelling exists, so this is
+   a second `d.SQL` pair: `payload::json ->> 'booking_id'` on Postgres (the cast is
+   needed because the column is TEXT). The reschedule test carried its own copy of
+   the same expression, and discarded the `Scan` error, so the real failure showed
+   up two seconds later as a time-parsing error.
+4. **`ORDER BY rowid` (3 failures).** `webhook_deliveries` had no timestamp of its
+   own, so recency was `rowid DESC` — unportable, and not strictly correct on
+   SQLite either, since VACUUM may renumber rowids. Migration **00058** adds
+   `created_at TEXT NOT NULL DEFAULT ''` to both dirs, the writer binds
+   `dbtime.NowMilli()`, and the query is `ORDER BY created_at DESC, id DESC`.
+5. **`randomblob` in a gcal test helper (2 failures).** SQLite-only id generator,
+   replaced with `uid.New()` like every other row in those tests.
+
+Both suites green in one commit: 28/28 packages on SQLite, 28/28 on PostgreSQL.
+
+1. **Booleans — resolved.** The Postgres migrations declare them `SMALLINT`, so the
+   tree's `= 1` comparisons and `boolToInt(...)` work unchanged. Only *computed*
+   boolean expressions in SELECT lists needed a fix (Boundary 5, cause 2).
 2. **Text timestamp collation.** Timestamps are `TEXT` and compared
    lexicographically on purpose (the recordings consent window, the job queue's
    `run_at <= ?`). That is byte ordering under SQLite. Under a non-`C` Postgres

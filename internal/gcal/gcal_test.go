@@ -10,6 +10,7 @@ import (
 
 	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/dbtest"
+	"github.com/calnode/calnode/internal/uid"
 )
 
 // testKeyHex is a valid 64-char hex key (32 bytes) used across tests.
@@ -314,10 +315,13 @@ func insertConnCal(t *testing.T, db *db.DB, userID, account, calID string, check
 	if check {
 		cc = 1
 	}
+	// uid.New() rather than lower(hex(randomblob(16))): randomblob is a SQLite
+	// built-in with no PostgreSQL counterpart, and every other row in these tests
+	// already gets its id from uid.
 	_, err := db.ExecContext(context.Background(), `
 		INSERT INTO connection_calendars (id, user_id, provider, account_email, calendar_id, name, check_conflicts, is_destination)
-		VALUES (lower(hex(randomblob(16))), ?, 'google', ?, ?, '', ?, 0)`,
-		userID, account, calID, cc)
+		VALUES (?, ?, 'google', ?, ?, '', ?, 0)`,
+		uid.New(), userID, account, calID, cc)
 	if err != nil {
 		t.Fatalf("insertConnCal(%q): %v", calID, err)
 	}

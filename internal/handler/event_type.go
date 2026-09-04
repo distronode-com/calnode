@@ -162,8 +162,12 @@ const selectETCols = "SELECT " + etColumns + " FROM event_types"
 // listEventTypesQuery returns every event type the user owns OR is an assigned
 // host on, with an `owned` flag (the owner is also seeded into event_type_hosts,
 // so ownership is keyed on event_types.user_id, not host membership).
-const listEventTypesQuery = "SELECT " + etColumns + `, (user_id = ?) AS owned,
-	(archived_at IS NOT NULL) AS archived
+//
+// The two flags are CASE expressions rather than bare comparisons because a bare
+// comparison's type is engine-dependent: SQLite yields 0/1 and PostgreSQL yields a
+// boolean, and the boolean does not scan into the int the 0/1 columns beside it use.
+const listEventTypesQuery = "SELECT " + etColumns + `, CASE WHEN user_id = ? THEN 1 ELSE 0 END AS owned,
+	CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END AS archived
 FROM event_types
 WHERE user_id = ?
    OR id IN (SELECT event_type_id FROM event_type_hosts WHERE user_id = ?)
@@ -172,10 +176,10 @@ ORDER BY created_at`
 // getEventTypeQuery fetches one event type by slug if the user owns it or hosts
 // it, with the `owned` flag and the owner's name/email (so a read-only host knows
 // who to contact for changes).
-const getEventTypeQuery = "SELECT " + etColumns + `, (user_id = ?) AS owned,
+const getEventTypeQuery = "SELECT " + etColumns + `, CASE WHEN user_id = ? THEN 1 ELSE 0 END AS owned,
 	(SELECT name FROM users WHERE id = event_types.user_id) AS owner_name,
 	(SELECT email FROM users WHERE id = event_types.user_id) AS owner_email,
-	(archived_at IS NOT NULL) AS archived
+	CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END AS archived
 FROM event_types
 WHERE slug = ? AND (user_id = ? OR id IN (SELECT event_type_id FROM event_type_hosts WHERE user_id = ?))`
 

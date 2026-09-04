@@ -1938,11 +1938,19 @@ func (h *Handler) replaceReminderJobs(ctx context.Context, bookingID, etID strin
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM jobs
-		WHERE type = 'reminder.send'
-		  AND json_extract(payload, '$.booking_id') = ?
-		  AND status != 'running'`, bookingID); err != nil {
+	// jobs.payload is TEXT holding JSON, and extracting a field out of it is the one
+	// operation here with no spelling both engines accept: json_extract is SQLite's
+	// JSON1 function, ->> needs an explicit cast because the column is TEXT rather
+	// than json. Hence a dialect pair rather than one statement.
+	if _, err := tx.ExecContext(ctx, tx.Dialect().SQL(
+		`DELETE FROM jobs
+		 WHERE type = 'reminder.send'
+		   AND json_extract(payload, '$.booking_id') = ?
+		   AND status != 'running'`,
+		`DELETE FROM jobs
+		 WHERE type = 'reminder.send'
+		   AND payload::json ->> 'booking_id' = ?
+		   AND status != 'running'`), bookingID); err != nil {
 		return fmt.Errorf("replace reminder jobs: delete: %w", err)
 	}
 

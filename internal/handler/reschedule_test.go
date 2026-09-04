@@ -106,19 +106,31 @@ func TestRescheduleBooking_updatesReminderJob(t *testing.T) {
 
 	// replaceReminderJobs deletes old jobs and inserts fresh ones keyed by booking_id.
 	// Poll until a pending reminder job with the correct run_at appears.
+	//
+	// The JSON lookup is a dialect pair for the same reason the production statement
+	// is one. The Scan error is captured rather than discarded: swallowing it turned a
+	// "json_extract does not exist" into an empty run_at and a two-second poll that
+	// then reported itself as a time-parsing failure.
 	var runAt string
+	var lastErr error
+	payloadMatch := database.Dialect().SQL(
+		`json_extract(payload, '$.booking_id') = ?`,
+		`payload::json ->> 'booking_id' = ?`)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		database.QueryRowContext(ctx, `
+		lastErr = database.QueryRowContext(ctx, `
 			SELECT run_at FROM jobs
 			WHERE type = 'reminder.send'
-			  AND json_extract(payload, '$.booking_id') = ?
+			  AND `+payloadMatch+`
 			  AND status = 'pending'`, bookingID).
 			Scan(&runAt)
 		if runAt != "" && runAt != oldReminderAt.Format(time.RFC3339) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if runAt == "" {
+		t.Fatalf("no pending reminder job appeared within 2s; last query error: %v", lastErr)
 	}
 
 	gotRunAt, err := time.Parse(time.RFC3339, runAt)

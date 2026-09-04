@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/uid"
 )
 
@@ -446,9 +447,9 @@ func (s *Service) Enqueue(ctx context.Context, event string, p BookingPayload) e
 		deliveryID := uid.New()
 		jobID := uid.New()
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO webhook_deliveries (id, webhook_id, booking_id, event, payload, status)
-			VALUES (?, ?, ?, ?, ?, 'pending')`,
-			deliveryID, wh.id, bookingIDArg, event, string(payloadBytes)); err != nil {
+			INSERT INTO webhook_deliveries (id, webhook_id, booking_id, event, payload, status, created_at)
+			VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+			deliveryID, wh.id, bookingIDArg, event, string(payloadBytes), dbtime.NowMilli()); err != nil {
 			return fmt.Errorf("webhook: insert delivery: %w", err)
 		}
 		jobPayload, _ := json.Marshal(map[string]string{"webhook_delivery_id": deliveryID})
@@ -473,11 +474,14 @@ func (s *Service) ListDeliveries(ctx context.Context, userID, webhookID string) 
 		return nil, ErrNotFound
 	}
 
+	// created_at DESC rather than rowid DESC: rowid is SQLite-only, and id is a random
+	// uid so it carries no recency. The id tiebreak makes two deliveries written in the
+	// same millisecond a stable order rather than whatever the engine returns.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, COALESCE(booking_id,''), event, status,
 		       response_status, attempt_count, last_attempted_at
 		FROM webhook_deliveries WHERE webhook_id = ?
-		ORDER BY rowid DESC LIMIT 50`, webhookID)
+		ORDER BY created_at DESC, id DESC LIMIT 50`, webhookID)
 	if err != nil {
 		return nil, fmt.Errorf("webhook: list deliveries: %w", err)
 	}

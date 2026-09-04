@@ -22,6 +22,12 @@ import (
 //	CALNODE_TEST_POSTGRES_DSN=postgres://postgres:pw@127.0.0.1:5432/calnode?sslmode=disable
 const postgresDSNEnv = "CALNODE_TEST_POSTGRES_DSN"
 
+// knownMigrationCount is the version a fully-migrated database must report. It is a
+// sanity check on the embedded set, not a property of PostgreSQL, so it moves with
+// every migration added — one named constant rather than the same literal in two
+// assertions, so adding one is a single edit that cannot be half-done.
+const knownMigrationCount = 58
+
 // openTestPostgres returns a handle scoped to a schema of its own, created for
 // this test and dropped when it finishes. A schema rather than a database because
 // CREATE DATABASE cannot run inside a transaction and cannot be reached over the
@@ -130,8 +136,8 @@ func TestPostgres_migrateToTargetVersion(t *testing.T) {
 	if applied != target {
 		t.Errorf("applied version = %d; want target %d", applied, target)
 	}
-	if target != 57 {
-		t.Errorf("target version = %d; want 57 (sanity check against the known migration set)", target)
+	if target != knownMigrationCount {
+		t.Errorf("target version = %d; want %d (sanity check against the known migration set)", target, knownMigrationCount)
 	}
 
 	ready, err := db.SchemaReady(ctx, handle.DB)
@@ -167,8 +173,8 @@ func TestPostgres_migrateViaPackageFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppliedVersion: %v", err)
 	}
-	if applied != 57 {
-		t.Errorf("applied version = %d; want 57", applied)
+	if applied != knownMigrationCount {
+		t.Errorf("applied version = %d; want %d", applied, knownMigrationCount)
 	}
 }
 
