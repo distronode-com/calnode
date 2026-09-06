@@ -27,7 +27,9 @@ This guide covers a generic Docker deploy and a step-by-step **Railway** deploy
 | `CALNODE_RECOVERY_SECRET` | recommended | — | Escrow secret so the data key can be recovered if the encryption key is rotated/lost. Store it somewhere separate. |
 | `BASE_URL` | **yes (prod)** | `http://localhost:3000` | Identity host — admin UI, OAuth callbacks, invite links. **Must include the scheme** (`https://booking.example.com`). The `https://` prefix flips the app into production mode (secure cookies, encryption-key enforcement). |
 | `PUBLIC_BASE_URL` | no | = `BASE_URL` | Booker-facing host for booking links/emails, if different from the identity host. |
-| `DATABASE_URL` | no | `sqlite://./data/calnode.db` | Point at the persistent volume, e.g. `sqlite:///data/calnode.db`. |
+| `DATABASE_URL` | no | `sqlite://./data/calnode.db` | Point at the persistent volume, e.g. `sqlite:///data/calnode.db`. A `postgres://user:pass@host:5432/dbname` URL selects PostgreSQL instead; anything else is SQLite. |
+| `DB_MAX_OPEN_CONNS` | no | `10` | **PostgreSQL only.** Size of the connection pool. It has to fit inside the server's own `max_connections`, shared with every other client — raise it for a busy instance on a well-sized server, lower it behind PgBouncer or on a shared one. Must be a positive integer; anything else is ignored (with a warning) and the default stands. **Ignored on SQLite, which is always 1**: the single connection is what serialises write transactions, not a tuning choice. |
+| `DB_MAX_IDLE_CONNS` | no | `5` | **PostgreSQL only.** How many idle connections the pool keeps rather than closing. Positive integer, and capped at `DB_MAX_OPEN_CONNS` (a larger value is clamped, since `database/sql` would silently do the same). |
 | `PORT` | no | `3000` | The app listens on `$PORT`. Many platforms inject their own (Railway injects `8080`) — let them. |
 | `EMAIL_SMTP_HOST` / `_PORT` / `_USER` / `_PASS` | no¹ | — / `587` | SMTP. Can also be set later in Settings → Email (DB-stored, encrypted). |
 | `EMAIL_SMTP_TLS` / `_STARTTLS` | no | `false` | `STARTTLS` for 587, implicit `TLS` for 465. |

@@ -13,10 +13,40 @@ import (
 
 	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
+
+	"github.com/calnode/calnode/internal/config"
 )
 
 //go:embed migrations/sqlite/*.sql migrations/postgres/*.sql
 var migrations embed.FS
+
+// Option configures OpenDB.
+type Option func(*openOptions)
+
+type openOptions struct {
+	maxOpen, maxIdle int
+}
+
+// WithPool sets the PostgreSQL pool sizes explicitly, bypassing
+// DB_MAX_OPEN_CONNS / DB_MAX_IDLE_CONNS. For a caller that must not follow the
+// environment — a one-shot CLI, or a test pinning the numbers it asserts.
+//
+// Values are sanity-checked the same way config does it, because this is the
+// function that hands them to database/sql: a non-positive size falls back to
+// the default, and an idle limit above the open limit is clamped.
+func WithPool(maxOpen, maxIdle int) Option {
+	return func(o *openOptions) {
+		if maxOpen > 0 {
+			o.maxOpen = maxOpen
+		}
+		if maxIdle > 0 {
+			o.maxIdle = maxIdle
+		}
+		if o.maxIdle > o.maxOpen {
+			o.maxIdle = o.maxOpen
+		}
+	}
+}
 
 // OpenDB connects to the database named by databaseURL and configures the pool
 // for the engine it names.
@@ -28,18 +58,34 @@ var migrations embed.FS
 // from the call. Anything that genuinely needs the bare pool (goose, Litestream)
 // reaches it as handle.DB, which at least says so at the call site.
 //
+// Pool sizing comes from the environment (config.PoolFromEnv) unless a WithPool
+// option overrides it, so every entry point picks up DB_MAX_OPEN_CONNS /
+// DB_MAX_IDLE_CONNS without each one having to remember to pass them. It is
+// ignored entirely on SQLite — see openSQLite.
+//
 // URL formats:
 //
 //	sqlite://./path/to/db, sqlite:///absolute/path, or a bare file path
 //	postgres://user:pass@host:port/dbname (postgresql:// is accepted too)
-func OpenDB(databaseURL string) (*DB, error) {
+func OpenDB(databaseURL string, opts ...Option) (*DB, error) {
 	if dialectFromURL(databaseURL) == DialectPostgres {
-		return openPostgres(databaseURL)
+		o := openOptions{}
+		o.maxOpen, o.maxIdle = config.PoolFromEnv()
+		for _, opt := range opts {
+			opt(&o)
+		}
+		return openPostgres(databaseURL, o)
 	}
 	return openSQLite(databaseURL)
 }
 
 // openSQLite opens SQLite and configures pragmas.
+//
+// It takes no pool options on purpose. DB_MAX_OPEN_CONNS is meaningless here and
+// honouring it would be a correctness bug, not a tuning choice: the single
+// connection is what serialises write transactions and what keeps the
+// booking-overlap check free of TOCTOU races (ARCHITECTURE §17), and the pragmas
+// below are connection-scoped, so a second connection would not have them.
 func openSQLite(databaseURL string) (*DB, error) {
 	dsn := parseDSN(databaseURL)
 
@@ -72,20 +118,20 @@ func openSQLite(databaseURL string) (*DB, error) {
 
 // openPostgres opens a PostgreSQL pool.
 //
-// The one-connection pool above is a SQLite constraint, not a Calnode design
-// choice, and carrying it over would serialise the whole instance on a database
-// that has its own concurrency control. Sizes are deliberately modest: one
-// Calnode instance is one small process, and a self-hoster's Postgres is usually
-// sized to match.
+// The one-connection pool of openSQLite is a SQLite constraint, not a Calnode
+// design choice, and carrying it over would serialise the whole instance on a
+// database that has its own concurrency control. Sizes come from the caller
+// (ultimately DB_MAX_OPEN_CONNS / DB_MAX_IDLE_CONNS, defaulting to 10/5)
+// because the number that fits is a property of the server: PostgreSQL's
+// max_connections is shared with every other client, and an instance behind
+// PgBouncer wants a different figure from one talking to the server directly.
 //
 // The pool does cost one property the SQLite path gets by accident: the
 // booking-overlap check (ARCHITECTURE §17) is free of TOCTOU races there only
 // because every transaction queues on that single connection. Here two
-// overlapping bookings can clear the check concurrently, and only
-// idx_bookings_no_double — exact start times — stops them. Closing that gap
-// belongs with the booking transaction (SERIALIZABLE, or a range exclusion
-// constraint), not with the pool.
-func openPostgres(databaseURL string) (*DB, error) {
+// overlapping bookings can clear the check concurrently, which is what
+// booking.lockHosts' advisory lock closes.
+func openPostgres(databaseURL string, o openOptions) (*DB, error) {
 	// pgx parses the DSN here, so a malformed URL fails at Open. Reachability is
 	// not probed: Migrate runs immediately after Open in every entry point and
 	// reports an unreachable server with the same context a probe would.
@@ -94,8 +140,8 @@ func openPostgres(databaseURL string) (*DB, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(o.maxOpen)
+	db.SetMaxIdleConns(o.maxIdle)
 
 	return &DB{DB: db, dialect: DialectPostgres}, nil
 }

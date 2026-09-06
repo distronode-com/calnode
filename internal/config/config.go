@@ -61,6 +61,18 @@ type Config struct {
 	// DemoResetInterval is how often DemoMode wipes and re-seeds the DB. Configurable
 	// (not hardcoded to 30m) so local verification doesn't require waiting half an hour.
 	DemoResetInterval time.Duration
+
+	// DBMaxOpenConns / DBMaxIdleConns size the PostgreSQL connection pool.
+	// PostgreSQL's own max_connections is the thing they have to fit inside, and
+	// that is a property of the server a self-hoster runs, not of Calnode — a
+	// small instance behind a PgBouncer wants a different number from one talking
+	// to a 200-connection server directly.
+	//
+	// They do NOT apply to SQLite, which is pinned at 1/1 in internal/db because
+	// the single writer connection is a correctness guarantee (ARCHITECTURE §17),
+	// not a tuning choice.
+	DBMaxOpenConns int
+	DBMaxIdleConns int
 }
 
 func Load() *Config {
@@ -100,8 +112,60 @@ func Load() *Config {
 	cfg.CookieSecure = getBool("COOKIE_SECURE", strings.HasPrefix(cfg.BaseURL, "https://"))
 	cfg.DemoMode = getBool("DEMO_MODE", false)
 	cfg.DemoResetInterval = getDuration("DEMO_RESET_INTERVAL", 30*time.Minute)
+	cfg.DBMaxOpenConns, cfg.DBMaxIdleConns = PoolFromEnv()
 
 	return cfg
+}
+
+// Pool defaults. Deliberately modest: one Calnode instance is one small process,
+// and a self-hoster's PostgreSQL is usually sized to match.
+const (
+	DefaultDBMaxOpenConns = 10
+	DefaultDBMaxIdleConns = 5
+)
+
+// PoolFromEnv reads DB_MAX_OPEN_CONNS and DB_MAX_IDLE_CONNS.
+//
+// It is exported separately from Load because internal/db calls it directly:
+// OpenDB has to know the pool size, every entry point that opens a database
+// would otherwise have to remember to pass it, and forgetting would silently
+// give that entry point the defaults. config imports nothing from the app, so
+// db → config is not a cycle.
+//
+// Validation, rather than handing database/sql whatever the environment said:
+//
+//   - unset, unparsable or not positive → the default, with a warning. This
+//     matches getBool/getDuration above, which also fall back rather than
+//     failing a boot over a typo in an optional knob.
+//   - idle > open → idle is clamped to open. database/sql silently reduces the
+//     idle limit to the open limit in that case, so the pair is the honest
+//     description of what the pool will do.
+func PoolFromEnv() (maxOpen, maxIdle int) {
+	maxOpen = getPositiveInt("DB_MAX_OPEN_CONNS", DefaultDBMaxOpenConns)
+	maxIdle = getPositiveInt("DB_MAX_IDLE_CONNS", DefaultDBMaxIdleConns)
+	if maxIdle > maxOpen {
+		slog.Warn("DB_MAX_IDLE_CONNS exceeds DB_MAX_OPEN_CONNS; clamping",
+			"idle", maxIdle, "open", maxOpen)
+		maxIdle = maxOpen
+	}
+	return maxOpen, maxIdle
+}
+
+func getPositiveInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("ignoring unparsable integer environment variable", "key", key, "value", v, "default", def)
+		return def
+	}
+	if n < 1 {
+		slog.Warn("ignoring non-positive environment variable", "key", key, "value", n, "default", def)
+		return def
+	}
+	return n
 }
 
 func parseLogLevel(s string) slog.Level {

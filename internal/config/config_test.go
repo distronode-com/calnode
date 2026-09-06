@@ -121,3 +121,76 @@ func TestLoad_demoResetIntervalInvalidFallsBackToDefault(t *testing.T) {
 		t.Errorf("DemoResetInterval = %v; want 30m default on invalid input", cfg.DemoResetInterval)
 	}
 }
+
+func TestLoad_poolDefaults(t *testing.T) {
+	os.Unsetenv("DB_MAX_OPEN_CONNS")
+	os.Unsetenv("DB_MAX_IDLE_CONNS")
+	cfg := config.Load()
+	if cfg.DBMaxOpenConns != 10 {
+		t.Errorf("DBMaxOpenConns = %d; want 10", cfg.DBMaxOpenConns)
+	}
+	if cfg.DBMaxIdleConns != 5 {
+		t.Errorf("DBMaxIdleConns = %d; want 5", cfg.DBMaxIdleConns)
+	}
+	// The exported constants are what internal/db falls back to, so they must be
+	// the same numbers Load reports rather than a second opinion.
+	if config.DefaultDBMaxOpenConns != 10 || config.DefaultDBMaxIdleConns != 5 {
+		t.Errorf("defaults = %d/%d; want 10/5",
+			config.DefaultDBMaxOpenConns, config.DefaultDBMaxIdleConns)
+	}
+}
+
+func TestPoolFromEnv(t *testing.T) {
+	tests := []struct {
+		name               string
+		open, idle         string
+		wantOpen, wantIdle int
+	}{
+		{name: "unset", wantOpen: 10, wantIdle: 5},
+		{name: "both set", open: "40", idle: "12", wantOpen: 40, wantIdle: 12},
+		{name: "idle above open is clamped to open", open: "6", idle: "99", wantOpen: 6, wantIdle: 6},
+		{name: "zero open is not positive", open: "0", idle: "2", wantOpen: 10, wantIdle: 2},
+		{name: "negative idle is not positive", open: "8", idle: "-1", wantOpen: 8, wantIdle: 5},
+		{name: "unparsable open", open: "many", idle: "3", wantOpen: 10, wantIdle: 3},
+		{name: "one and one", open: "1", idle: "1", wantOpen: 1, wantIdle: 1},
+		// The default idle (5) is above an explicitly small open limit, so the
+		// clamp has to apply to the DEFAULT too, not only to a value someone set.
+		{name: "small open clamps the default idle", open: "2", wantOpen: 2, wantIdle: 2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setEnvOrUnset(t, "DB_MAX_OPEN_CONNS", tc.open)
+			setEnvOrUnset(t, "DB_MAX_IDLE_CONNS", tc.idle)
+
+			gotOpen, gotIdle := config.PoolFromEnv()
+			if gotOpen != tc.wantOpen || gotIdle != tc.wantIdle {
+				t.Errorf("PoolFromEnv() = %d/%d; want %d/%d", gotOpen, gotIdle, tc.wantOpen, tc.wantIdle)
+			}
+			if gotIdle > gotOpen {
+				t.Errorf("idle %d exceeds open %d; the pair must always satisfy idle <= open", gotIdle, gotOpen)
+			}
+
+			cfg := config.Load()
+			if cfg.DBMaxOpenConns != gotOpen || cfg.DBMaxIdleConns != gotIdle {
+				t.Errorf("Load() reported %d/%d; want the same %d/%d PoolFromEnv gives",
+					cfg.DBMaxOpenConns, cfg.DBMaxIdleConns, gotOpen, gotIdle)
+			}
+		})
+	}
+}
+
+func setEnvOrUnset(t *testing.T, key, value string) {
+	t.Helper()
+	if value == "" {
+		previous, had := os.LookupEnv(key)
+		os.Unsetenv(key)
+		t.Cleanup(func() {
+			if had {
+				os.Setenv(key, previous)
+			}
+		})
+		return
+	}
+	t.Setenv(key, value)
+}
