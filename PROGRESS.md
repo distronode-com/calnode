@@ -1771,34 +1771,31 @@ of this file); the vendor webhooks resolving their workspace from the row they n
 already done (B1's `config.Validate` refuses `MULTI_TENANT` with `DEMO_MODE`) and D14
 landed with the platform-hooks merge.
 
-### ⛔ OPEN ITEM: `embed_allowed_origins` and `stt_base_url` are written and never read
+### `embed_allowed_origins` and `stt_base_url` are READ — the D7 reader wiring, done
 
-Migration 00062 added both columns and the platform API fills them, so a provisioned
-workspace no longer loses what the caller sent. **Nothing reads them.** The embed CORS
-check still resolves `config.EmbedAllowedOrigins` and the notetaker still resolves
-`config.STTBaseURL`, both of which are one process-wide value — so on a multi-tenant
-instance **every tenant currently shares one embed allowlist and one STT host**, whatever
-their row says. That is a silent wrong answer in the making: an operator who sets a
-per-tenant allowlist through the platform API will believe it is in force.
+Migration 00062 added both columns and the platform API filled them; until this commit nothing
+read them, so a multi-tenant instance shared one embed allowlist and one STT host across every
+tenant whatever its row said. Now `internal/handler/tenant_settings.go` reads both through the
+bound handle into a per-workspace `settingsCache` (the same `tenantCache` the vendor clients use):
 
-Wiring the readers is **D7 work**, not a one-line lookup, and that is why it is not done
-here: each has to go through the per-workspace settings cache (`shared.<kind>.get(wsID)`,
-`internal/handler/tenantcache.go`) so the value is built from that workspace's
-`server_settings` row and invalidated when the workspace saves. Two specifics for whoever
-picks it up:
+- **`embed_allowed_origins`**: the CORS wrapper became `server.PublicCORSFor(originsFor)`, with
+  `PublicCORS(list)` as the single-tenant special case. In multi-tenant mode `server.New` passes
+  `h.EmbedOriginsFor`, which resolves the request host to its workspace on the platform handle
+  (one indexed read, the route's own 404 unchanged) and answers that workspace's list. An unknown
+  host answers known=false, which the middleware turns into NO allow-origin header — never `*`.
+  An empty per-tenant list keeps the single-tenant meaning: any origin. `EMBED_ALLOWED_ORIGINS`
+  is not consulted in this mode. The 'move the check inside the handler' alternative was not
+  taken: a disallowed origin is still refused before any handler runs, exactly as today.
+- **`stt_base_url`**: `sttBaseURL()` gained one rung on top of its existing ladder — the
+  workspace's column when multi-tenant and non-empty, then `STT_BASE_URL`, then the provider
+  default. The notetaker job already runs bound (`workspaceForJob`, B5), so it needed no change.
 
-- **`embed_allowed_origins`** is consumed by the CORS wrapper on the embed and public
-  booking routes, which runs BEFORE the handler and therefore before any per-request
-  workspace exists on the `Scoped` path. It needs the same treatment `rateLimitKey` got for
-  D14: resolve from the request Host without a database read, or move the check inside the
-  handler where the bound handle is available. The second is cleaner and is a behaviour
-  change to think about, since today a disallowed origin is refused before any handler runs.
-- **`stt_base_url`** is read by the notetaker job, which already runs bound to its
-  workspace (`workspaceForJob`, B5), so it is the easier of the two: a settings read on the
-  bound handle, with `config.STTBaseURL` as the fallback when the column is `''`.
-
-Until both are wired, a multi-tenant deployment should keep `EMBED_ALLOWED_ORIGINS` and
-`STT_BASE_URL` set to values that are correct for **every** tenant on the instance.
+Tests: `TestTenantSettings_perWorkspaceReaders` (handler, PG: two workspaces via the platform API;
+A's own STT host and origins, B's fall-through to the process value and then the default, an
+unknown host resolving to no tenant), `TestPublicCORSFor_*` (middleware unit, both engines) and
+`TestTenancy_embedOriginsArePerWorkspace` (end to end through the real mux). Negative control,
+the multi-tenant branch in `server.New` disabled: the end-to-end test fails with `200 "*"` on
+acme's own origin, on a foreign origin, and on an unknown host — the shared-allowlist bug, seen.
 
 ### ⚠️ A pre-existing upstream race, fixed here (upstream-first PR candidate)
 
@@ -2267,10 +2264,8 @@ connections.
    without moving the key. Import's `dek_fingerprint` check makes the coupling loud rather than
    silent, which is as far as this packet goes. Making it per tenant changes D3, the schema
    (`crypto_keystore` gains `workspace_id`), and the export format.
-2. ⚠️ **The D7 reader wiring for `embed_allowed_origins` and `stt_base_url`.** Both columns are
-   written by the platform API and read by nothing, so a multi-tenant instance still shares one
-   embed allowlist and one STT host across tenants. Details and the two specifics are in the
-   open item above.
+2. ✅ **The D7 reader wiring for `embed_allowed_origins` and `stt_base_url`** — done after
+   B7, see the section above. One known follow-up remains in this list.
 
 ⚠️ This file carried a plan for the SSO mint half between the merge and part three above.
 It is now BUILT, and part three is the record; the plan is deleted rather than annotated,

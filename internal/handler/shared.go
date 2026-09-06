@@ -44,6 +44,9 @@ type shared struct {
 	zoomCache    *tenantCache[*zoom.Client]
 	stripeCache  *tenantCache[*stripe.Client]
 	livekitCache *tenantCache[*livekit.Client]
+	// settingsCache holds the two multi-tenant-only server_settings columns
+	// (embed origins, STT host) per workspace; see tenant_settings.go.
+	settingsCache *tenantCache[tenantSettings]
 
 	// calBase is the PLATFORM-level provider registry: one Service holding the
 	// instance's Google/Microsoft OAuth apps and the CalDAV client, per D7. It is

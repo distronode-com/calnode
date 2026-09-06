@@ -145,19 +145,37 @@ func requestOriginHost(r *http.Request) string {
 // access-control boundary (the routes are rate-limited regardless). Handles the
 // OPTIONS preflight itself (returns 204).
 func PublicCORS(allowedOrigins []string) func(http.HandlerFunc) http.HandlerFunc {
-	allowAny := len(allowedOrigins) == 0
-	allowed := make(map[string]bool, len(allowedOrigins))
-	for _, o := range allowedOrigins {
-		allowed[strings.ToLower(strings.TrimRight(o, "/"))] = true
-	}
+	return PublicCORSFor(func(*http.Request) ([]string, bool) { return allowedOrigins, true })
+}
+
+// PublicCORSFor is PublicCORS with the allowlist chosen per request. originsFor
+// answers the list that applies to this request and whether one applies at all:
+// known=false means the request names no tenant, and then NO
+// Access-Control-Allow-Origin header is sent — not `*`, because "no workspace"
+// must never read as "any origin". An empty list with known=true keeps
+// PublicCORS's meaning: any origin.
+//
+// This is what lets a multi-tenant instance honour each workspace's own
+// `embed_allowed_origins` (handler.EmbedOriginsFor) while a single-tenant instance
+// keeps one process-wide list. The preflight is answered either way; the resolver
+// only decides the origin header.
+func PublicCORSFor(originsFor func(*http.Request) ([]string, bool)) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if origin := r.Header.Get("Origin"); origin != "" {
-				if allowAny {
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-				} else if allowed[strings.ToLower(strings.TrimRight(origin, "/"))] {
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					w.Header().Add("Vary", "Origin")
+				if allowedOrigins, known := originsFor(r); known {
+					if len(allowedOrigins) == 0 {
+						w.Header().Set("Access-Control-Allow-Origin", "*")
+					} else {
+						want := strings.ToLower(strings.TrimRight(origin, "/"))
+						for _, o := range allowedOrigins {
+							if strings.ToLower(strings.TrimRight(o, "/")) == want {
+								w.Header().Set("Access-Control-Allow-Origin", origin)
+								w.Header().Add("Vary", "Origin")
+								break
+							}
+						}
+					}
 				}
 			}
 			if r.Method == http.MethodOptions {

@@ -178,15 +178,16 @@ func New(database *db.DB, logger *slog.Logger) *Handler {
 	whs, _ := webhook.New(database, "") // ephemeral key when no encryption key configured
 	return &Handler{
 		shared: &shared{
-			logger:       logger,
-			calNudge:     make(chan struct{}, 1),
-			mailerCache:  newTenantCache[mailer.Mailer](),
-			calCache:     newTenantCache[*calendar.Service](),
-			llmCache:     newTenantCache[*llm.Client](),
-			zoomCache:    newTenantCache[*zoom.Client](),
-			stripeCache:  newTenantCache[*stripe.Client](),
-			livekitCache: newTenantCache[*livekit.Client](),
-			appDB:        database,
+			logger:        logger,
+			calNudge:      make(chan struct{}, 1),
+			mailerCache:   newTenantCache[mailer.Mailer](),
+			calCache:      newTenantCache[*calendar.Service](),
+			llmCache:      newTenantCache[*llm.Client](),
+			zoomCache:     newTenantCache[*zoom.Client](),
+			stripeCache:   newTenantCache[*stripe.Client](),
+			livekitCache:  newTenantCache[*livekit.Client](),
+			settingsCache: newTenantCache[tenantSettings](),
+			appDB:         database,
 		},
 		db:         database,
 		ws:         DefaultWorkspace,
@@ -252,7 +253,18 @@ func (h *Handler) SetSTTBaseURL(url string) {
 // sttBaseURL returns the effective endpoint host. Resolved on read rather than at set
 // time so a Handler built without SetSTTBaseURL (every test) still reports the real
 // default rather than an empty string.
+//
+// In multi-tenant mode a workspace's own `stt_base_url` (written by the platform
+// API, see tenant_settings.go) comes first, so an EU tenant's recordings go to the
+// EU speech-to-text host regardless of what the process was booted with. Empty
+// falls through to the process value, then the provider default — the same ladder
+// single-tenant mode has always had, with one rung added on top of it.
 func (h *Handler) sttBaseURL() string {
+	if h.multiTenant && h.ws != nil {
+		if v := h.tenantSettings().sttBaseURL; v != "" {
+			return v
+		}
+	}
 	if h.sttBaseURLCfg != "" {
 		return h.sttBaseURLCfg
 	}

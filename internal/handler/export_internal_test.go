@@ -72,3 +72,9 @@ func StripeEventWorkspaceForTest(h *Handler, sessionID, metadataBookingID string
 	})(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/stripe/webhook", nil))
 	return id, found
 }
+
+// STTBaseURLForWorkspaceForTest answers what the notetaker would use for one
+// workspace: the scoped handler's resolution, per-tenant column first.
+func STTBaseURLForWorkspaceForTest(h *Handler, workspaceID string) string {
+	return h.forWorkspace(&Workspace{ID: workspaceID}).sttBaseURL()
+}

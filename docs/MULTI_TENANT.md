@@ -141,6 +141,13 @@ local `HH:MM` and defaulting the zone would move the workspace's hours), the fir
 webhook subscribed to **every** event the codebase emits, and the default event type with its
 availability. Either the tenant exists complete or it does not exist.
 
+`defaults.embed_allowed_origins` and `defaults.stt_base_url` are per workspace and are READ: the public
+booking endpoints' CORS allowlist is the one stored for the workspace whose host the request names (an
+empty list means any origin, and a host no workspace owns gets no `Access-Control-Allow-Origin` at all,
+never `*`), and the notetaker sends that workspace's recordings to its own speech-to-text host, falling
+through to `STT_BASE_URL` and then the provider default when the column is empty. In this mode
+`EMBED_ALLOWED_ORIGINS` is not consulted.
+
 `day_of_week` is 0 = Sunday. A duplicate `id`, `slug` or `public_host` is 409, and the losing
 attempt leaves nothing behind.
 
@@ -237,8 +244,6 @@ and nothing is disclosed either way. Single-tenant keeps the original verify-the
 |---|---|
 | **the data encryption key** | one wrapped DEK per process. An operator who can read the database can decrypt every workspace, and a workspace cannot move between instances without its key. The import fingerprint check makes the coupling loud rather than silent |
 | **the OAuth app credentials** | Google/Microsoft client id and secret identify the *instance* to the provider, not the tenant |
-| **`embed_allowed_origins`** | stored per workspace and **not yet read**: the CORS check still uses the process-wide value, so every tenant shares one embed allowlist |
-| **`stt_base_url`** | same: stored, not yet read, so every tenant shares one speech-to-text host |
 | **rate-limit windows** | keyed `(workspace, client IP)`, but the counters live in one process |
 | **retention sweeps** | expired sessions, tokens and deliveries are purged globally: they are retention rules, not tenant logic |
 

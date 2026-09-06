@@ -517,6 +517,14 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	// cross-origin from a customer's site. Scoped to these unauthenticated routes
 	// only — admin/auth routes never get CORS. Default (empty allowlist) = any origin.
 	cors := PublicCORS(cfg.EmbedAllowedOrigins)
+	if cfg.MultiTenant {
+		// Per workspace: the allowlist is the one the platform API stored for the
+		// workspace whose public host the request names, and an unknown host gets
+		// no CORS header at all. EMBED_ALLOWED_ORIGINS is not consulted in this
+		// mode — one process-wide list would let tenant A's embed origins call
+		// tenant B's booking endpoints.
+		cors = PublicCORSFor(h.EmbedOriginsFor)
+	}
 
 	// Public event-type display info for the widget (name/duration/location/brand).
 	mux.HandleFunc("GET /v1/event-types/{slug}/public", cors(h.Scoped(handler.HostWorkspace, (*H).PublicEventType)))
