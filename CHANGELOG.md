@@ -12,6 +12,19 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 ## [Unreleased]
 
 ### Added
+- **`FRAME_ANCESTORS`: embed the admin UI in your own console.** Space-separated origins
+  (`https://console.example.com 'self'`); when set, `/admin/` sends
+  `Content-Security-Policy: frame-ancestors <list>`. The public booking pages are
+  untouched and still deny framing outright — this is about the console, not the pages
+  that take card details.
+
+  Two deliberate refusals. An entry that is not `https://host[:port]` or `'self'` stops
+  the app booting rather than being ignored, because a browser drops a source list it
+  cannot parse, which would leave the admin UI *more* embeddable than the setting being
+  unset. And no `X-Frame-Options` is sent beside it: that header has no allow-list form,
+  so the only value it could carry is `SAMEORIGIN`, which browsers honour instead of the
+  CSP and would break the embedding this exists for.
+
 - **`TRUSTED_PROXY_CIDRS`: per-IP rate limits that work behind a CDN.** Rate limits key
   on the TCP peer, which is right for a directly-reachable instance and useless behind a
   fronting CDN, where every visitor arrives from the same handful of addresses and shares

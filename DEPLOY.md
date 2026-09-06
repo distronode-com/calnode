@@ -37,6 +37,7 @@ This guide covers a generic Docker deploy and a step-by-step **Railway** deploy
 | `LITESTREAM_REPLICA_URL` | recommended | — | Enables continuous SQLite backup (see §6). |
 | `COOKIE_SECURE` | no | https→true | Override cookie Secure flag; defaults from `BASE_URL` scheme. |
 | `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated CIDRs (a bare address = one host) whose `CF-Connecting-IP` / `X-Forwarded-For` are believed when keying per-IP rate limits, e.g. `10.0.0.0/8`. Unset ⇒ those headers are ignored and the limit keys on the TCP peer, so behind a fronting CDN every visitor shares one bucket. **Only list networks you control**: anything in the list can name any client IP it likes. |
+| `FRAME_ANCESTORS` | no | — | **Space**-separated origins allowed to embed the **admin UI** in a frame, e.g. `https://console.example.com 'self'`. Each entry must be `https://host[:port]` or `'self'` — anything else and **the app refuses to start**, because browsers drop a policy they cannot parse. Does not affect the public booking pages, which always deny framing. |
 | `LOG_LEVEL` | no | `info` | `debug`/`info`/`warn`/`error`. |
 
 ¹ Email is optional to boot, but bookings won't send confirmations until SMTP is configured (env **or** the admin UI). Precedence is **env var > DB setting > default**.

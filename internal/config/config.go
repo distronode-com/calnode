@@ -1,7 +1,9 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -66,6 +68,19 @@ type Config struct {
 	// CIDRs; a bare address is taken as a single host.
 	TrustedProxyCIDRs []string
 
+	// FrameAncestors lists the origins allowed to embed the admin SPA in a frame, as a
+	// Content-Security-Policy frame-ancestors source list. Space-separated, matching the
+	// CSP syntax it becomes. Empty (the default) ⇒ nothing is sent and /admin/ behaves
+	// exactly as it did. Each entry must be `https://host[:port]` or `'self'`; anything
+	// else fails Validate and the process refuses to start, because a directive the
+	// browser cannot parse is a directive that silently allows everything.
+	//
+	// Only the admin SPA is affected. The public booking pages keep their
+	// `frame-ancestors 'none'` + `X-Frame-Options: DENY` unconditionally — those are
+	// unauthenticated pages that take payment details, and no operator convenience is
+	// worth making them embeddable.
+	FrameAncestors []string
+
 	// DemoMode turns this instance into a public, self-resetting demo: seeds sample
 	// data on every boot (there's no persistent volume, so every boot is a fresh DB),
 	// disables calendar/Zoom connect, serves a disallow-all robots.txt, and exposes
@@ -104,6 +119,9 @@ func Load() *Config {
 
 		EmbedAllowedOrigins: splitCSV(getEnv("EMBED_ALLOWED_ORIGINS", "")),
 		TrustedProxyCIDRs:   splitCSV(getEnv("TRUSTED_PROXY_CIDRS", "")),
+		// Space-separated, not comma: the value goes into a CSP source list verbatim, so
+		// it reads the same in the env var as it does in the header.
+		FrameAncestors: strings.Fields(getEnv("FRAME_ANCESTORS", "")),
 	}
 
 	cfg.EncryptionKey = os.Getenv("CALNODE_ENCRYPTION_KEY")
@@ -118,6 +136,60 @@ func Load() *Config {
 	cfg.DemoResetInterval = getDuration("DEMO_RESET_INTERVAL", 30*time.Minute)
 
 	return cfg
+}
+
+// Validate reports the configuration errors an operator has to fix before the process
+// can safely serve traffic. Called from main after Load; a non-nil error is fatal.
+//
+// It holds the settings whose wrong value is worse than their absence. A malformed CSP
+// directive is the example: browsers drop a source list they cannot parse, so the admin
+// UI would end up MORE embeddable than with the setting unset, and nothing in the
+// response would say so.
+func (c *Config) Validate() error {
+	for _, origin := range c.FrameAncestors {
+		if err := validFrameAncestor(origin); err != nil {
+			return fmt.Errorf("FRAME_ANCESTORS: %w", err)
+		}
+	}
+	return nil
+}
+
+// validFrameAncestor accepts 'self' or an https origin with no path, credentials, query
+// or fragment.
+//
+// Wildcards are deliberately refused even though CSP allows them. `https://*.example.com`
+// trusts every host any subdomain of that name ever points at, including one taken over
+// later; an operator who needs two hosts can name two hosts. Plain http is refused for
+// the same reason the admin session cookie is Secure — the framing page would be able to
+// read nothing, but its own compromise becomes a foothold.
+func validFrameAncestor(origin string) error {
+	if origin == "'self'" {
+		return nil
+	}
+	if strings.HasPrefix(origin, "'") {
+		// 'none', 'unsafe-inline' and friends are keywords this setting has no use for:
+		// 'none' is not "unset" (see FrameAncestors) and the rest are not source
+		// expressions at all. Refusing them keeps the accepted grammar one line long.
+		return fmt.Errorf("%q is not a supported keyword; use 'self' or an https:// origin", origin)
+	}
+	u, err := url.Parse(origin)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%q is not a URL: %w", origin, err)
+	case u.Scheme != "https":
+		return fmt.Errorf("%q must use https://", origin)
+	case u.Host == "":
+		return fmt.Errorf("%q has no host", origin)
+	case strings.Contains(u.Host, "*"):
+		return fmt.Errorf("%q must name one host, not a wildcard", origin)
+	case u.User != nil:
+		return fmt.Errorf("%q must not carry credentials", origin)
+	case u.Path != "" && u.Path != "/":
+		return fmt.Errorf("%q must be an origin, with no path", origin)
+	case u.RawQuery != "" || u.Fragment != "":
+		return fmt.Errorf("%q must be an origin, with no query or fragment", origin)
+	}
+	return nil
 }
 
 func parseLogLevel(s string) slog.Level {
