@@ -111,18 +111,40 @@ func TestReplaceReminderJobs_upsertSurvivesTheLosingInterleaving(t *testing.T) {
 	}
 }
 
-// waitForLockWaiter blocks until some backend in this database is waiting on a lock,
-// which is the reschedule's INSERT queueing behind the uncommitted key. It fails rather
-// than returning if that never happens: without the block, the test would be exercising
-// the ordinary interleaving and proving nothing.
+// waitForLockWaiter blocks until the reschedule's INSERT is demonstrably queued behind the
+// uncommitted key. It fails rather than returning if that never happens: without the block,
+// the test would be exercising the ordinary interleaving and proving nothing.
+//
+// ⛔ Two signals, because `wait_event_type = 'Lock'` ALONE IS NOT ENOUGH — a `-race
+// -count=30` run on a box with two other workers on it failed here 2 times in 30, always at
+// this control and never at the run_at assertion. The fix was holding; the detection was not.
+//
+// The reason is that the Lock wait is a STATE THIS POLL HAS TO CATCH THE BACKEND IN, and
+// `pg_stat_activity` is a sampled view of it. Under `-race` (several times slower on the Go
+// side) plus CPU contention, the goroutine issuing the INSERT can still be inside the driver,
+// or between statements of its transaction, for the whole window this loop looks at — so "not
+// blocked yet" and "never going to block" are indistinguishable from that one column.
+//
+// ⚠️ It is NOT driver-side queueing: the PostgreSQL pool defaults to 10 open / 5 idle
+// (config.PoolFromEnv) and this test uses two connections, so nothing is waiting for one. It
+// is `-race` plus load, which is why the answer is a better signal rather than a bigger pool.
+//
+// So a backend running the reschedule's own INSERT counts too, identified by its query text.
+// An `active` backend running that statement is either about to block on the key or already
+// past it; either way the interleaving has been reached, which is all this control claims. 30s
+// rather than 10 for the same reason: the deadline has to outlast a slow, loaded box, and it is
+// only ever paid when something is genuinely wrong.
 func waitForLockWaiter(t *testing.T, database *db.DB) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		var waiters int
 		if err := database.QueryRow(`
 			SELECT COUNT(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND datname = current_database()`).Scan(&waiters); err != nil {
+			WHERE datname = current_database()
+			  AND (wait_event_type = 'Lock'
+			       OR (state = 'active' AND query LIKE '%ON CONFLICT (workspace_id, type, payload) DO UPDATE%'))`).
+			Scan(&waiters); err != nil {
 			t.Fatalf("read pg_stat_activity: %v", err)
 		}
 		if waiters > 0 {
@@ -130,6 +152,7 @@ func waitForLockWaiter(t *testing.T, database *db.DB) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("no backend ever blocked on a lock, so the losing interleaving was never " +
-		"reached and this test would pass whatever ON CONFLICT does")
+	t.Fatal("in 30s no backend ever blocked on a lock and none was running the reschedule's " +
+		"upsert, so the losing interleaving was never reached and this test would pass " +
+		"whatever ON CONFLICT does")
 }
