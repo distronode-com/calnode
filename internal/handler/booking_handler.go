@@ -1970,10 +1970,43 @@ func (h *Handler) replaceReminderJobs(ctx context.Context, bookingID, etID strin
 		if err != nil {
 			return fmt.Errorf("replace reminder jobs: marshal payload: %w", err)
 		}
+		// ⛔ UPSERT, not DO NOTHING, and the difference is a silently wrong reminder.
+		//
+		// This runs in the detached rescheduleSideEffects goroutine, and the booking's
+		// CREATE path enqueues its reminders from a detached goroutine too. Both write
+		// the identical payload {booking_id, hours_before}, and jobs carries a unique on
+		// (workspace_id, type, payload) — so if the create-side INSERT lands after the
+		// DELETE above and before this statement, DO NOTHING would drop the rescheduled
+		// row and leave the reminder pinned to the ORIGINAL time, permanently and with
+		// no error anywhere. Measured at 2 failures in 60 runs on PostgreSQL; the window
+		// is one booking created and rescheduled inside the same second.
+		//
+		// DO UPDATE makes all three interleavings agree on the same answer: the
+		// reschedule's run_at. The create side deliberately keeps DO NOTHING — a create
+		// must never overwrite a reschedule, and by the time the two can collide the
+		// reschedule is the later fact.
+		//
+		// The arbiter is the index's exact column set, read from migration 00060 rather
+		// than assumed: both engines declare (workspace_id, type, payload) after it, and
+		// on PostgreSQL a target that does not match an index is a runtime error rather
+		// than a compile one.
+		//
+		// A `done` row for this payload never reaches this statement: the DELETE above
+		// spares only 'running', so an already-fired reminder is removed and re-inserted
+		// fresh. That is the intended semantics — the attendee was reminded about a time
+		// that has since moved, so they are owed another reminder at the new one.
+		//
+		// ⚠️ WHERE jobs.status <> 'running' preserves the invariant the DELETE already
+		// encodes: a job the worker has claimed is being executed right now, and
+		// resetting it to pending underneath would either double-send or be clobbered by
+		// the worker's own completion write. A running conflict therefore leaves the row
+		// alone, which is exactly what happens today.
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
 			VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)
-			ON CONFLICT DO NOTHING`,
+			ON CONFLICT (workspace_id, type, payload) DO UPDATE
+			   SET run_at = excluded.run_at, status = 'pending', attempts = 0
+			 WHERE jobs.status <> 'running'`,
 			uid.New(), string(payload), runAt.Format(time.RFC3339)); err != nil {
 			return fmt.Errorf("replace reminder jobs: insert: %w", err)
 		}

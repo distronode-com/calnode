@@ -1,0 +1,135 @@
+package handler_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/handler"
+	"github.com/calnode/calnode/internal/uid"
+)
+
+// The reminder-replacement race, forced rather than waited for.
+//
+// Two detached goroutines write the same reminder payload: the booking CREATE path
+// (enqueueBookingReminders) and the RESCHEDULE path (replaceReminderJobs). jobs carries a
+// unique on (workspace_id, type, payload), so exactly one row can exist per
+// (booking, hours_before) — and the losing interleaving is:
+//
+//	reschedule: DELETE reminder rows for this booking   (create's row not yet visible)
+//	create:     INSERT the reminder row at the OLD time
+//	reschedule: INSERT the reminder row at the NEW time -> conflict
+//
+// With ON CONFLICT DO NOTHING the last step is a silent no-op and the reminder stays
+// pinned to the original time forever. With DO UPDATE it wins, which is what this holds.
+//
+// ⛔ The interleaving is forced by the unique index itself, not by a sleep: the
+// create-side row is inserted inside an UNCOMMITTED transaction, so it is invisible to
+// the DELETE and yet already owns the key — which makes the reschedule's INSERT BLOCK
+// until that transaction commits. The test waits for a backend to actually be
+// lock-waiting before committing, so a run where the interleaving was never reached fails
+// loudly instead of passing on the easy path.
+func TestReplaceReminderJobs_upsertSurvivesTheLosingInterleaving(t *testing.T) {
+	h, database, key, _ := setupWorkspaceWithDB(t)
+	ctx := context.Background()
+
+	if database.Dialect() != db.DialectPostgres {
+		t.Skip("LOUD SKIP: this needs two concurrent connections to hold one uncommitted " +
+			"row while another transaction blocks on its key. SQLite runs on a single " +
+			"connection by design (it is what serialises write transactions there), so " +
+			"the interleaving cannot be constructed and the race cannot occur either.")
+	}
+
+	slug, etID := seedEventTypeHTTP(t, h, key)
+	bookStart := futureAt(10, 10, 0)
+	newStart := futureAt(13, 9, 0)
+	bookingID := createBookingViaHTTP(t, h, slug, bookStart.Format(time.RFC3339))
+
+	// Clean slate: drop whatever the create path enqueued, so the only rows in play are
+	// the ones this test writes.
+	if _, err := database.ExecContext(ctx,
+		`DELETE FROM jobs WHERE type = 'reminder.send'`); err != nil {
+		t.Fatalf("clear reminder jobs: %v", err)
+	}
+
+	oldRunAt := bookStart.Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	wantRunAt := newStart.Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+	payload := fmt.Sprintf(`{"booking_id":%q,"hours_before":24}`, bookingID)
+
+	// The create side's insert, held open. Identical payload, OLD run_at.
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin create-side tx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO jobs (id, type, payload, run_at, status, attempts, max_attempts)
+		VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)
+		ON CONFLICT (workspace_id, type, payload) DO NOTHING`,
+		uid.New(), payload, oldRunAt); err != nil {
+		t.Fatalf("create-side insert: %v", err)
+	}
+
+	// The reschedule, which will delete nothing (the row above is invisible) and then
+	// block on its key.
+	replaced := make(chan error, 1)
+	go func() { replaced <- handler.ReplaceReminderJobsForTest(h, ctx, bookingID, etID, newStart) }()
+
+	waitForLockWaiter(t, database)
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit create-side tx: %v", err)
+	}
+	if err := <-replaced; err != nil {
+		t.Fatalf("replaceReminderJobs: %v", err)
+	}
+
+	var rows int
+	if err := database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs WHERE type = 'reminder.send'`).Scan(&rows); err != nil {
+		t.Fatalf("count reminder jobs: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("reminder rows = %d; want 1 — the unique on (workspace_id, type, payload) "+
+			"admits exactly one row per (booking, hours_before)", rows)
+	}
+
+	var gotRunAt, status string
+	if err := database.QueryRowContext(ctx,
+		`SELECT run_at, status FROM jobs WHERE type = 'reminder.send'`).Scan(&gotRunAt, &status); err != nil {
+		t.Fatalf("read surviving reminder job: %v", err)
+	}
+	if gotRunAt != wantRunAt {
+		t.Errorf("surviving reminder run_at = %s; want %s (the rescheduled time). "+
+			"%s is the ORIGINAL time, which is what ON CONFLICT DO NOTHING leaves behind",
+			gotRunAt, wantRunAt, oldRunAt)
+	}
+	if status != "pending" {
+		t.Errorf("surviving reminder status = %q; want pending", status)
+	}
+}
+
+// waitForLockWaiter blocks until some backend in this database is waiting on a lock,
+// which is the reschedule's INSERT queueing behind the uncommitted key. It fails rather
+// than returning if that never happens: without the block, the test would be exercising
+// the ordinary interleaving and proving nothing.
+func waitForLockWaiter(t *testing.T, database *db.DB) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiters int
+		if err := database.QueryRow(`
+			SELECT COUNT(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND datname = current_database()`).Scan(&waiters); err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		if waiters > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("no backend ever blocked on a lock, so the losing interleaving was never " +
+		"reached and this test would pass whatever ON CONFLICT does")
+}

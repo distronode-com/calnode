@@ -111,26 +111,56 @@ func TestRescheduleBooking_updatesReminderJob(t *testing.T) {
 	// is one. The Scan error is captured rather than discarded: swallowing it turned a
 	// "json_extract does not exist" into an empty run_at and a two-second poll that
 	// then reported itself as a time-parsing failure.
+	//
+	// ⛔ Three things here are about a flake, not about style, and each one hid the
+	// timeout it was supposed to report. Measured at 2 failures in 60 PostgreSQL runs
+	// after feat/platform-hooks merged, 0 in 60 before it.
+	//
+	//  1. The loop polls for the WANTED run_at. Breaking on "anything that is not the
+	//     old string" meant any stale or unrelated row ended the wait, and a row whose
+	//     text differs while its instant does not (a second reminder offset, a
+	//     differently-formatted stamp) counted as success.
+	//  2. Falling out of the loop on the DEADLINE is a Fatal that says so. Before, the
+	//     last value read stayed in runAt and was asserted on, so a two-second timeout
+	//     reported itself as "run_at is three days wrong" — a wrong answer to a
+	//     question nobody asked, and the reason this took a bisect to attribute.
+	//  3. ORDER BY run_at DESC LIMIT 1 makes the read deterministic. An event type may
+	//     have several reminder offsets, so QueryRow without an order returns an
+	//     arbitrary one of them on PostgreSQL and a stable one on SQLite — a test that
+	//     passes on one engine and flakes on the other.
+	//  4. The deadline is proportional to what is being waited FOR. replaceReminderJobs
+	//     is the LAST step of the detached rescheduleSideEffects goroutine, after two
+	//     emails and a webhook enqueue, and that goroutine gives itself 30s. Two
+	//     seconds was not a correctness bound, it was a bet on scheduling — and on the
+	//     PostgreSQL lane, where every one of those steps is a round trip and the
+	//     package runs its tests in parallel on 4 cores, it lost about 3% of the time.
+	//     Ten seconds still fails a real regression promptly; it just no longer fails a
+	//     busy machine.
 	var runAt string
 	var lastErr error
 	payloadMatch := database.Dialect().SQL(
 		`json_extract(payload, '$.booking_id') = ?`,
 		`payload::json ->> 'booking_id' = ?`)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	wantRunAt := wantNewReminder.Format(time.RFC3339)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
 		lastErr = database.QueryRowContext(ctx, `
 			SELECT run_at FROM jobs
 			WHERE type = 'reminder.send'
 			  AND `+payloadMatch+`
-			  AND status = 'pending'`, bookingID).
+			  AND status = 'pending'
+			ORDER BY run_at DESC
+			LIMIT 1`, bookingID).
 			Scan(&runAt)
-		if runAt != "" && runAt != oldReminderAt.Format(time.RFC3339) {
+		if runAt == wantRunAt {
 			break
 		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out after 10s waiting for the rescheduled reminder job: "+
+				"latest pending run_at = %q, want %q (old was %q); last query error: %v",
+				runAt, wantRunAt, oldReminderAt.Format(time.RFC3339), lastErr)
+		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	if runAt == "" {
-		t.Fatalf("no pending reminder job appeared within 2s; last query error: %v", lastErr)
 	}
 
 	gotRunAt, err := time.Parse(time.RFC3339, runAt)
