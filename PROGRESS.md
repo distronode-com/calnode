@@ -203,4 +203,146 @@ retries within a bounded budget. Three consecutive full PostgreSQL runs clean.
    `run_at <= ?`). That is byte ordering under SQLite. Under a non-`C` Postgres
    collation, ordering of mixed shapes (a space-separated `run_at` against a
    `T`-separated one) is not guaranteed to match. Worth either `COLLATE "C"` on
-   those columns or a deliberate decision that it is safe.
+   those columns or a deliberate decision that it is safe. **Closed by Boundary 7.**
+
+## Boundary 7 — the last four items — DONE
+
+Open item 2 above, the `RETURNING` clause Boundary 2 left unverified, the bare
+`Open` the port had been dragging along, and the hard-coded pool size.
+
+### 1. TEXT timestamps are `COLLATE "C"` — migration 00059
+
+**54 columns across 27 tables**, enumerated from the migrated schema rather than
+from memory: every `*_at` (49 of them, including `locked_until`), plus
+`availability_rules.start_time`/`end_time` and `availability_overrides.date`/
+`start_time`/`end_time`, which hold `HH:MM` and `YYYY-MM-DD` and are ordered as
+times too (`ORDER BY day_of_week, start_time`, `ORDER BY date`). One grouped
+`ALTER TABLE` per table, so each is rewritten once. The SQLite half is a no-op
+file: BINARY *is* memcmp, so there is nothing to pin, and the file exists because
+the directories keep one file per version.
+
+Fixed in the schema rather than in the predicates. There are ~20 distinct
+lexicographic time comparisons in the tree (`run_at <= ?`, `expires_at > ?`,
+`locked_until < ?`, `decided_at BETWEEN`, `start_at`/`end_at` overlap,
+`created_at < ?`, several `ORDER BY created_at`); a `COLLATE "C"` clause on each
+is 20 chances to forget one, and forgetting is silent.
+
+⚠️ **The load-bearing site is `internal/handler/notetaker.go`**, which writes
+`datetime('now')`'s space-separated shape *because* it sorts before any
+`T`-separated stamp, which is what makes a notetaker job due immediately. That is
+a dependency on byte ordering in production code, not a theoretical one.
+
+**Measured, and it corrects the framing of the open item.** The server this
+branch develops against is PostgreSQL 17.11 with `datcollate = en_US.utf8`
+(libc provider) — read from `pg_database`, because ⛔ `SHOW lc_collate` no longer
+exists (it stopped being a GUC in PostgreSQL 16 and errors with "unrecognized
+configuration parameter", so the obvious way to ask is a dead end). The two
+shapes the schema actually stores do **not** flip under it:
+
+| pair | en_US.utf8 | memcmp |
+|---|---|---|
+| `2026-01-01 20:00:00` vs `2026-01-01T10:00:00Z` | space first | space first |
+
+Nor under **any of the other 878 collations installed on the server** — scanned,
+not assumed. glibc ignores the space at the primary level but still sorts a digit
+before `T`, which happens to agree with memcmp. So a control built only on those
+two values would pass with or without the migration, which is exactly the
+vacuous green the packet warned about. The control therefore also carries RFC
+3339's lower-case `t`/`z` spelling (§5.6 permits it, so an importer or a
+third-party API can hand it to us), where the two orders really do differ:
+
+```
+plain: 2026-01-01 10:00:00 | 2026-01-01T10:00:00.000Z | 2026-01-01t10:00:00z | 2026-01-01T10:00:00Z
+C    : 2026-01-01 10:00:00 | 2026-01-01T10:00:00.000Z | 2026-01-01T10:00:00Z | 2026-01-01t10:00:00z
+```
+
+`internal/db/collation_test.go` holds it three ways. (a) An audit over
+`information_schema.columns` matching by NAME, so a timestamp column added by a
+later migration is caught without anyone remembering — `collation_name` is NULL
+for a default-collated column and `'C'` after an explicit `COLLATE`, so the
+assertion is exact. (b) The control above, which **skips naming the server's
+collation** if the default already orders byte-wise, rather than passing
+vacuously. (c) An ordering test on `jobs.run_at` through the worker's real claim
+predicate.
+
+Proved failable by dropping `jobs.run_at` from the migration:
+
+```
+collation_test.go:79: 1 of 54 timestamp columns are not COLLATE "C":
+    jobs.run_at = <database default>
+collation_test.go:242: ORDER BY run_at =
+    [… 2026-01-01t10:00:00z 2026-01-01T10:00:00Z …]
+    want byte order
+    [… 2026-01-01T10:00:00Z 2026-01-01t10:00:00z …]
+```
+
+### 2. `RETURNING position` — works unchanged on Postgres
+
+No `d.SQL` pair, no rewrite. The clause is the auto-position `INSERT` in
+`question_handler.go`, which computes the position inside the statement
+(`VALUES (…, (SELECT COALESCE(MAX(position)+1, 0) …)) RETURNING position`) so two
+concurrent creates cannot land on the same one.
+
+The new test goes through the HTTP handler on `dbtest.Open(t)`, so it follows the
+environment like everything else, and it asserts the value the handler **scanned
+from RETURNING** as well as the row left behind: a `RETURNING` that quietly
+produced a zero would still leave a correct row, so checking the table alone —
+which `TestCreateQuestion_autoPosition` already did — cannot see it. The
+explicit-position case is in the same test because the next auto position after a
+pinned 9 must be 10, which is what shows the subselect is evaluated by the engine
+rather than the sequence being an artifact of insertion order.
+
+Measured: **0, 1, 2, then 9 explicit, then 10 — identical on both engines.**
+
+### 3. `db.Open` deleted
+
+It returned a bare `*sql.DB` "for callers that have not moved to OpenDB yet".
+Nothing outside the package's own tests used it, and it could only ever do harm:
+statements through that handle are not rebound, so every `?` is a Postgres syntax
+error found at runtime, far from the call. It was also the shape most likely to
+be copied by whoever added the next call site.
+
+`/readyz` was the one production caller reaching into the exported embedded field
+(`db.SchemaReady(ctx, h.db.DB)`). `*db.DB` now carries `SchemaReady` and
+`AppliedVersion`, so the handler asks the handle. The package-level functions stay
+for the cases that genuinely hold a bare pool — goose's bookkeeping, the tests
+that open an unmigrated one — and `db_test.go` passes `database.DB` explicitly,
+which says at the call site that the bare pool is deliberate. `TestOpen_inMemory`
+became `TestOpenDB_inMemory` rather than staying named after something that no
+longer exists. No test asserts the symbol's absence: the build is the proof.
+
+### 4. Pool size is configurable
+
+`DB_MAX_OPEN_CONNS` / `DB_MAX_IDLE_CONNS`, defaults unchanged at 10/5, validated
+in `config.PoolFromEnv`: unset, unparsable or non-positive falls back to the
+default with a warning (matching `getBool`/`getDuration`, which also refuse to
+fail a boot over a typo in an optional knob), and idle above open is clamped —
+`database/sql` reduces it silently anyway, so the clamped pair is the honest
+description of what the pool will do. ⚠️ The clamp has to apply to the **default**
+idle as well: `DB_MAX_OPEN_CONNS=2` alone must give 2/2, not 2/5. A test pins it.
+
+`OpenDB` reads `PoolFromEnv` itself rather than taking the numbers as an
+argument, so all five entry points pick them up without five identical edits and
+without one of them silently keeping the defaults; `db.WithPool` is the override
+for a caller that must not follow the environment. `db` → `config` is not a
+cycle (`config` imports only the standard library).
+
+**SQLite stays pinned at 1/1 and ignores both the environment and `WithPool`.**
+That is the correctness guarantee, not a preference: the single connection is
+what serialises write transactions (it is why `booking.lockHosts` is a no-op
+there) and the pragmas are connection-scoped.
+`TestOpenDB_sqlitePoolIsNotConfigurable` asserts it with both knobs at 40/20, for
+the `:memory:` and file forms.
+
+The idle limit cannot be read back — `sql.DBStats` exposes the open limit only —
+so it is measured: four live transactions force four connections, and after
+committing them all the pool keeps **1** with `WithPool(4, 1)`.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, **28/28 packages ok on SQLite and
+28/28 on PostgreSQL**. Negative control, the same PostgreSQL command with the
+password changed to `wrong`: `internal/db` **fails** rather than skipping, with
+`failed SASL auth: FATAL: password authentication failed for user "postgres"
+(SQLSTATE 28P01)` — including `TestPostgres_idleLimitApplied`, the one new test
+whose assertions could conceivably have held without a server.
