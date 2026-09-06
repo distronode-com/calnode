@@ -1840,6 +1840,129 @@ deadline expired, and asserted on that — so a timeout surfaced as "`run_at` is
 wrong". A poll loop that falls through to an assertion on stale data will misattribute every
 failure it ever catches.
 
+## Boundary 6, part two — export, import and erasure (D12)
+
+`internal/handler/platform_data.go`. Three more `Platform` routes behind the same token
+gate: `POST …/export`, `POST …/import`, `DELETE …/attendees?email=`.
+
+### The replay order is data, not convention
+
+`exportTableOrder` is a hand-ordered list (parents before children) and the document carries
+its tables as an ordered ARRAY, because import replays them in the order it receives.
+Alphabetical — `db.TenantTables`' order — would put `booking_answers` before `bookings` and
+`event_type_hosts` before `event_types`, i.e. a foreign-key violation.
+
+⛔ **`exportCoversEveryTenantTable` runs at request time**, not only in a test: it fails the
+export if any `db.TenantTables` entry is missing from the order, or if the order names
+something that is not a tenant table. `TestTenancy_tableListsCoverTheSchema` already forces a
+new table to be classified; this makes the same guarantee reach the backups, so a table added
+by a later migration cannot be silently absent from every tenant's export. Being wrong here
+produces data that was never backed up, which is exactly the class of failure nobody notices
+until they need the backup.
+
+Rows are read with `SELECT *` + `rows.Columns()` rather than 32 hand-written column lists,
+for the same reason: a migration that adds a column would otherwise stop exporting it, and
+the loss would surface only as data missing after an import. `ORDER BY 1` makes two exports
+of one workspace byte-comparable, which is what the round-trip test relies on.
+
+### ⛔ Decision: the DEK does NOT travel; a fingerprint does
+
+The turn's instruction said "the `crypto_keystore` row for the workspace travels with it
+because the DEK is per tenant". **There is no such row.** `crypto_keystore` has no
+`workspace_id` at all — it is exempt (D2) and holds one wrapped DEK per PROCESS (D3),
+labelled `primary` / `recovery`. Verified in the schema rather than assumed.
+
+So carrying it was not an option, and manufacturing one would have been worse than useless:
+an export of a SINGLE tenant would then contain the key that decrypts EVERY tenant's secrets
+on that instance, which is the opposite of what the isolation exists for.
+
+What travels is `dek_fingerprint`: SHA-256 over the already-encrypted `wrapped_dek`, which
+cannot be reversed to the key. Equal fingerprints mean the two instances share a data key, so
+the document's `_enc` columns will decrypt there. **Different ones make import refuse with
+409.** That refusal is the point: without it the rows import perfectly and then every secret
+in them — SMTP password, LLM key, LiveKit secret, calendar tokens — fails at first use, one
+integration at a time, long after anyone is watching. Import is the only moment the two keys
+can be compared. The message names `CALNODE_ENCRYPTION_KEY`, because moving it with the data
+is the operator's actual remedy.
+
+⚠️ A per-tenant DEK would change all of this, plus D3 and the schema. It is a separate
+packet, and until then moving a workspace between instances means moving the encryption key
+with it.
+
+Secrets and API-key hashes otherwise travel **verbatim**, per the contract: a tenant whose
+keys and manage links stopped working on migration has not been migrated. The consequence is
+that the document is as sensitive as the database.
+
+### ⛔ Import forces the target workspace
+
+Every row is inserted with `workspace_id` = the id **in the URL**, and the document's own
+value is discarded. This endpoint is authorised by the platform token, so trusting the
+document would make an export of any workspace a way to write rows into any other.
+
+⚠️ **Ids are GLOBAL primary keys, so import is a MOVE and not a copy.** Replaying a document
+into a second workspace while the first still holds its rows collides on `users_pkey`. The
+supported operation is export → delete → import, usually into another region's instance where
+those ids do not exist; `TestPlatformData_importForcesTheTargetWorkspace` performs exactly
+that inside one database, which is the only place the workspace_id question can be asked.
+This is worth knowing before anyone tries to use import to clone a tenant for staging.
+
+`UseNumber` on the decoder, and `importValue` converts a `json.Number` to `int64` when it is
+one: without it every numeric column round-trips through `float64` and a large id loses its
+low bits silently.
+
+### Erasure: exactly one email, in exactly one workspace, cancelling nothing
+
+⚠️ **`booking_answers` carries no attendee** — it is keyed `(booking_id, question_id)` — so
+"their answers" has to be derived. They are erased only for bookings where the erased person
+was the **only** attendee. With anyone else still on the booking the answers cannot be
+attributed to them, and deleting them would erase a third party's data to satisfy someone
+else's request. Both halves are tested: two attendees ⇒ 1 attendee row and **0** answers
+erased; sole attendee ⇒ 1 and 1.
+
+Bookings are not cancelled (the host's calendar and the other attendees' records are not the
+erased person's data), and the workspace boundary holds: the same address in another
+workspace is untouched, because one tenant's erasure request is not consent to delete
+another's records.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test -count=1 ./...` **rc=0 on SQLite (30/30)**.
+PostgreSQL: `internal/handler` **rc=0** (329.5s), `internal/server` **rc=0**, `internal/db`
+**rc=0**.
+
+```
+--- PASS: TestPlatformData_exportDeleteImportRoundTrip (1.31s)
+--- PASS: TestPlatformData_importIntoAPopulatedWorkspaceIs409 (1.29s)
+--- PASS: TestPlatformData_importForcesTheTargetWorkspace (1.33s)
+--- PASS: TestPlatformData_eraseAttendee (1.31s)
+--- PASS: TestPlatformData_eraseTakesAnswersWhenNobodyElseIsOnTheBooking (1.27s)
+--- PASS: TestPlatformData_eraseRequiresAnEmail (1.22s)   [missing, empty, not an email]
+--- PASS: TestPlatformData_routesRefuseWithoutTheToken (1.27s)   [export, import, erase]
+--- PASS: TestPlatformData_importRefusesAForeignDEK (1.28s)
+```
+
+Negative control, the workspace-forcing removed so the document's own `workspace_id` is
+trusted:
+
+```
+--- FAIL: TestPlatformData_importForcesTheTargetWorkspace
+    import into acme: 400 — insert or update on table "server_settings" violates foreign key
+    constraint "server_settings_workspace_id_fkey" (SQLSTATE 23503)
+```
+
+⚠️ Stated precisely, because it is not the failure I predicted: it proves the forcing is
+load-bearing (unfixed 400, fixed 200 with the rows in `acme`), but it fails at the foreign key
+rather than by writing rows into the wrong tenant — the source workspace has been deleted by
+then, so the id the document names no longer exists. The leak shape it guards against is
+unreachable on one instance for the same reason ids are global; the guard matters for a
+destination where `globex` DOES exist.
+
+### Still owed by B6
+
+The SSO + OAuth hand-off on the public host (plan at the end of this file) and the vendor
+webhooks resolving their workspace from the row they name. D13 and D14 are done.
+
 ---
 
 ## D11, the remaining half — the plan for B6

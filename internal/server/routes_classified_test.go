@@ -190,6 +190,9 @@ func TestPlatformRoutesAreTheIdentityHostSet(t *testing.T) {
 		"GET /v1/platform/workspaces/{id}",
 		"PATCH /v1/platform/workspaces/{id}",
 		"DELETE /v1/platform/workspaces/{id}",
+		"POST /v1/platform/workspaces/{id}/export",
+		"POST /v1/platform/workspaces/{id}/import",
+		"DELETE /v1/platform/workspaces/{id}/attendees",
 		// Bootstrap: creates the first user of a single-tenant instance.
 		"POST /v1/setup",
 		// OAuth login and its callbacks live on the identity host, because that is

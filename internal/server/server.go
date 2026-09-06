@@ -335,6 +335,12 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	mux.HandleFunc("GET /v1/platform/workspaces/{id}", h.Platform((*H).GetWorkspace))
 	mux.HandleFunc("PATCH /v1/platform/workspaces/{id}", h.Platform((*H).PatchWorkspace))
 	mux.HandleFunc("DELETE /v1/platform/workspaces/{id}", h.Platform((*H).DeleteWorkspace))
+	// Export, import and erasure. Export and import are POSTs because each is an operation
+	// on the workspace rather than a representation of it, and because an export is far too
+	// large and too sensitive to be a cacheable GET.
+	mux.HandleFunc("POST /v1/platform/workspaces/{id}/export", h.Platform((*H).ExportWorkspace))
+	mux.HandleFunc("POST /v1/platform/workspaces/{id}/import", h.Platform((*H).ImportWorkspace))
+	mux.HandleFunc("DELETE /v1/platform/workspaces/{id}/attendees", h.Platform((*H).EraseAttendee))
 
 	// Bootstrap — public, once-only
 	mux.HandleFunc("POST /v1/setup", h.Platform((*H).Setup))
