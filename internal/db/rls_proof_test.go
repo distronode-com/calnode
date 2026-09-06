@@ -35,6 +35,8 @@ import (
 // appRole is a non-superuser application role with a handle opened as it.
 type appRole struct {
 	name   string
+	dsn    string // the suite's DSN rewritten for this role, search_path pinned
+	schema string
 	handle *db.DB
 }
 
@@ -92,7 +94,8 @@ func newAppRole(t *testing.T, owner *db.DB) *appRole {
 		}
 	}
 
-	handle, err := db.OpenDB(appDSN(t, dsn, name, password, schema))
+	roleDSN := appDSN(t, dsn, name, password, schema)
+	handle, err := db.OpenDB(roleDSN)
 	if err != nil {
 		t.Fatalf("open as %s: %v", name, err)
 	}
@@ -113,7 +116,7 @@ func newAppRole(t *testing.T, owner *db.DB) *appRole {
 			"its own policy unless FORCE is set", schema)
 	}
 
-	return &appRole{name: name, handle: handle}
+	return &appRole{name: name, dsn: roleDSN, schema: schema, handle: handle}
 }
 
 // ownsNothing reports whether the connected role owns none of the schema's

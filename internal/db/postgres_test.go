@@ -3,7 +3,6 @@ package db_test
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"net/url"
 	"os"
@@ -603,7 +602,7 @@ func postgresColumns(t *testing.T, handle *db.DB) map[string][]string {
 	return schema
 }
 
-func scanStrings(t *testing.T, rows *sql.Rows) []string {
+func scanStrings(t *testing.T, rows *db.Rows) []string {
 	t.Helper()
 	defer rows.Close()
 

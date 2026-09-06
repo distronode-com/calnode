@@ -523,3 +523,108 @@ uses it for `Migrate` + `EnableRLS`; Boundary 2 replaces that pair with
 `db.OpenPair`. The other entry points (`mcp`, `reset-admin`, `rotate-key`,
 `recover-key`) still open one handle from `DATABASE_URL` and are untouched —
 they are single-tenant operator tools today, and B3/B6 decide what they become.
+
+## Boundary 2 — the two handles, and the per-statement binding — DONE
+
+`db.OpenPair(appURL, adminURL)` returns `(app, platform)`, `app.Platform()`
+answers with `platform`, and `ForWorkspace(id)` returns a **value** carrying the
+pool plus a string. `OpenDB` is untouched, and a handle from it binds nothing —
+so single-tenant SQLite and single-tenant PostgreSQL run exactly the statements
+they ran before. `TestSingleHandle_forWorkspaceIsIdentity` pins that:
+`ForWorkspace` returns the identical pointer, does not even validate, `Platform()`
+is the handle itself, and `Prepare` still works.
+
+### Binding is per statement, and the release is the part that needed proving
+
+Each `Query`/`QueryRow`/`Exec`/`Begin` on a bound handle takes a pooled
+`*sql.Conn`, runs `SELECT set_config('app.workspace_id', $1, false)`, runs the
+statement there, and gives the connection back: `Exec` immediately, `Row` on
+`Scan`/`Err`, `Rows` on `Close`, `Tx` on `Commit`/`Rollback` (idempotently — a
+`defer tx.Rollback()` after a successful `Commit` is the standard pattern here and
+must not double-close). `Begin` uses `set_config(…, true)`, i.e. `SET LOCAL`, so
+the connection goes back carrying nothing.
+
+Nothing is pinned between statements, which is the point:
+`TestOpenPair_handleSurvivesItsRequest` builds a handle inside a function, lets
+that function return, and then reads through it from four concurrent goroutines.
+Calnode's handlers are full of fire-and-forget goroutines (notify hosts, enqueue
+the webhook, enqueue reminders) that outlive their request, and a handle that
+pinned a session would be unusable in them.
+
+Release is asserted by `handle.Stats().InUse` returning to **0** after every
+shape, with a positive control on the same number: while a cursor or a
+transaction is open it must read **1**, so the zero afterwards means something.
+Proved failable by making `Row.release` and `Rows.Close` skip the release:
+
+```
+--- FAIL: TestOpenPair_workspaceHandleSeesOnlyItsOwn/QueryRow
+    pair_test.go:103: pool reports InUse=2 after two QueryRow/Scan pairs; the connection was not released
+--- FAIL: .../Query
+    pair_test.go:114: with a cursor open the pool reports InUse=3; want 1
+    pair_test.go:133: pool reports InUse=3 after Rows.Close; the connection was not released
+--- FAIL: .../Exec
+    pair_test.go:156: pool reports InUse=3 after Exec; the connection was not released
+--- FAIL: .../Tx
+    pair_test.go:167: with a transaction open the pool reports InUse=4; want 1
+```
+
+### ⛔ `Prepare` is refused on a bound handle
+
+A `*sql.Stmt` is re-prepared on whatever connection the pool hands it, and there
+is no hook to set `app.workspace_id` on that connection first — so a prepared
+statement on a multi-tenant handle would run **unbound**, which is silently
+empty rather than an error. Nothing in the tree prepares a statement (checked, not
+assumed), and a caller that needs one should take a transaction, where the binding
+is a property of the connection for the whole tx.
+
+### `VerifyRoles` — because D4 was otherwise documentation only
+
+Called on the application handle at boot, right after `EnableRLS`, and the boot
+fails if it does. Both halves fail **silently** otherwise:
+
+- The application role being a superuser, having `BYPASSRLS`, or **owning any
+  table in the schema** means it is not constrained by the policies. Nothing
+  breaks. Every request works. It can also read every other workspace. That is a
+  security hole with no symptom, which is exactly the kind of thing that needs a
+  boot-time refusal rather than a doc line.
+- The platform role *not* bypassing means its `''` binding matches no row, so the
+  worker claims nothing and the reconciler enumerates nothing. Also no error, just
+  an instance that quietly does no background work. This is what makes binding
+  `''` on the platform handle (D5) safe rather than a gamble.
+
+`openTenantPair` in the tests runs it, so every case in the file is asserted
+against a configuration the guard accepts.
+
+### ⚠️ `connstore.Execer` had to change, and `destination_test.go` with it
+
+`Execer` was `QueryRowContext(…) *sql.Row`, and it is called with a `*db.DB` in
+three provider packages (`gcal`, `calendar/microsoft`, `caldav`) as well as with a
+`*db.Tx`. Go has no covariant return types, so once `QueryRowContext` returns
+`*db.Row` the interface has to say `*db.Row`. The consequence is that
+`connstore/destination_test.go`'s deliberately-bare `sql.Open("sqlite",
+":memory:")` no longer satisfies it and is now `db.OpenDB("sqlite://:memory:")`
+— which is a correction, not a concession: a bare `*sql.DB` does not rebind
+placeholders either, so holding it up as "Execer accepts this too" was already
+describing a handle that cannot run the tree's SQL on PostgreSQL. The bespoke
+fragment schema is unchanged; `OpenDB` does not migrate.
+
+The compiler found the rest, and there were only three: `*sql.Rows` declarations
+in `handler/availability.go` and `handler/livekit_recording.go`, and the
+`scanStrings` helper in `internal/db/postgres_test.go`.
+
+### Boot
+
+`cmd/calnode/main.go` opens the pair when `MULTI_TENANT` is set and one handle
+otherwise, runs migrations and `EnableRLS` on **`platform`**, and `VerifyRoles` on
+`database`. Both refusals are `os.Exit(1)`.
+
+⚠️ Still single-handle, from `DATABASE_URL`, and untouched: the `mcp`,
+`reset-admin`, `rotate-key` and `recover-key` subcommands. They are single-tenant
+operator tools today; B3 and B6 decide what they become.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test ./...` **rc=0 on SQLite (28/28)** and **rc=0 on PostgreSQL (28/28)**.
+The 11 new cases all run rather than skip on the PostgreSQL lane, and the
+tenant-binding ones skip with a stated reason on SQLite.

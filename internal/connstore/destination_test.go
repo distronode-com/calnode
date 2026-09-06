@@ -2,16 +2,21 @@ package connstore
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	calnodedb "github.com/calnode/calnode/internal/db"
 )
 
 // newDestDB builds just enough schema to exercise the destination lookup.
-func newDestDB(t *testing.T) *sql.DB {
+//
+// A *db.DB rather than a bare *sql.DB, even though nothing here is migrated and
+// the schema is a hand-written fragment: Execer takes *db.Row, because on a
+// tenant-bound handle a row owns the connection its tenant was bound on. A bare
+// *sql.DB does not rebind placeholders either, so it was never the right shape to
+// hold up as "Execer accepts this too".
+func newDestDB(t *testing.T) *calnodedb.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
+	db, err := calnodedb.OpenDB("sqlite://:memory:")
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -32,7 +37,7 @@ func newDestDB(t *testing.T) *sql.DB {
 	return db
 }
 
-func insertCal(t *testing.T, db *sql.DB, id, user, provider, email, calID string, conflicts, dest int) {
+func insertCal(t *testing.T, db *calnodedb.DB, id, user, provider, email, calID string, conflicts, dest int) {
 	t.Helper()
 	if _, err := db.Exec(
 		`INSERT INTO connection_calendars (id, user_id, provider, account_email, calendar_id, check_conflicts, is_destination)

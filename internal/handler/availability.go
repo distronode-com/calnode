@@ -71,7 +71,7 @@ func (h *Handler) ListAvailabilityRules(w http.ResponseWriter, r *http.Request) 
 	user, _ := userFromContext(r.Context())
 
 	var (
-		rows *sql.Rows
+		rows *db.Rows
 		err  error
 	)
 	if etID := r.URL.Query().Get("event_type_id"); etID != "" {

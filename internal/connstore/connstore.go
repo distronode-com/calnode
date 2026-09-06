@@ -11,12 +11,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+
+	"github.com/calnode/calnode/internal/db"
 )
 
 // Execer is satisfied by both *db.DB and *db.Tx — ResolveFlags runs inside whichever
 // transaction the caller already opened for its own upsert.
+//
+// It returns *db.Row rather than *sql.Row because that is what the wrapper hands
+// back: on a tenant-bound handle the row owns the pooled connection its tenant was
+// bound on, and releases it when the caller Scans. A bare *sql.DB therefore no
+// longer satisfies this — which is correct, since a statement issued through one
+// is neither rebound nor tenant-bound.
 type Execer interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryRowContext(ctx context.Context, query string, args ...any) *db.Row
 }
 
 // WhereClause builds the "AND check_conflicts = ? AND is_destination = ?" fragment

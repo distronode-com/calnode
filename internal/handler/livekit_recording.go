@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/dbtime"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/uid"
@@ -299,7 +300,7 @@ func (h *Handler) ListRecordingConsent(w http.ResponseWriter, r *http.Request) {
 		DecidedAt string `json:"decided_at"`
 	}
 	out := []consent{}
-	var rows *sql.Rows
+	var rows *db.Rows
 	var err error
 	if scoped {
 		rows, err = h.db.QueryContext(r.Context(), `

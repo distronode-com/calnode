@@ -67,46 +67,54 @@ func main() {
 		slog.Warn("Google OAuth NOT configured — GOOGLE_CLIENT_ID is empty")
 	}
 
-	database, err := db.OpenDB(cfg.DatabaseURL)
-	if err != nil {
-		logger.Error("failed to open database", "error", err)
-		os.Exit(1)
+	// One handle in single-tenant mode; two in multi-tenant mode, because
+	// migrations, EnableRLS and every cross-tenant read are the PLATFORM role's
+	// work. DATABASE_URL is then a NOBYPASSRLS role that does not own the schema
+	// and cannot run DDL at all. database.Platform() answers with the right one
+	// either way, so nothing downstream has to know which mode this is.
+	var (
+		database, platform *db.DB
+		err                error
+	)
+	if cfg.MultiTenant {
+		database, platform, err = db.OpenPair(cfg.DatabaseURL, cfg.DatabaseAdminURL)
+		if err != nil {
+			logger.Error("failed to open the database pair", "error", err)
+			os.Exit(1)
+		}
+		defer platform.Close()
+	} else {
+		database, err = db.OpenDB(cfg.DatabaseURL)
+		if err != nil {
+			logger.Error("failed to open database", "error", err)
+			os.Exit(1)
+		}
+		platform = database
 	}
 	defer database.Close()
 
-	// Migrations and row-level-security enablement are the PLATFORM role's work,
-	// not the application role's. In multi-tenant mode DATABASE_URL is a
-	// NOBYPASSRLS role that does not own the schema and therefore cannot run DDL
-	// at all; DATABASE_ADMIN_URL is the owner. Single-tenant mode has one role and
-	// one handle, so migrator is just database.
-	//
-	// Boundary 2 replaces this pair of opens with db.OpenPair.
-	migrator := database
-	if cfg.MultiTenant {
-		admin, err := db.OpenDB(cfg.DatabaseAdminURL)
-		if err != nil {
-			logger.Error("failed to open the platform database handle", "error", err)
-			os.Exit(1)
-		}
-		defer admin.Close()
-		migrator = admin
-	}
-
-	if err := migrator.Migrate(); err != nil {
+	if err := platform.Migrate(); err != nil {
 		logger.Error("failed to run migrations", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("database migrations applied")
 
-	// ⛔ Refuse to serve if this fails. Without it every policy created by
-	// migration 00060 is inert, and the process would come up looking multi-tenant
-	// while separating nothing. It is idempotent, so booting twice is fine, and it
-	// is deliberately gated on MULTI_TENANT: FORCE ROW LEVEL SECURITY applies a
-	// policy to the table's owner too, and in single-tenant mode DATABASE_URL is
-	// that owner (see db.EnableRLS).
+	// ⛔ Refuse to serve if either of these fails. Without EnableRLS every policy
+	// created by migration 00060 is inert and the process comes up looking
+	// multi-tenant while separating nothing; without VerifyRoles the same is true
+	// of a DATABASE_URL that happens to bypass or to own the tables. Both failures
+	// are otherwise silent — every request works, and each one can read every
+	// workspace. EnableRLS is idempotent, so booting twice is fine, and it is
+	// deliberately gated on MULTI_TENANT: FORCE ROW LEVEL SECURITY applies a policy
+	// to the table's owner too, and in single-tenant mode DATABASE_URL is that
+	// owner (see db.EnableRLS).
 	if cfg.MultiTenant {
-		if err := migrator.EnableRLS(context.Background()); err != nil {
+		if err := platform.EnableRLS(context.Background()); err != nil {
 			logger.Error("failed to enable row-level security; refusing to serve", "error", err)
+			os.Exit(1)
+		}
+		if err := database.VerifyRoles(context.Background()); err != nil {
+			logger.Error("database roles cannot enforce tenant isolation; refusing to serve", "error", err)
 			os.Exit(1)
 		}
 		logger.Info("row-level security enabled", "tables", len(db.TenantTables))
