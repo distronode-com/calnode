@@ -44,6 +44,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	h.SetDataDir("data")
 	h.SetEncKey(cfg.EncryptionKey)
 	h.SetSSOSecret(cfg.SSOSharedSecret)
+	h.SetMetricsToken(cfg.MetricsToken)
 	h.SetDemoMode(cfg.DemoMode)
 	h.SetDemoResetInterval(cfg.DemoResetInterval)
 
@@ -258,6 +259,10 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	mux.HandleFunc("GET /healthz", h.Healthz)
 	mux.HandleFunc("GET /readyz", h.Readyz)
 	mux.HandleFunc("GET /version", h.Version)
+	// Prometheus exposition. Registered unconditionally and gated inside the handler on
+	// METRICS_TOKEN, which answers 404 when it is unset — so an instance never publishes
+	// its request volume or booking rate by accident, and never advertises the endpoint.
+	mux.HandleFunc("GET /metrics", h.Metrics)
 
 	// Bootstrap — public, once-only
 	mux.HandleFunc("POST /v1/setup", h.Setup)

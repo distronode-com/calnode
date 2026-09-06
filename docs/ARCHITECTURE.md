@@ -63,6 +63,30 @@ app you must `pnpm build` in `frontend/` **and** rebuild/restart the Go binary
   return handler + a `drain` func.
 - Ops endpoints: `GET /healthz`, `GET /readyz` (readiness gate), `GET /version`
   (build stamp from `internal/buildinfo`).
+- **`GET /metrics`** — Prometheus text exposition, hand-written in `internal/metrics`
+  (no client library, for the reason `internal/livekit` signs its own tokens: a
+  one-page stable text protocol is not worth a dependency tree in a self-hosted
+  binary). Series: `calnode_build_info{version,commit}`,
+  `calnode_http_requests_total{class,status}`,
+  `calnode_http_request_duration_seconds` (histogram, fixed buckets),
+  `calnode_jobs_pending`, `calnode_jobs_failed_total`,
+  `calnode_bookings_total{event}` for created/cancelled/rescheduled,
+  `process_start_time_seconds`, `go_goroutines`, `go_memstats_alloc_bytes`.
+  ⛔ **Gated on `Authorization: Bearer $METRICS_TOKEN`, and it answers 404** — identical
+  to the mux's own not-found — when the token is unset or wrong. Not 401: a 401 confirms
+  the endpoint exists, and these numbers are a business feed (bookings per hour, request
+  volume by surface) on an instance meant to be publicly reachable. Not rate-limited
+  either; a scrape runs every few seconds by design and a limiter would punch gaps that
+  read as downtime.
+  `class` is derived from the path **prefix only** (`public|admin|api|mcp|ops`), so the
+  label set is closed and can never be attacker-chosen — the usual way a metrics endpoint
+  becomes an out-of-memory vector. Read it as "which surface of the URL space", not "how
+  the request authenticated": `POST /v1/bookings` is public and unauthenticated and still
+  counts as `api`. Requests are counted in the existing `Logging` middleware, the only
+  place that already knows the final status and elapsed time; job depth is read from the
+  `jobs` table per scrape, because any instance can claim any job. A host **reassignment**
+  fires the `booking.rescheduled` webhook but is deliberately **not** counted as a
+  reschedule — it does not move the meeting.
 - Graceful shutdown drains the worker and in-flight requests before `db.Close()`.
 
 ---

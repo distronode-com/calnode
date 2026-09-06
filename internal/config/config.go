@@ -49,6 +49,11 @@ type Config struct {
 	// page an admin session can reach.
 	SSOSharedSecret string
 
+	// MetricsToken is the bearer token that authorises GET /metrics. Empty ⇒ that
+	// endpoint 404s, so an instance never publishes its request volume, booking rate or
+	// queue depth by accident. Env-only, for the same reason as SSOSharedSecret.
+	MetricsToken string
+
 	// CookieSecure sets the Secure flag on session cookies. Defaults to true
 	// when BASE_URL starts with https://, but can be overridden explicitly via
 	// COOKIE_SECURE=false for HTTPS-terminated-at-proxy setups where the binary
@@ -127,6 +132,7 @@ func Load() *Config {
 	cfg.EncryptionKey = os.Getenv("CALNODE_ENCRYPTION_KEY")
 	cfg.RecoverySecret = os.Getenv("CALNODE_RECOVERY_SECRET")
 	cfg.SSOSharedSecret = os.Getenv("CALNODE_SSO_SHARED_SECRET")
+	cfg.MetricsToken = os.Getenv("METRICS_TOKEN")
 	// PUBLIC_BASE_URL overrides the booker-facing host (custom/vanity domain).
 	// Unset → inherits BASE_URL, so single-domain deploys need only set BASE_URL.
 	cfg.PublicBaseURL = getEnv("PUBLIC_BASE_URL", cfg.BaseURL)

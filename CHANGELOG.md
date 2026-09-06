@@ -12,6 +12,18 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 ## [Unreleased]
 
 ### Added
+- **`GET /metrics`: Prometheus metrics, off until you set `METRICS_TOKEN`.** Build
+  identity, requests by surface and status, a request-duration histogram, pending and
+  failed job counts, bookings created/cancelled/rescheduled, process start time and two Go
+  runtime gauges. No new dependency — the exposition format is a page of text, and a
+  scrape endpoint is not worth a dependency tree in a binary you self-host.
+
+  Without the token, and with a wrong one, it answers 404 rather than 401: these numbers
+  are a business feed, and an operator who has not configured a token has not agreed to
+  publish it, so there is nothing to advertise either. The `class` label comes from the
+  path prefix and nothing else, so the series count is fixed at five times the handful of
+  status codes and a request cannot invent a new one.
+
 - **`FRAME_ANCESTORS`: embed the admin UI in your own console.** Space-separated origins
   (`https://console.example.com 'self'`); when set, `/admin/` sends
   `Content-Security-Policy: frame-ancestors <list>`. The public booking pages are

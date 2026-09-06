@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/calnode/calnode/internal/metrics"
 )
 
 type contextKey string
@@ -43,12 +45,18 @@ func Logging(logger *slog.Logger, next http.Handler) http.Handler {
 
 		next.ServeHTTP(rw, r)
 
+		// Counted here rather than in a middleware of its own: this is already the one
+		// place that knows the final status and the elapsed time, and a second wrapper
+		// measuring the same thing would drift from the log line it is supposed to match.
+		elapsed := time.Since(start)
+		metrics.HTTPRequest(metrics.ClassifyPath(r.URL.Path), rw.status, elapsed)
+
 		reqID, _ := r.Context().Value(requestIDKey).(string)
 		logger.InfoContext(r.Context(), "request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.status,
-			"duration_ms", time.Since(start).Milliseconds(),
+			"duration_ms", elapsed.Milliseconds(),
 			"remote_addr", r.RemoteAddr,
 			"request_id", reqID,
 		)
