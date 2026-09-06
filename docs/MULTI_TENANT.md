@@ -46,6 +46,7 @@ magic link), and every route says which of the two it uses.
 | `CALNODE_ENCRYPTION_KEY` | as before, and it must travel with any workspace moved between instances |
 | `BASE_URL` | the identity host (below) |
 | `PUBLIC_BASE_URL` | **ignored**; each workspace's `public_host` replaces it |
+| `DATA_DIR` | where uploads (avatars, branding) are written; defaults to the relative `data`. A read-only image sets it to its mounted volume |
 
 ## The isolation model
 

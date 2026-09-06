@@ -46,7 +46,14 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	h.SetMultiTenant(cfg.MultiTenant)
 	h.SetBaseURL(cfg.BaseURL)
 	h.SetPublicBaseURL(cfg.PublicBaseURL)
-	h.SetDataDir("data")
+	// DATA_DIR, defaulting to the relative "data" every deployment has always used.
+	// The fallback is repeated here because tests build a Config literal that skips
+	// Load, and an empty dir would put uploads beside the binary.
+	dataDir := cfg.DataDir
+	if dataDir == "" {
+		dataDir = "data"
+	}
+	h.SetDataDir(dataDir)
 	h.SetEncKey(cfg.EncryptionKey)
 	h.SetSSOSecret(cfg.SSOSharedSecret)
 	h.SetPlatformToken(cfg.PlatformToken)
