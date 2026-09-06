@@ -226,6 +226,31 @@ the platform/recovery secret doesn't expose secrets.
   Owner-gated actions: grant/revoke admin, transfer ownership. Admins can cancel
   any booking, see all bookings, manage teams/members. Safe-removal + archive
   guards prevent orphaning.
+- **Signed session hand-off** (`GET /v1/auth/sso?token=<jwt>`, `sso.go`) lets an
+  external identity system that has already authenticated someone drop them into a
+  Calnode session without a second login. **Off unless `CALNODE_SSO_SHARED_SECRET` is
+  set** — an unconfigured instance answers **404**, deliberately indistinguishable from
+  a build without the feature. The token is a compact **HS256** JWT verified in-tree
+  (`crypto/hmac`, like `internal/livekit`'s signing) with a constant-time compare; only
+  HS256 is accepted, checked *before* the signature so the `alg: none` downgrade never
+  reaches it. Claims: `iss` (any non-empty string, logged only), `aud` = `BASE_URL`
+  (what stops a staging token being spent on production when a secret is shared by
+  mistake), `sub` = email, `name`, `role` ∈ owner|admin|member, `iat`, `exp` at most
+  **60 s** after `iat` with **30 s** of clock skew allowed either way, and a unique
+  `jti`. `wid` is parsed and ignored — a multi-workspace mode will use it. The `jti` is
+  claimed in **`sso_nonces`** *before* the session is created, so a replay inside the
+  validity window collides on the primary key rather than racing a read-then-write; the
+  worker purges expired rows in its GC pass (§13). Success is a 302 to `/admin/`, or to
+  `?next=` when that is a same-origin absolute path (anything with a scheme, a `//`
+  prefix, a backslash or a control character is a 400, refused rather than sanitised).
+  Every other failure is a 401 whose JSON body names the claim that failed. Rate-limited
+  like the OAuth callbacks.
+  ⛔ **This is the one path that creates a user without an invite.** Everywhere else an
+  unknown email is refused (`no_account`); here the shared secret is the difference — the
+  caller is the operator's own identity system. On creation the claim's `role` is applied;
+  on an existing user the role is **not** rewritten, except that a claim asking for
+  `owner` bootstraps ownership when the instance has none (the one-owner invariant §6
+  maintains means there is nothing to displace). An archived user is still refused.
 - **Offboarding = archive** (`users.archived_at`), never hard-delete — preserves
   bookings, event-type ownership, team links. Archived ⇒ no login, hidden from
   lists, skipped in routing/slots, event types deactivated. Reversible (restore).

@@ -115,6 +115,13 @@ func (w *Worker) Poll(ctx context.Context) {
 		`DELETE FROM magic_link_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, now); err != nil {
 		w.logger.Error("worker: purge magic link tokens", "error", err)
 	}
+	// SSO hand-off nonces exist only to refuse a replay inside the token's own validity
+	// window (at most ~60s), so a row past its expires_at can never reject anything and
+	// is pure growth. Nothing reads them back except the INSERT that claims one.
+	if _, err := w.db.ExecContext(ctx,
+		`DELETE FROM sso_nonces WHERE expires_at < ?`, now); err != nil {
+		w.logger.Error("worker: purge sso nonces", "error", err)
+	}
 	// Idempotency keys are only useful for the retry window of the original
 	// request; purge them 24h after creation so the table stays small.
 	idemCutoff := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)

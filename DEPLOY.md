@@ -25,6 +25,7 @@ This guide covers a generic Docker deploy and a step-by-step **Railway** deploy
 |---|---|---|---|
 | `CALNODE_ENCRYPTION_KEY` | **prod: yes** | — | KEK input (Argon2id). **Required when `BASE_URL` is https** — the app refuses to start without it. Use a long random string: `openssl rand -hex 32`. **Losing it makes encrypted data unrecoverable** unless you set the recovery secret below. |
 | `CALNODE_RECOVERY_SECRET` | recommended | — | Escrow secret so the data key can be recovered if the encryption key is rotated/lost. Store it somewhere separate. |
+| `CALNODE_SSO_SHARED_SECRET` | no | — | HMAC key for the signed session hand-off (`GET /v1/auth/sso`). Unset ⇒ that endpoint **404s**. Anything holding this secret can mint a session and create a user, so treat it like the encryption key: `openssl rand -hex 32`, env only, never in the admin UI. |
 | `BASE_URL` | **yes (prod)** | `http://localhost:3000` | Identity host — admin UI, OAuth callbacks, invite links. **Must include the scheme** (`https://booking.example.com`). The `https://` prefix flips the app into production mode (secure cookies, encryption-key enforcement). |
 | `PUBLIC_BASE_URL` | no | = `BASE_URL` | Booker-facing host for booking links/emails, if different from the identity host. |
 | `DATABASE_URL` | no | `sqlite://./data/calnode.db` | Point at the persistent volume, e.g. `sqlite:///data/calnode.db`. |

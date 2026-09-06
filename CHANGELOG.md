@@ -11,6 +11,25 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 
 ## [Unreleased]
 
+### Added
+- **Signed session hand-off, so an identity system you already run can sign people in.**
+  `GET /v1/auth/sso?token=<jwt>` accepts a short-lived HS256 JWT signed with a shared
+  secret and starts an ordinary Calnode session, redirecting to `/admin/` (or to a
+  same-origin `?next=` path). Off unless `CALNODE_SSO_SHARED_SECRET` is set — an
+  unconfigured instance answers 404, so it cannot be turned on by accident.
+
+  The token must carry `iss`, `aud` (your `BASE_URL`), `sub` (email), `name`, `role`,
+  `iat`, `exp` and a unique `jti`. It may live at most 60 seconds, 30 seconds of clock
+  skew is tolerated either way, and the `jti` is recorded in a new `sso_nonces` table
+  before the session is created, so a replay inside that window is refused rather than
+  handed a second session. A `wid` claim is accepted and ignored today.
+
+  This is the only path that creates a user without an invite, which is the trade the
+  shared secret buys: the caller is your own identity system, not a visitor with a
+  Google account. On creation the claimed role is applied; for someone who already
+  exists the role is left alone, except that a claim asking for `owner` bootstraps
+  ownership when the instance has none. Archived accounts are still refused.
+
 ## [0.8.0] - 2026-09-03
 
 ### Added

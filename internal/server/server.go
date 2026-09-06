@@ -43,6 +43,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	h.SetPublicBaseURL(cfg.PublicBaseURL)
 	h.SetDataDir("data")
 	h.SetEncKey(cfg.EncryptionKey)
+	h.SetSSOSecret(cfg.SSOSharedSecret)
 	h.SetDemoMode(cfg.DemoMode)
 	h.SetDemoResetInterval(cfg.DemoResetInterval)
 
@@ -280,6 +281,12 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	mux.HandleFunc("GET /v1/auth/callback", authRL(h.CallbackGoogle))
 	mux.HandleFunc("GET /v1/auth/microsoft/login", authRL(h.LoginMicrosoft))
 	mux.HandleFunc("GET /v1/auth/microsoft/callback", authRL(h.CallbackMicrosoft))
+	// Signed session hand-off from an external identity system. Registered
+	// unconditionally and gated inside the handler on the shared secret, so an
+	// unconfigured instance answers 404 rather than exposing whether the route exists
+	// at all. Same limiter as the OAuth callbacks: it is an unauthenticated endpoint
+	// that does an HMAC and a write.
+	mux.HandleFunc("GET /v1/auth/sso", authRL(h.SSOHandoff))
 	mux.HandleFunc("POST /v1/auth/logout", h.Logout)
 
 	// MCP server (Model Context Protocol) — Streamable HTTP transport for remote

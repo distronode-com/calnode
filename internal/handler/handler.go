@@ -39,6 +39,7 @@ type Handler struct {
 	googleAuth        *oauth2.Config
 	microsoftAuth     *oauth2.Config
 	secureCookie      bool
+	ssoSecret         string // HMAC key for the signed session hand-off; empty ⇒ /v1/auth/sso is off
 	llmMu             sync.RWMutex
 	llm               *llm.Client // nil when the optional LLM layer is off/unconfigured
 	zoomMu            sync.RWMutex
