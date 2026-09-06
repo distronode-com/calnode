@@ -120,9 +120,16 @@ func (h *Handler) MCPCallerMiddleware(next http.Handler) http.Handler {
 func (h *Handler) VerifyMCPBearer(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
 	hash := hashAPIKey(token)
 
+	// ⛔ platformDB, not h.db, for every read below. oauth_access_tokens.token_hash
+	// and api_keys.key_hash are globally unique precisely so a bearer token
+	// resolves before a tenant is known — which is what these reads DO. On the
+	// application handle they run bound to the workspace of the request, and /mcp
+	// is on the identity host so there is no workspace bound at all: every valid
+	// token would be reported Unauthorized.
+
 	// OAuth access token?
 	var userID, expiresAt string
-	err := h.db.QueryRowContext(ctx,
+	err := h.platformDB().QueryRowContext(ctx,
 		`SELECT user_id, expires_at FROM oauth_access_tokens WHERE token_hash = ?`, hash).
 		Scan(&userID, &expiresAt)
 	if err == nil {
@@ -131,17 +138,17 @@ func (h *Handler) VerifyMCPBearer(ctx context.Context, token string, _ *http.Req
 			return nil, auth.ErrInvalidToken // expired — client should refresh
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		_, _ = h.db.ExecContext(ctx, `UPDATE oauth_access_tokens SET last_used_at = ? WHERE token_hash = ?`, now, hash)
+		_, _ = h.platformDB().ExecContext(ctx, `UPDATE oauth_access_tokens SET last_used_at = ? WHERE token_hash = ?`, now, hash)
 		return &auth.TokenInfo{UserID: userID, Expiration: exp}, nil
 	}
 
 	// API key fallback (programmatic callers).
 	var keyUser string
-	if err := h.db.QueryRowContext(ctx, `
+	if err := h.platformDB().QueryRowContext(ctx, `
 		SELECT u.id FROM api_keys ak JOIN users u ON u.id = ak.user_id
 		WHERE ak.key_hash = ? AND u.archived_at IS NULL`, hash).Scan(&keyUser); err == nil {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
-		_, _ = h.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?`, now, hash)
+		_, _ = h.platformDB().ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE key_hash = ?`, now, hash)
 		// API keys don't expire; report a far-future expiry so the SDK doesn't reject it.
 		return &auth.TokenInfo{UserID: keyUser, Expiration: time.Now().Add(mcpAccessTokenTTL)}, nil
 	}

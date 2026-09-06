@@ -844,3 +844,110 @@ whole instance.
 ### Gates
 
 `gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+
+## Boundary 3, part three — the end-to-end tenancy proof
+
+Two workspaces on distinct public hosts, one process, the **real mux** via
+`httptest`, and a real `db.OpenPair` whose application handle is a `NOBYPASSRLS`
+role that owns nothing. `internal/server/tenancy_e2e_test.go`, and the harness it
+uses is now reusable: `dbtest.RequireTenantPair(t)`.
+
+Eight assertions, each in both directions:
+
+| surface | A sees its own | A cannot reach B's |
+|---|---|---|
+| `GET /v1/event-types` (API key) | ✓ | ✓ |
+| `GET /v1/bookings?scope=all` (API key) | ✓ | ✓ |
+| `GET /v1/event-types/{slug}/slots` (public) | ✓ | ✓ |
+| `GET /book/{slug}` (public page) | — | ✓ |
+| `GET /v1/bookings/{id}` | 200 | **404** |
+| `POST /v1/bookings` (public write) | lands in `acme` | B's count unmoved |
+| MCP `list_bookings` over the HTTP transport | ✓ | ✓ (both directions) |
+| A's API key on B's host | — | **403 `workspace mismatch`** |
+
+The MCP call is a real `tools/call` through `mcp.StreamableClientTransport`
+against an `httptest.Server`, with the `cno_` key as a bearer token. It is
+asserted in **both** directions — A then B — because that is what catches a
+cached server built for whichever workspace called first. The mismatch test also
+checks the same key on the **identity** host still works: that host names no
+workspace, so there is nothing to disagree with, and it is where API and MCP
+callers legitimately arrive.
+
+### ⛔ `VerifyMCPBearer` was reading credentials on the tenant handle
+
+Found by the MCP test failing `connect to /mcp: Unauthorized`. All four of its
+reads and writes — `oauth_access_tokens`, `api_keys`, and the two `last_used_at`
+updates — ran on `h.db`. `/mcp` is on the identity host, so **no workspace is
+bound at all**, and every valid bearer token would have been reported
+Unauthorized on a multi-tenant instance. Now on `platformDB()`, which is the same
+reasoning as `RequireAuth` and `MCPCallerMiddleware`, and the third place in the
+tree where a global-unique credential lookup had to move. That is the pattern:
+**any read whose purpose is to discover the tenant cannot be bound to it.**
+
+### Two controls, and the second is the one that matters
+
+**Control 1 — the binding stubbed off** (`DB.binds()` forced false). Every test
+fails, but at the FIXTURE, because the seeding writes are refused:
+
+```
+tenancy_e2e_test.go:192: create user for acme: ERROR: new row violates row-level security policy for table "users" (SQLSTATE 42501)
+```
+
+That proves the binding is load-bearing, and nothing more — the read assertions
+never run.
+
+**Control 2 — the application handle given the bypassing owner role**, with
+`VerifyRoles`' refusal disabled. This is the "a superuser DSN proves nothing"
+scenario made concrete, and it is what shows the assertions themselves working:
+
+```
+--- FAIL: TestTenancy_readSurfaces/bookings_list
+    A's booking list contains B's "globex-booking"
+--- FAIL: TestTenancy_readSurfaces/slots_for_B's_event_type_on_A's_host
+    B's event type produced slots on A's host: {…"host_ids":["globex-user"]…}
+--- FAIL: TestTenancy_readSurfaces/public_event_type_page_for_B's_slug_on_A's_host
+    B's booking page rendered on A's host: status 200
+--- FAIL: TestTenancy_bookingByIDIsNotFoundAcrossWorkspaces
+    B's booking id on A's host: status = 200, want 404: {"id":"globex-booking",…}
+--- FAIL: TestTenancy_mcpToolCallOverHTTP
+    A's MCP list_bookings returned B's booking "globex-booking"
+    B's MCP list_bookings returned A's booking "acme-booking"
+```
+
+⚠️ Worth stating plainly: **that is what this code does without the NOBYPASSRLS
+role.** It is why `RequireTenantPair` skips loudly rather than falling back, and
+why `VerifyRoles` refuses the boot.
+
+### ⚠️ A trap the fixture paid for
+
+`server.New`'s `drain` blocks until the worker finishes its poll cycle, and the
+worker only stops when its context is done. Passing `context.Background()` gives a
+**green test body and a hang in `Worker.Wait`** at cleanup, which reads as a
+deadlock in the code under test. `main.go` cancels then drains; the fixture now
+does the same.
+
+---
+
+## Carried into later boundaries
+
+⛔ **Vendor webhooks (B6).** `POST /v1/livekit/webhook`, its
+`/v1/livekit/egress-webhook` alias, and `POST /v1/stripe/webhook` are classified
+`Platform` today, which gets them far enough to find their row and no further.
+They arrive at whatever host the vendor was given and carry no tenant Host, so
+each must **resolve its workspace from the row it names** — the recording's `room`,
+the booking's `stripe_session_id` — on the platform handle, and then hand off to
+`h.forWorkspace(ws)` for **all** processing. A test per webhook that a room or
+session belonging to B, handled on the platform path, writes only into B.
+
+⛔ **Every INSERT through a `Platform`-wrapped route or the platform API must name
+`workspace_id` explicitly.** The platform handle binds `''`, and the column default
+is `COALESCE(current_setting('app.workspace_id', true), 'default')` — so a write
+that omits the column lands in **`default`**, silently, rather than failing. The
+e2e fixture already has to do this for `workspaces` and `server_settings`. B6 owes
+a test on the platform API's create path that the row carries the **requested**
+workspace id, not `default`.
+
+⚠️ **The platform `/metrics` endpoint** (on `feat/platform-hooks`) reads the `jobs`
+table, which is a tenant table. At integration it must read through `Platform()`:
+on the application handle it would report one workspace's queue, and on the unbound
+handle, zero.
