@@ -40,6 +40,7 @@ This guide covers a generic Docker deploy and a step-by-step **Railway** deploy
 | `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated CIDRs (a bare address = one host) whose `CF-Connecting-IP` / `X-Forwarded-For` are believed when keying per-IP rate limits, e.g. `10.0.0.0/8`. Unset ⇒ those headers are ignored and the limit keys on the TCP peer, so behind a fronting CDN every visitor shares one bucket. **Only list networks you control**: anything in the list can name any client IP it likes. |
 | `FRAME_ANCESTORS` | no | — | **Space**-separated origins allowed to embed the **admin UI** in a frame, e.g. `https://console.example.com 'self'`. Each entry must be `https://host[:port]` or `'self'` — anything else and **the app refuses to start**, because browsers drop a policy they cannot parse. Does not affect the public booking pages, which always deny framing. |
 | `LOG_LEVEL` | no | `info` | `debug`/`info`/`warn`/`error`. |
+| `STT_BASE_URL` | no | `https://api.deepgram.com` | Speech-to-text endpoint **host** for meeting transcription, e.g. a regional endpoint so recording audio stays in one jurisdiction. Host only — the path, model and options are fixed. Shown read-only in Settings → Notetaker as `stt_base_url`. |
 
 ¹ Email is optional to boot, but bookings won't send confirmations until SMTP is configured (env **or** the admin UI). Precedence is **env var > DB setting > default**.
 

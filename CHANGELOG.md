@@ -12,6 +12,17 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 ## [Unreleased]
 
 ### Added
+- **`STT_BASE_URL`: choose which speech-to-text endpoint transcribes your recordings.**
+  The host was hardcoded, so meeting audio always went to the provider's global endpoint —
+  a problem if you need it transcribed inside one jurisdiction. The default is unchanged.
+
+  Only the host is configurable; the path, model and transcription options stay ours, so
+  this picks a region rather than a different request. The effective value is reported
+  read-only as `stt_base_url` in `GET /v1/settings/notetaker`, because an admin should be
+  able to see where audio is sent without reading a running container's environment — and
+  should not be able to repoint it from a browser session, which is why it is not a
+  settings field.
+
 - **`GET /metrics`: Prometheus metrics, off until you set `METRICS_TOKEN`.** Build
   identity, requests by surface and status, a request-duration histogram, pending and
   failed job counts, bookings created/cancelled/rescheduled, process start time and two Go

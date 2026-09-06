@@ -45,6 +45,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	h.SetEncKey(cfg.EncryptionKey)
 	h.SetSSOSecret(cfg.SSOSharedSecret)
 	h.SetMetricsToken(cfg.MetricsToken)
+	h.SetSTTBaseURL(cfg.STTBaseURL)
 	h.SetDemoMode(cfg.DemoMode)
 	h.SetDemoResetInterval(cfg.DemoResetInterval)
 

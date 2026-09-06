@@ -54,6 +54,15 @@ app you must `pnpm build` in `frontend/` **and** rebuild/restart the Go binary
   - `MICROSOFT_CLIENT_ID/SECRET` and `MICROSOFT_TENANT` (default `common`; use the
     multi-tenant `common` so any work/personal Microsoft account can connect/sign in)
   - `COOKIE_SECURE` (defaults true when BASE_URL is https)
+  - `STT_BASE_URL` — speech-to-text endpoint **host** for the notetaker; defaults to
+    `stt.DefaultBaseURL` (`https://api.deepgram.com`). Set it to a regional endpoint to
+    keep recording audio inside one jurisdiction. Only the host is configurable: the path,
+    model and transcription options stay Calnode's (`internal/stt`'s `listenPath`), so an
+    operator picks a region and not a different request. Surfaced **read-only** as
+    `stt_base_url` in `GET /v1/settings/notetaker` — an admin should be able to read where
+    audio is sent without shelling into the container, and should not be able to repoint it
+    from a browser session, which is why it is env-only rather than a DB setting like the
+    API key beside it.
 - Startup (`internal/server/server.go: New`): open DB → run goose migrations →
   open keyvault (unwrap DEK) → configure mailer (DB settings override env) → start
   webhook/reminder **worker** → load Google creds (DB > env) → build one

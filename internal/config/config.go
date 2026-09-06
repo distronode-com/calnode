@@ -54,6 +54,13 @@ type Config struct {
 	// queue depth by accident. Env-only, for the same reason as SSOSharedSecret.
 	MetricsToken string
 
+	// STTBaseURL overrides the speech-to-text endpoint host for the notetaker, e.g. a
+	// regional endpoint so recordings are transcribed inside one jurisdiction. Empty ⇒
+	// stt.DefaultBaseURL. Only the host is configurable; the path, model and options are
+	// Calnode's. Surfaced read-only in GET /v1/settings/notetaker so an operator can see
+	// where audio is being sent without reading the environment of a running container.
+	STTBaseURL string
+
 	// CookieSecure sets the Secure flag on session cookies. Defaults to true
 	// when BASE_URL starts with https://, but can be overridden explicitly via
 	// COOKIE_SECURE=false for HTTPS-terminated-at-proxy setups where the binary
@@ -124,6 +131,7 @@ func Load() *Config {
 
 		EmbedAllowedOrigins: splitCSV(getEnv("EMBED_ALLOWED_ORIGINS", "")),
 		TrustedProxyCIDRs:   splitCSV(getEnv("TRUSTED_PROXY_CIDRS", "")),
+		STTBaseURL:          getEnv("STT_BASE_URL", ""),
 		// Space-separated, not comma: the value goes into a CSP source list verbatim, so
 		// it reads the same in the env var as it does in the header.
 		FrameAncestors: strings.Fields(getEnv("FRAME_ANCESTORS", "")),

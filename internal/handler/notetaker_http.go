@@ -30,6 +30,10 @@ func (h *Handler) GetNotetakerSettings(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":         enabled != 0,
 		"stt_api_key_set": keyEnc != "",
+		// Read-only, and env-only (STT_BASE_URL): it names where recording audio is sent,
+		// which an admin should be able to read without shelling into the container, and
+		// should not be able to repoint from a browser session.
+		"stt_base_url": h.sttBaseURL(),
 	})
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/stripe"
+	"github.com/calnode/calnode/internal/stt"
 	"github.com/calnode/calnode/internal/webhook"
 	"github.com/calnode/calnode/internal/zoom"
 )
@@ -41,6 +42,7 @@ type Handler struct {
 	secureCookie      bool
 	ssoSecret         string // HMAC key for the signed session hand-off; empty ⇒ /v1/auth/sso is off
 	metricsToken      string // bearer token for GET /metrics; empty ⇒ that endpoint 404s
+	sttBaseURLCfg     string // STT_BASE_URL override; empty ⇒ stt.DefaultBaseURL (see sttBaseURL)
 	llmMu             sync.RWMutex
 	llm               *llm.Client // nil when the optional LLM layer is off/unconfigured
 	zoomMu            sync.RWMutex
@@ -174,6 +176,22 @@ func (h *Handler) publicURL() string {
 		return h.publicBaseURL
 	}
 	return h.baseURL
+}
+
+// SetSTTBaseURL sets the speech-to-text endpoint host used by the notetaker. Empty keeps
+// the provider default.
+func (h *Handler) SetSTTBaseURL(url string) {
+	h.sttBaseURLCfg = url
+}
+
+// sttBaseURL returns the effective endpoint host. Resolved on read rather than at set
+// time so a Handler built without SetSTTBaseURL (every test) still reports the real
+// default rather than an empty string.
+func (h *Handler) sttBaseURL() string {
+	if h.sttBaseURLCfg != "" {
+		return h.sttBaseURLCfg
+	}
+	return stt.DefaultBaseURL
 }
 
 // SetDataDir sets the directory used for file uploads (avatars, etc.).
