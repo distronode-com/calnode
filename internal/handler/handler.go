@@ -153,12 +153,30 @@ func (h *Handler) getLLM() *llm.Client {
 	})
 }
 
+// SetEnvMailer records the transport built from EMAIL_SMTP_* at boot as the region
+// default for multi-tenant workspaces that have no email settings of their own.
+//
+// Boot calls it in addition to SetMailer, not instead of it: SetMailer installs the
+// hot-swappable live wrapper, this keeps an unswappable reference to the ENV transport
+// specifically. It is set in both modes and consulted only in multi-tenant mode — on a
+// single-tenant instance the live entry SetMailer cached answers every send and the
+// fallback below is never reached.
+func (h *Handler) SetEnvMailer(m mailer.Mailer) { h.envMailer = m }
+
 // getMailer returns this workspace's mailer.
 //
 // In single-tenant mode the entry is the process-wide *mailer.Live that boot
 // installed, so nothing changes. In multi-tenant mode each workspace's transport
 // is chosen by BuildMailer from its OWN settings row — which is what keeps one
 // tenant's SMTP credentials and From address out of another's email.
+//
+// ⛔ A workspace with NO settings row falls back to the env transport rather than to
+// Noop, and the difference is whether a provisioned tenancy sends mail at all. The
+// platform client provisions without defaults.smtp on purpose (the region's SMTP is
+// the operator's, not the tenant's), so every such tenancy resolved to Noop and its
+// bookings were confirmed to nobody — silently, because Noop reports success and
+// isEmailEnabled reads h.live and answered yes. A tenant that HAS settings still wins:
+// the fallback is only reached when there is nothing to build from.
 func (h *Handler) getMailer() mailer.Mailer {
 	return h.mailerCache.get(h.cacheKey(), func() mailer.Mailer {
 		cfg, err := LoadEmailSettingsFromDB(h.db, h.encKey)
@@ -167,6 +185,11 @@ func (h *Handler) getMailer() mailer.Mailer {
 			return &mailer.Noop{}
 		}
 		if cfg == nil {
+			if h.multiTenant && h.envMailer != nil {
+				h.logger.Debug("mailer: no workspace settings, using the environment transport",
+					"workspace", h.cacheKey())
+				return h.envMailer
+			}
 			return &mailer.Noop{}
 		}
 		m, _ := BuildMailer(*cfg)

@@ -128,10 +128,17 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 			"transport", string(transport), "host", dbSMTP.Host, "port", dbSMTP.Port)
 
 	case cfg.SMTPHost != "":
-		live.Swap(mailer.NewSMTP(
+		env := mailer.NewSMTP(
 			cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUser, cfg.SMTPPass,
 			cfg.SMTPTLS, cfg.SMTPStartTLS, cfg.EmailFrom, cfg.EmailFromName,
-		))
+		)
+		live.Swap(env)
+		// The same object again, kept unswappable, as the region default for
+		// multi-tenant workspaces that carry no email settings of their own. Without
+		// it a provisioned tenancy resolves to Noop and confirms its bookings to
+		// nobody; live cannot serve that purpose because the settings-save path swaps
+		// it to whichever workspace saved last.
+		h.SetEnvMailer(env)
 		logger.Info("mailer: configured from environment", "host", cfg.SMTPHost, "port", cfg.SMTPPort)
 		// Seed env-var settings into DB so they appear in the UI on first boot.
 		seedSMTPToDB(db, cfg, encKey, logger)
