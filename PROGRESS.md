@@ -1387,3 +1387,92 @@ the difference is demonstrably the binding and not the fixture.
 Measured sweep target set with a suspended tenant present:
 `map[acme:true default:true initech:true]` — the suspended `globex` absent, and the
 seeded `default` workspace present because it is active in every migrated database.
+
+## Boundary 5, part four — the CLI subcommands
+
+Which of the four needs what follows from what it touches, so the classification is
+data (`platformWideCLI`) and a test asserts it rather than re-deriving it.
+
+| command | touches | under `MULTI_TENANT` |
+|---|---|---|
+| `rotate-key` | `crypto_keystore` | **unchanged** |
+| `recover-key` | `crypto_keystore` | **unchanged** |
+| `reset-admin` | `users` (tenant) | **requires `--workspace=<id>`** |
+| `mcp` (stdio) | everything | **refused** |
+
+`crypto_keystore` is exempt from tenancy (D2) because there is one DEK per process
+(D3) — it has no policies at all, so `DATABASE_URL`'s handle reaches it whether or
+not RLS is enabled. Both key commands now carry a comment saying that, and saying
+that per-tenant DEKs would make it wrong.
+
+### ⛔ `reset-admin` was a real hole, not a hygiene issue
+
+Since D9 the unique on `users` is **`(workspace_id, email)`**, not `email`. So
+`UPDATE users SET password_hash = ? WHERE email = ?` on an unscoped handle matches
+**every workspace that has a user with that address** — and a shared address across
+an agency's client workspaces is the ordinary case, not a contrivance. The negative
+control measures it:
+
+```
+tenancy_test.go:222: negative control: one unscoped `WHERE email = "owner@example.com"`
+reset 2 workspaces' owners — since D9 the unique is (workspace_id, email), so a shared
+address is legal and common
+```
+
+A recovery tool that quietly hands an operator access to tenants nobody asked about
+is worse than one that refuses. `--workspace` is accepted in both `--workspace=id`
+and `--workspace id` forms, anywhere among the positional arguments, and is validated
+against the same `[a-z0-9_-]{1,64}` shape `db.ForWorkspace` enforces. In
+single-tenant mode it is **accepted and ignored** rather than rejected, so a script
+written for a multi-tenant fleet keeps working against one instance.
+
+### `mcp` stdio is refused, and the message names the path that works
+
+The stdio transport carries no credential and no Host, so there is nothing to
+resolve a tenant from; the tools would run on the unbound handle, which matches no
+row, and the operator would see an empty workspace with no explanation. The refusal
+points at `POST /mcp` with a workspace's API key or OAuth token, which resolves the
+tenant from the credential (D10). A test asserts the message mentions the HTTP
+transport, the path, and the credential — a refusal that does not say what to do
+instead is a dead end.
+
+---
+
+## Every remaining cross-tenant read and write, and why each is correct
+
+For B7's proof to assert this list is complete. Anything reaching more than one
+workspace's rows is here; everything else is bound.
+
+### Platform handle, by design — the tenant root and the exempt tables
+
+| site | what | why correct |
+|---|---|---|
+| `workspaceByHost`, `workspaceByID`, `activeWorkspaceIDs` | `workspaces` | resolving *which* tenant; `workspaces` is exempt and carries a SELECT-only policy for the app role (D2) |
+| `RequireAuth` (api_keys, sessions) | credential → user | the read that DISCOVERS the tenant cannot be bound to it; those uniques are global for exactly this (D9) |
+| `MCPCallerMiddleware`, `VerifyMCPBearer` | bearer → user | same |
+| `workspaceOfUser` | `users.workspace_id` | resolves the tenant for a Platform route's write |
+| `/oauth/*` handlers | auth codes, tokens, clients | Platform-wrapped: `h.db` **is** the platform handle; the two INSERTs name `workspace_id` (the sweep's finding 16/17) |
+| `rotate-key`, `recover-key` | `crypto_keystore` | exempt (D2), one DEK per process (D3) |
+| goose migrations, `EnableRLS`, `VerifyRoles` | DDL and role attributes | schema-level, not row-level |
+
+### Worker, on the platform handle — one queue, and retention rules
+
+| site | what | why correct |
+|---|---|---|
+| the claim query + reaper | `jobs` | ONE queue ordered by `run_at` globally; a bound loop would serve one tenant and starve the rest. This is what 00060's `idx_jobs_pending_global` is for |
+| purge expired manage tokens, sessions, magic links, idempotency keys, oauth auth codes | 5 `DELETE`s | retention rules keyed on `expires_at`/`created_at`, properties of the row and not of the tenant; per-workspace would be N statements to express one policy |
+| purge finished webhook deliveries | `DELETE` | same, 30-day retention |
+| ⚠️ **Stripe payment-hold backstop** | **`UPDATE bookings SET status='cancelled'`** | the only cross-tenant **WRITE** left. Keyed on `payment_status='pending' AND created_at < cutoff`, a property of the row. ⛔ **It has to move if hold timeouts ever become per-workspace**, and it is the one entry on this list a reviewer should push back on |
+
+### Reconciler
+
+Enumerates on the platform handle, then every pass is bound. No cross-tenant read
+inside a pass.
+
+### Not yet correct — known, and owed to B6
+
+| site | state |
+|---|---|
+| `POST /v1/livekit/webhook` + its alias, `POST /v1/stripe/webhook` | `Platform`-wrapped so they can find the row they name; the processing after that is **not** yet bound. Must resolve the workspace from the room / session and hand off to `forWorkspace` |
+| `/v1/auth/sso` hand-off (D11), `clientIP` rate-limit keys (D14) | blocked on `feat/platform-hooks` |
+| `/metrics` | reads `jobs`; must use `Platform()` at integration |

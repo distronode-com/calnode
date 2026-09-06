@@ -14,6 +14,15 @@ import (
 // The current secret is read from CALNODE_ENCRYPTION_KEY (env or .env file).
 // After a successful rotation, update CALNODE_ENCRYPTION_KEY to <new-platform-secret>
 // before the next server start.
+// Multi-tenant mode needs no change here, and this note is why rather than an
+// oversight: rotate-key operates only on crypto_keystore, which migration 00060 leaves
+// EXEMPT from tenancy (D2) because there is one DEK per process (D3). It is
+// platform-wide by construction, so DATABASE_URL's handle reaches it whether or not
+// the row-level-security policies are enabled — crypto_keystore has none.
+//
+// ⚠️ If per-tenant DEKs are ever adopted, both commands need a --workspace flag and
+// this comment becomes wrong. cmd/calnode/tenancy.go's platformWideCLI is the list a
+// test asserts against.
 func runRotateKey(args []string) {
 	if len(args) != 1 || args[0] == "" {
 		fmt.Fprintln(os.Stderr, "usage: calnode rotate-key <new-platform-secret>")

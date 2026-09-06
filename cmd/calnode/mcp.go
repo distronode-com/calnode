@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -25,6 +26,16 @@ import (
 // for a local agent. The MCP JSON-RPC stream owns stdout, so all logs go to stderr.
 func runMCPStdio(_ []string) {
 	cfg := config.Load()
+
+	// ⛔ Refused under MULTI_TENANT. The stdio transport carries no credential and no
+	// Host, so there is nothing to resolve a tenant from and the tools would run on
+	// the unbound handle — which under the policies matches no row, so an operator
+	// would get an empty workspace and no explanation. The HTTP transport resolves
+	// the tenant from the bearer credential (D10).
+	if err := refuseMCPStdio(cfg.MultiTenant); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// stdout carries the MCP protocol — never log to it. All logs → stderr.
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel}))

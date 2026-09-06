@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -13,32 +12,48 @@ import (
 
 // runResetAdmin is invoked when the binary is called as:
 //
-//	calnode reset-admin <email> <new-password>
+//	calnode reset-admin [--workspace=<id>] <email> <new-password>
 //
 // It resets the password for the named user and enables email_login on their
 // account. This is the last-resort recovery path when SMTP is unavailable and
 // the admin is locked out.
 func runResetAdmin(args []string) {
-	if len(args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: calnode reset-admin <email> <new-password>")
-		os.Exit(1)
-	}
-	email := strings.TrimSpace(strings.ToLower(args[0]))
-	password := args[1]
-
-	if len(password) < 8 || len(password) > 72 {
-		fmt.Fprintln(os.Stderr, "error: password must be 8–72 characters")
-		os.Exit(1)
-	}
-
 	cfg := config.Load()
 
-	database, err := db.OpenDB(cfg.DatabaseURL)
+	req, err := parseResetAdmin(args, cfg.MultiTenant)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to open database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer database.Close()
+	email, password := req.Email, req.Password
+
+	// ⛔ In multi-tenant mode the UPDATE must be bound. users.email is unique per
+	// WORKSPACE since D9, so `WHERE email = ?` on the platform handle would match
+	// every workspace that has a user with that address and reset all of their
+	// passwords — a recovery tool that hands out access to tenants the operator was
+	// not asked about.
+	var database *db.DB
+	if cfg.MultiTenant {
+		app, platform, oerr := db.OpenPair(cfg.DatabaseURL, cfg.DatabaseAdminURL)
+		if oerr != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to open database pair: %v\n", oerr)
+			os.Exit(1)
+		}
+		defer platform.Close()
+		defer app.Close()
+		database = app.ForWorkspace(req.Workspace)
+		if database.Err() != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", database.Err())
+			os.Exit(1)
+		}
+	} else {
+		database, err = db.OpenDB(cfg.DatabaseURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to open database: %v\n", err)
+			os.Exit(1)
+		}
+		defer database.Close()
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
