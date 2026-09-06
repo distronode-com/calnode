@@ -36,6 +36,17 @@ type shared struct {
 	live   *mailer.Live // non-nil in production; nil in tests using a direct stub
 	encKey [32]byte     // AES-256 key for encrypting secrets stored in the DB
 
+	// envMailer is the transport EMAIL_SMTP_* configured at boot, kept as the
+	// REGION DEFAULT for multi-tenant workspaces that carry no email settings of
+	// their own. Nil when the process was started without one.
+	//
+	// ⛔ Not h.live, deliberately, even though live wraps the same object at boot.
+	// live is process-wide AND hot-swappable: the email-settings save path calls
+	// live.Swap with whatever the saving workspace persisted, so reading live at
+	// send time would hand one tenant's SMTP credentials and From address to every
+	// tenant that has none. This field is written once, at boot, and never swapped.
+	envMailer mailer.Mailer
+
 	// The per-workspace runtime state (D7). Each is built lazily from THAT
 	// workspace's server_settings row through the bound handle, and replaced when
 	// that workspace saves its settings. One entry keyed "" in single-tenant mode.
