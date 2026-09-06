@@ -1771,6 +1771,75 @@ of this file); the vendor webhooks resolving their workspace from the row they n
 already done (B1's `config.Validate` refuses `MULTI_TENANT` with `DEMO_MODE`) and D14
 landed with the platform-hooks merge.
 
+### ⛔ OPEN ITEM: `embed_allowed_origins` and `stt_base_url` are written and never read
+
+Migration 00062 added both columns and the platform API fills them, so a provisioned
+workspace no longer loses what the caller sent. **Nothing reads them.** The embed CORS
+check still resolves `config.EmbedAllowedOrigins` and the notetaker still resolves
+`config.STTBaseURL`, both of which are one process-wide value — so on a multi-tenant
+instance **every tenant currently shares one embed allowlist and one STT host**, whatever
+their row says. That is a silent wrong answer in the making: an operator who sets a
+per-tenant allowlist through the platform API will believe it is in force.
+
+Wiring the readers is **D7 work**, not a one-line lookup, and that is why it is not done
+here: each has to go through the per-workspace settings cache (`shared.<kind>.get(wsID)`,
+`internal/handler/tenantcache.go`) so the value is built from that workspace's
+`server_settings` row and invalidated when the workspace saves. Two specifics for whoever
+picks it up:
+
+- **`embed_allowed_origins`** is consumed by the CORS wrapper on the embed and public
+  booking routes, which runs BEFORE the handler and therefore before any per-request
+  workspace exists on the `Scoped` path. It needs the same treatment `rateLimitKey` got for
+  D14: resolve from the request Host without a database read, or move the check inside the
+  handler where the bound handle is available. The second is cleaner and is a behaviour
+  change to think about, since today a disallowed origin is refused before any handler runs.
+- **`stt_base_url`** is read by the notetaker job, which already runs bound to its
+  workspace (`workspaceForJob`, B5), so it is the easier of the two: a settings read on the
+  bound handle, with `config.STTBaseURL` as the fallback when the column is `''`.
+
+Until both are wired, a multi-tenant deployment should keep `EMBED_ALLOWED_ORIGINS` and
+`STT_BASE_URL` set to values that are correct for **every** tenant on the instance.
+
+### ⚠️ A pre-existing upstream race, fixed here (upstream-first PR candidate)
+
+Not a tenancy bug and not caused by the merge: it reproduces on a stock single-tenant
+instance, and the fix is generic. Worth carrying upstream as its own patch.
+
+**The bug.** Two detached goroutines write the same reminder row. The booking CREATE path
+enqueues reminders from one; the RESCHEDULE path replaces them from another. Both marshal
+the identical payload `{booking_id, hours_before}`, and `jobs` carries a unique on
+`(type, payload)` — so exactly one row can exist per `(booking, hours_before)`. The
+replacement deletes the booking's non-running reminder rows and re-inserts them at the new
+time, and the losing interleaving is:
+
+```
+reschedule: DELETE …            (create's row not yet committed, so invisible to it)
+create:     INSERT at the OLD time
+reschedule: INSERT at the NEW time  ->  conflict  ->  ON CONFLICT DO NOTHING  ->  dropped
+```
+
+The reschedule's own row is the one discarded, so the reminder stays pinned to the
+**original** time — permanently, with nothing logged. A booking created and rescheduled
+inside the same second is enough. The attendee is then reminded about a time the meeting no
+longer has, or not at all if the old time has already passed.
+
+**The fix.** The reschedule's INSERT upserts; the create side keeps `DO NOTHING`, because a
+create must never overwrite a reschedule and by the time the two can collide the reschedule
+is the later fact. One side upserting makes all three interleavings agree on the
+reschedule's time. `WHERE status <> 'running'` preserves the invariant the DELETE already
+encodes — a claimed job is executing, and resetting it underneath the worker would either
+double-send or be clobbered by the worker's completion write.
+
+**Measured:** 2 failures in 60 runs before, 0 in 30 after, on PostgreSQL. The test forces
+the interleaving with an uncommitted row rather than waiting for it, and fails if no backend
+ever blocks, so it cannot pass on the easy path.
+
+⚠️ **The test that found it reported it as something else**, which is why it took a bisect:
+it polled for "any `run_at` that is not the old one", kept the last value read when its
+deadline expired, and asserted on that — so a timeout surfaced as "`run_at` is three days
+wrong". A poll loop that falls through to an assertion on stale data will misattribute every
+failure it ever catches.
+
 ---
 
 ## D11, the remaining half — the plan for B6
