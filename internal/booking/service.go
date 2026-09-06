@@ -27,6 +27,15 @@ func New(db *db.DB) *Service {
 	return &Service{db: db}
 }
 
+// ForDB returns a copy of s backed by handle. It is how a per-request handler
+// gets a booking service bound to its workspace: the Service is a struct over a
+// pool, so this costs one allocation and pins nothing.
+func (s *Service) ForDB(handle *db.DB) *Service {
+	copied := *s
+	copied.db = handle
+	return &copied
+}
+
 // Create inserts a new confirmed booking inside a transaction.
 // It checks for overlapping bookings for every host in p.HostIDs before
 // inserting, satisfying the double-booking guard described in §6.4.

@@ -152,6 +152,15 @@ func New(db *db.DB, encKeyHex string) (*Service, error) {
 	return s, nil
 }
 
+// ForDB returns a copy of s backed by handle, keeping the same signing key. It is
+// how a per-request handler gets a webhook service bound to its workspace; the
+// Service is a struct over a pool, so this pins nothing.
+func (s *Service) ForDB(handle *db.DB) *Service {
+	copied := *s
+	copied.db = handle
+	return &copied
+}
+
 // Create registers a new webhook and returns the Webhook plus the plain-text
 // signing secret (shown only once; stored encrypted).
 // Create registers a webhook (fields default to the unset/original-payload set;

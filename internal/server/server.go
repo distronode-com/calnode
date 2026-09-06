@@ -39,6 +39,8 @@ import (
 // has finished its current poll cycle.
 func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger) (*handler.Handler, func()) {
 	h := handler.New(db, logger)
+	// Before anything else: it decides whether every route resolves a tenant.
+	h.SetMultiTenant(cfg.MultiTenant)
 	h.SetBaseURL(cfg.BaseURL)
 	h.SetPublicBaseURL(cfg.PublicBaseURL)
 	h.SetDataDir("data")

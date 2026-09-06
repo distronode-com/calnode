@@ -12,7 +12,7 @@ import (
 // (b) answer If-None-Match with a 304 — that's what lets a redeploy propagate within
 // minutes instead of being pinned for the full max-age.
 func TestEmbedJS_etagRevalidation(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{shared: &shared{}}
 
 	rec := httptest.NewRecorder()
 	h.EmbedJS(rec, httptest.NewRequest(http.MethodGet, "/embed.js", nil))
@@ -53,7 +53,7 @@ func TestEmbedJS_etagRevalidation(t *testing.T) {
 // disclosure element pulls from the fetched i18n map (t(this.i18n, 'assistant_disclosure')),
 // not a hardcoded literal that could silently diverge again.
 func TestEmbedJS_assistantDisclosure(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{shared: &shared{}}
 	rec := httptest.NewRecorder()
 	h.EmbedJS(rec, httptest.NewRequest(http.MethodGet, "/embed.js", nil))
 	body := rec.Body.String()
@@ -67,7 +67,7 @@ func TestEmbedJS_assistantDisclosure(t *testing.T) {
 }
 
 func TestBookingCSS_cacheModes(t *testing.T) {
-	h := &Handler{}
+	h := &Handler{shared: &shared{}}
 
 	// Unversioned: short cache + revalidate + ETag.
 	rec := httptest.NewRecorder()

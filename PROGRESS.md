@@ -628,3 +628,134 @@ operator tools today; B3 and B6 decide what they become.
 `go test ./...` **rc=0 on SQLite (28/28)** and **rc=0 on PostgreSQL (28/28)**.
 The 11 new cases all run rather than skip on the PostgreSQL lane, and the
 tenant-binding ones skip with a stated reason on SQLite.
+
+## Boundary 3 — handler scoping and tenant resolution — PART ONE of two
+
+⚠️ **B3 is not finished.** This commit lands the foundation: the `shared` split,
+the `Workspace` type, the two resolvers, `Scoped`, `Platform`, the refusal
+mapping, `AuthUser.WorkspaceID`, and the credential lookups moved onto the
+platform handle. What remains is the part that touches `internal/server/server.go`:
+**163 `mux.HandleFunc` registrations** have to be rewritten through
+`h.Scoped(resolve, (*Handler).Method)`, and with them the route-classification
+test, the five end-to-end request tests, and the `/v1/bookings/{id}` tenant check.
+Split because the registration rewrite is a single mechanical edit across 163
+lines that has to land with its own gate, not because either half is optional.
+
+### The split, and why the mutexes had to move
+
+`Handler` was 30 fields including **six `sync.RWMutex`**. A tenant-scoped request
+needs a handler whose `db` is bound to its workspace, and the only way to give
+**314 methods** a bound `h.db` without editing all of them is to hand them a
+receiver that differs in that one field — so `Handler` is copied per request. A
+struct containing a mutex cannot be copied (`go vet` copylocks, and rightly:
+copying a mutex copies its state).
+
+So: `shared` holds everything the process has one of — logger, mailer, the
+hot-swappable integration clients and their mutexes, the configured hosts, demo
+bookkeeping — and `Handler` is `{ *shared; db; ws; bookingSvc; webhookSvc }`.
+Embedding as `*shared` rather than naming it is what keeps `h.logger`,
+`h.livekitMu`, `h.mailer = m` and the rest compiling **untouched across all 61
+files**. Measured: the split needed zero edits to any handler method, and
+`go vet ./...` is clean.
+
+`bookingSvc` and `webhookSvc` stay on `Handler` because each wraps a `*db.DB`;
+`forWorkspace` rebuilds them from the scoped handle through new
+`(*Service).ForDB` methods on `internal/booking` and `internal/webhook`. Both are
+structs over a pool, so a rebuild is one allocation and pins nothing.
+
+### ⛔ Credential lookups had to move to the platform handle
+
+`RequireAuth`'s two reads — `api_keys` and `sessions` — ran on `h.db`. On a
+multi-tenant instance the application handle is bound to the workspace **of the
+request**, and the workspace of the request is what those reads exist to
+DISCOVER. Bound, they find nothing, and a perfectly good API key is reported
+`invalid API key`. Both now use `h.platformDB()` (`h.db.Platform()`, which is the
+same handle in single-tenant mode) and both select `u.workspace_id` into the new
+`AuthUser.WorkspaceID`. This is the reason D9 keeps `api_keys.key_hash` and
+`sessions.id` globally unique.
+
+### Four refusals, and none of them is "carry on unscoped"
+
+`errUnknownHost` → **404** (HTML: the host-resolved surfaces are pages a person is
+looking at). `errWorkspaceSuspended` → **503** + `Retry-After`.
+`errWorkspaceMismatch` → **403 `{"error":"workspace mismatch"}`**, which is the
+body D10 specifies and a test pins. `errNoWorkspace` → **500**.
+
+⛔ There is deliberately **no fallback to the default workspace** on an
+unrecognised host. Falling back would serve one tenant's booking page on any
+domain pointed at the instance. Migration 00060 seeds `workspaces.public_host`
+empty for `default` for the same reason: no HTTP request carries an empty Host, so
+the default workspace is unreachable by host resolution. Both are asserted.
+
+Proved failable by making `HostWorkspace` return `DefaultWorkspace` on a failed
+lookup — the exact bug:
+
+```
+--- FAIL: TestHostWorkspace_multiTenant/unknown_host_does_not_fall_back_to_default
+    workspace_internal_test.go:102: resolved &{ID:default Slug:default PublicHost: Region: Status:active}; want an error
+--- FAIL: TestHostWorkspace_multiTenant/the_default_workspace_is_unreachable_by_host
+    workspace_internal_test.go:117: an empty Host resolved; err = <nil>
+--- FAIL: TestScoped_refusalsNeverReachTheMethod/unknown_host_is_404
+    workspace_internal_test.go:230: status = 200; want 404 (body "{\"workspace\":\"default\"}\n")
+    workspace_internal_test.go:233: the method ran 1 times; wantReach=false
+```
+
+### `Scoped` takes a method EXPRESSION, and the compiler enforces it
+
+`h.Scoped(HostWorkspace, (*Handler).BookPage)`, not `h.Scoped(…, h.BookPage)`. A
+bound method value would capture the **unscoped** receiver, which is exactly the
+bug the wrapper exists to prevent, and it would compile silently. A method
+expression cannot: its first parameter is the receiver, which `Scoped` supplies
+from `forWorkspace`.
+
+`Platform(method)` is the sibling for routes that belong to no workspace — the
+identity host's OAuth endpoints, `/.well-known/*`, `/healthz`, `/readyz`,
+`/version`, `/metrics`, the platform API. It exists so "unscoped, on purpose" is
+something the registration says out loud rather than by omission, which is what
+the route-classification test in part two will hold.
+
+### `publicURL()` is per workspace
+
+In multi-tenant mode it returns `https://<ws.public_host>` and `PUBLIC_BASE_URL`
+is ignored entirely (D11); `BASE_URL` stays the identity host of the process.
+Single-tenant is unchanged: `PUBLIC_BASE_URL` if set, else `BASE_URL`. Four cases
+pinned.
+
+### Scope of the tests here, stated so it is not overread
+
+`workspace_internal_test.go` runs against ONE handle with `multiTenant` set. That
+is enough for everything it asserts, because resolution reads `workspaces` through
+`platformDB()` and on a single handle that is the handle itself. It does **not**
+re-prove the row-level-security binding — that needs a NOBYPASSRLS role and is
+already proven in `internal/db` (`rls_proof_test.go`, `pair_test.go`). The
+end-to-end request tests in part two are where a real pair gets exercised through
+HTTP.
+
+### TODO(integration) — blocked on `feat/platform-hooks`
+
+Neither is implemented, and neither is faked:
+
+- **D11, the OAuth login hand-off.** After a Google/Microsoft callback on the
+  identity host, the callback cannot set a cookie for the workspace's public host,
+  so it must mint an SSO token for the workspace carried in the OAuth `state` and
+  redirect to `https://<public_host>/v1/auth/sso?token=…`. That endpoint arrives
+  with `feat/platform-hooks`, which is **not in this clone**. Expected shape at
+  integration: the branch's SSO issue/verify pair, extended per the packet with a
+  required `wid` claim and an `aud` equal to the workspace's public host.
+  `finishOAuthLogin` in `internal/handler/auth_oauth.go` is where the redirect
+  replaces the cookie set.
+- **D14, rate-limit keys.** They should become `(workspace_id, client_ip)` using
+  that branch's `TRUSTED_PROXY_CIDRS`-aware client-IP helper. Expected shape:
+  `handler.clientIP(r) string`. Today's limiters key on the TCP remote address
+  (`ARCHITECTURE` §16 says so deliberately), and prefixing the workspace without
+  the helper would key a whole tenant behind one proxy as a single client.
+- **The platform `/metrics` endpoint**, also on that branch, reads the `jobs`
+  table. At integration it **must** read through `Platform()`: `jobs` is a tenant
+  table and an application-handle read would report one workspace's queue, or on
+  the unbound handle, zero.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test ./...` **rc=0 on SQLite (28/28)** and **rc=0 on PostgreSQL (28/28)**.
+The 21 new resolver cases all run on both lanes.

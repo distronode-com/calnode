@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -21,36 +20,27 @@ import (
 	"github.com/calnode/calnode/internal/zoom"
 )
 
+// Handler is a per-request value: the process-wide state behind *shared, plus the
+// database handle and workspace this particular request is scoped to.
+//
+// In single-tenant mode there is one Handler and one workspace ("default"), and
+// nothing copies it. In multi-tenant mode Scoped makes a copy per request whose
+// db is bound to the resolved workspace, so a method body that reads h.db is
+// tenant-scoped without being edited. The copy is a value with no locks in it,
+// which is what keeps go vet copylocks clean — and it pins no connection, so a
+// fire-and-forget goroutine may keep the copy it was started with (see
+// db.DB.ForWorkspace).
 type Handler struct {
-	db                *db.DB
-	logger            *slog.Logger
-	bookingSvc        *booking.Service
-	mailer            mailer.Mailer
-	live              *mailer.Live // non-nil in production; nil in tests using a direct stub
-	encKey            [32]byte     // AES-256 key for encrypting secrets stored in the DB
-	calMu             sync.RWMutex
-	cal               *calendar.Service
-	calNudge          chan struct{} // buffered(1): wakes the calendar reconciler after a failed inline op
-	webhookSvc        *webhook.Service
-	baseURL           string
-	publicBaseURL     string
-	dataDir           string
-	authMu            sync.RWMutex
-	googleAuth        *oauth2.Config
-	microsoftAuth     *oauth2.Config
-	secureCookie      bool
-	llmMu             sync.RWMutex
-	llm               *llm.Client // nil when the optional LLM layer is off/unconfigured
-	zoomMu            sync.RWMutex
-	zoom              *zoom.Client // nil when no Zoom app is configured
-	stripeMu          sync.RWMutex
-	stripe            *stripe.Client // nil when payments are unconfigured
-	livekitMu         sync.RWMutex
-	livekit           *livekit.Client // nil when LiveKit video is unconfigured
-	demoMode          bool            // true on the public demo instance: disables calendar/Zoom connect
-	demoResetInterval time.Duration
-	demoMu            sync.RWMutex
-	demoNextResetAt   time.Time
+	*shared
+
+	db *db.DB
+	ws *Workspace
+
+	// bookingSvc and webhookSvc wrap a *db.DB, so they are per-request too:
+	// forWorkspace rebuilds each from the scoped handle. Both are cheap structs
+	// over a pool, not connections.
+	bookingSvc *booking.Service
+	webhookSvc *webhook.Service
 }
 
 // SetLiveKit swaps the active LiveKit client (nil disables built-in video rooms).
@@ -123,15 +113,18 @@ func (h *Handler) getLLM() *llm.Client {
 	return h.llm
 }
 
-func New(db *db.DB, logger *slog.Logger) *Handler {
-	whs, _ := webhook.New(db, "") // ephemeral key when no encryption key configured
+func New(database *db.DB, logger *slog.Logger) *Handler {
+	whs, _ := webhook.New(database, "") // ephemeral key when no encryption key configured
 	return &Handler{
-		db:         db,
-		logger:     logger,
-		bookingSvc: booking.New(db),
-		mailer:     &mailer.Noop{},
+		shared: &shared{
+			logger:   logger,
+			mailer:   &mailer.Noop{},
+			calNudge: make(chan struct{}, 1),
+		},
+		db:         database,
+		ws:         DefaultWorkspace,
+		bookingSvc: booking.New(database),
 		webhookSvc: whs,
-		calNudge:   make(chan struct{}, 1),
 	}
 }
 
@@ -165,9 +158,18 @@ func (h *Handler) SetPublicBaseURL(url string) {
 	h.publicBaseURL = url
 }
 
-// publicURL returns the booker-facing base URL, defaulting to the identity host
-// (baseURL) when no public host has been configured.
+// publicURL returns the booker-facing base URL.
+//
+// In multi-tenant mode each workspace has its own public host and that replaces
+// PUBLIC_BASE_URL entirely (D11): booking links, emails, embed snippets and the
+// admin UI all live there, while BASE_URL stays the identity host of the whole
+// process for OAuth callbacks, /.well-known/*, /oauth/*, /mcp and the platform
+// API. Single-tenant behaviour is unchanged: PUBLIC_BASE_URL if set, else
+// BASE_URL.
 func (h *Handler) publicURL() string {
+	if h.multiTenant && h.ws != nil && h.ws.PublicHost != "" {
+		return "https://" + h.ws.PublicHost
+	}
 	if h.publicBaseURL != "" {
 		return h.publicBaseURL
 	}

@@ -15,7 +15,13 @@ const ctxKeyUser contextKey = "user"
 
 // AuthUser is the authenticated caller stored in request context.
 type AuthUser struct {
-	ID         string
+	ID string
+
+	// WorkspaceID is the tenant this caller belongs to, read from the same row as
+	// the rest. It is what CredentialWorkspace resolves the request's workspace
+	// from, and it is "default" in single-tenant mode.
+	WorkspaceID string
+
 	Email      string
 	Name       string
 	IANATZ     string
@@ -68,13 +74,17 @@ func (h *Handler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			var user AuthUser
 			var keyID string
 			var nc, nca, nr, nrm, nhb, nhc, nhr int
-			err := h.db.QueryRowContext(r.Context(), `
-				SELECT ak.id, u.id, u.email, u.name, u.iana_timezone, u.time_format, u.week_start, u.date_format, COALESCE(u.avatar_url,''), u.is_admin, u.is_owner,
+			// ⛔ platformDB, not h.db. api_keys.key_hash is global precisely so a
+			// key resolves without a tenant, and the tenant is what this read
+			// DISCOVERS — on the workspace-bound handle it would find nothing and
+			// a valid key would be reported invalid.
+			err := h.platformDB().QueryRowContext(r.Context(), `
+				SELECT ak.id, u.id, u.workspace_id, u.email, u.name, u.iana_timezone, u.time_format, u.week_start, u.date_format, COALESCE(u.avatar_url,''), u.is_admin, u.is_owner,
 				       COALESCE(u.notify_confirmation,1), COALESCE(u.notify_cancellation,1), COALESCE(u.notify_reschedule,1), COALESCE(u.notify_reminder,1),
 				       COALESCE(u.notify_host_booking,1), COALESCE(u.notify_host_cancel,1), COALESCE(u.notify_host_reschedule,1)
 				FROM api_keys ak JOIN users u ON u.id = ak.user_id
 				WHERE ak.key_hash = ? AND u.archived_at IS NULL`, hash).
-				Scan(&keyID, &user.ID, &user.Email, &user.Name, &user.IANATZ, &user.TimeFormat, &user.WeekStart, &user.DateFormat, &user.AvatarURL, &user.IsAdmin, &user.IsOwner,
+				Scan(&keyID, &user.ID, &user.WorkspaceID, &user.Email, &user.Name, &user.IANATZ, &user.TimeFormat, &user.WeekStart, &user.DateFormat, &user.AvatarURL, &user.IsAdmin, &user.IsOwner,
 					&nc, &nca, &nr, &nrm, &nhb, &nhc, &nhr)
 			user.NotifyConfirmation, user.NotifyCancellation, user.NotifyReschedule, user.NotifyReminder = nc != 0, nca != 0, nr != 0, nrm != 0
 			user.NotifyHostBooking, user.NotifyHostCancel, user.NotifyHostReschedule = nhb != 0, nhc != 0, nhr != 0
@@ -83,7 +93,7 @@ func (h *Handler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 			now := time.Now().UTC().Format(time.RFC3339Nano)
-			_, _ = h.db.ExecContext(r.Context(),
+			_, _ = h.platformDB().ExecContext(r.Context(),
 				`UPDATE api_keys SET last_used_at = ? WHERE id = ?`, now, keyID)
 			next(w, r.WithContext(context.WithValue(r.Context(), ctxKeyUser, user)))
 			return
@@ -94,15 +104,17 @@ func (h *Handler) RequireAuth(next http.HandlerFunc) http.HandlerFunc {
 			now := time.Now().UTC().Format(time.RFC3339)
 			var user AuthUser
 			var nc, nca, nr, nrm, nhb, nhc, nhr int
-			if err := h.db.QueryRowContext(r.Context(), `
-				SELECT u.id, u.email, u.name, u.iana_timezone, u.time_format, u.week_start, u.date_format, COALESCE(u.avatar_url,''), u.is_admin, u.is_owner,
+			// platformDB for the same reason as the API-key path above:
+			// sessions.id is global so a cookie resolves without a tenant.
+			if err := h.platformDB().QueryRowContext(r.Context(), `
+				SELECT u.id, u.workspace_id, u.email, u.name, u.iana_timezone, u.time_format, u.week_start, u.date_format, COALESCE(u.avatar_url,''), u.is_admin, u.is_owner,
 				       COALESCE(u.notify_confirmation,1), COALESCE(u.notify_cancellation,1), COALESCE(u.notify_reschedule,1), COALESCE(u.notify_reminder,1),
 				       COALESCE(u.notify_host_booking,1), COALESCE(u.notify_host_cancel,1), COALESCE(u.notify_host_reschedule,1)
 				FROM sessions s
 				JOIN users u ON u.id = s.user_id
 				WHERE s.id = ? AND s.expires_at > ? AND u.archived_at IS NULL`,
 				cookie.Value, now).
-				Scan(&user.ID, &user.Email, &user.Name, &user.IANATZ, &user.TimeFormat, &user.WeekStart, &user.DateFormat, &user.AvatarURL, &user.IsAdmin, &user.IsOwner,
+				Scan(&user.ID, &user.WorkspaceID, &user.Email, &user.Name, &user.IANATZ, &user.TimeFormat, &user.WeekStart, &user.DateFormat, &user.AvatarURL, &user.IsAdmin, &user.IsOwner,
 					&nc, &nca, &nr, &nrm, &nhb, &nhc, &nhr); err == nil {
 				user.NotifyConfirmation, user.NotifyCancellation, user.NotifyReschedule, user.NotifyReminder = nc != 0, nca != 0, nr != 0, nrm != 0
 				user.NotifyHostBooking, user.NotifyHostCancel, user.NotifyHostReschedule = nhb != 0, nhc != 0, nhr != 0
