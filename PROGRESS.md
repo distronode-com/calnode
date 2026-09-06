@@ -346,3 +346,180 @@ password changed to `wrong`: `internal/db` **fails** rather than skipping, with
 `failed SASL auth: FATAL: password authentication failed for user "postgres"
 (SQLSTATE 28P01)` — including `TestPostgres_idleLimitApplied`, the one new test
 whose assertions could conceivably have held without a server.
+
+---
+
+# Multi-tenant mode (`feat/multi-tenant`)
+
+One process, many isolated workspaces. `workspaces` is the tenant root, every
+application table carries a `workspace_id`, and PostgreSQL row-level security —
+not the query author — is what keeps one workspace out of another's rows.
+`MULTI_TENANT` unset must behave exactly as before, on SQLite and on
+single-tenant PostgreSQL. That is a gate, not a wish.
+
+## Boundary 1 — config + schema — DONE
+
+### Migration 00060, not 00061
+
+The packet numbered it 00061 on the assumption that `feat/platform-hooks` had
+landed 00060. It has not: that branch is not in this clone (no `/v1/auth/sso`
+endpoint, no `TRUSTED_PROXY_CIDRS`, no `/metrics`), and the 59 files in each
+directory are contiguous. `migrations_internal_test.go` asserts
+`target version == file count` and names the failure "a gap or a duplicate
+number", so 00061 over 59 files reds an existing gate. 00060 it is;
+`knownMigrationCount` moved 59 → 60 with it.
+
+### ⛔ ENABLE / FORCE ROW LEVEL SECURITY is NOT in the migration, and the reason is measured
+
+D2 puts `ENABLE` + `FORCE` + the policy in the migration. `FORCE` makes a
+table's policy apply to the table's **owner** as well, and in single-tenant mode
+`DATABASE_URL` *is* the owner. Measured against the PostgreSQL 17.11 this branch
+develops on, with a `NOBYPASSRLS` owner role and one row present:
+
+| role | RLS | `app.workspace_id` | rows seen |
+|---|---|---|---|
+| owner (NOBYPASSRLS) | ENABLE + FORCE | unset | **0** |
+| superuser | ENABLE + FORCE | unset | 1 |
+| owner (NOBYPASSRLS) | ENABLE only | unset | 1 |
+| non-owner app role | ENABLE only | unset | **0** |
+
+So an unconditional `FORCE` silently blinds every existing single-tenant
+PostgreSQL deployment whose DSN is not a superuser — and **the suite's own DSN
+is a superuser, so the test lane would have gone green anyway.** Row 4 is the
+other half: `ENABLE` alone already isolates a non-owner role, which is what the
+application role is under D4.
+
+The split that keeps both promises: the **policies** live in the migration,
+where they are reviewable SQL, and a policy on a table whose RLS is not enabled
+is inert (verified, not assumed). The two `ALTER TABLE` lines live in
+`db.EnableRLS`, which runs at boot **only when `MULTI_TENANT` is set**, on the
+**platform handle** (`DATABASE_ADMIN_URL` — the application role cannot run DDL
+in multi-tenant mode at all), is idempotent, and whose failure is
+`os.Exit(1)`: without it every policy is inert and the process would come up
+looking multi-tenant while separating nothing.
+`TestPostgres_rlsIsOffUntilEnabled` pins both halves — off straight after
+migrating, on for all 32 tenant tables and none of the 4 exempt ones after
+`EnableRLS`, twice.
+
+### The column default is `COALESCE(current_setting(…, true), 'default')`
+
+D1 spells it `current_setting('app.workspace_id')`. The bare form **raises** on
+an unset parameter, so it would fail every INSERT in single-tenant mode. The
+`missing_ok` form plus `COALESCE` gives `'default'` when nothing is bound, which
+is what single-tenant wants, and is never reached in multi-tenant mode because
+the handle binds before every statement. It also fails **closed** if a
+multi-tenant statement ever escapes that binding: the row would be written as
+`'default'` and the policy's `WITH CHECK` compares it against an unset parameter
+(NULL, so not true), which refuses the INSERT with SQLSTATE 42501 rather than
+letting it land in the wrong tenant. `rls_proof_test.go` asserts exactly that,
+including that nothing arrives in the default workspace.
+
+### The tenancy proof, and its negative control
+
+`internal/db/rls_proof_test.go` creates a `calnode_app_<hex>` role with
+`NOBYPASSRLS` per test schema, grants it the schema's tables, and opens a handle
+as it. ⛔ It **skips loudly** rather than falling back if the role cannot be
+created, or reports `rolsuper`/`rolbypassrls`, or owns any table in the schema —
+a superuser handle would satisfy every assertion whether the policies existed or
+not. Four subtests, both halves required:
+
+- unbound: `SELECT COUNT(*) FROM users` returns **0** of 2
+- unbound: INSERT refused with **42501**, and **nothing lands in `default`**
+- bound to `ws-a`: sees 1 of 2, reads `a@example.com`, INSERT naming **no**
+  `workspace_id` lands as `ws-a`, `b@example.com` invisible
+- bound to `ws-a`, naming `ws-b` explicitly: refused with **42501**
+
+`set_config(…, false)` is session-scoped, so every subtest pins one `*sql.Conn`
+and writes `$n` directly — statements through a `*sql.Conn` are not rebound.
+
+Proved failable by making `EnableRLS` return early:
+
+```
+--- FAIL: TestPostgres_rlsIsolatesAnUnprivilegedRole/unbound_reads_nothing
+    rls_proof_test.go:178: an unbound session sees 2 of 2 users; want 0 — an unset app.workspace_id must match no row
+--- FAIL: .../unbound_write_is_refused_and_lands_nowhere
+    rls_proof_test.go:187: an unbound INSERT succeeded; the policy's WITH CHECK must refuse it
+--- FAIL: .../bound_reads_and_writes_exactly_one_workspace
+    rls_proof_test.go:215: a session bound to ws-a sees 3 users; want 1
+--- FAIL: .../naming_another_workspace_explicitly_is_refused
+    rls_proof_test.go:261: writing into another workspace succeeded; WITH CHECK must refuse it
+```
+
+### 32 tenant tables, 4 exempt, and a gate against forgetting
+
+`db.TenantTables` / `db.ExemptTables` are the Go copies of the list in the
+migration header, and `TestTenancy_tableListsCoverTheSchema` fails if a base
+table is in neither — so a table added by a later migration has to be
+classified. Exempt: `workspaces` (the root, with its own SELECT-only policy for
+the application role), `crypto_keystore` (one DEK per process, D3),
+`goose_db_version`, `oauth_clients` (dynamic client registration is per client
+*application*; the per-tenant half is `oauth_access_tokens`, which is a tenant
+table).
+
+### SQLite's three forced differences
+
+1. **No `REFERENCES workspaces(id)`.** Measured on modernc.org/sqlite with
+   `foreign_keys=ON`: `ALTER TABLE t ADD COLUMN workspace_id TEXT NOT NULL
+   DEFAULT 'default' REFERENCES ws(id)` is **rejected** — "Cannot add a
+   REFERENCES column with non-NULL default value (1)". Rebuilding all 32 tables
+   to get a constraint whose only payoff is cascade-on-workspace-delete, in an
+   engine that cannot run multi-tenant, is not worth it. The two tables rebuilt
+   below omit it too, so the engine is consistent with itself.
+2. **No RLS, no policies.** Nothing to express them with, which is why
+   `config.Validate` refuses `MULTI_TENANT` without a `postgres://` DSN.
+3. **Only the uniqueness that has to MOVE moves.** `idempotency_keys` and
+   `meeting_consents` are rebuilt (their PRIMARY KEY changes and SQLite cannot
+   ALTER a table constraint); `ux_jobs_type_payload` and `idx_notes_booking` are
+   dropped and recreated (plain indexes need no rebuild). `users(email)`,
+   `event_types(slug)`, `teams(slug)` and `server_settings`' `id = 1` singleton
+   stay exactly as they are: with one workspace, a global unique and a
+   `(workspace_id, x)` unique admit precisely the same rows.
+
+### ⚠️ `jobs` keeps a second, workspace-free copy of each partial index
+
+The packet says every partial index on `bookings` and `jobs` gets `workspace_id`
+prepended. Correct for `bookings` — every query that uses those indexes now
+carries a workspace predicate. **Not** for `jobs`: it is the one table worked
+*across* tenants, and the worker's claim and its crash-recovery reaper (B5) run
+on the platform handle with no workspace predicate, ordered by `run_at` /
+`locked_until` globally. A workspace-leading index cannot serve an ordered global
+scan. So both are prepended as instructed **and** `idx_jobs_pending_global`
+`(run_at)` and `idx_jobs_running_expired_global` `(locked_until)` are added
+alongside. Four small indexes on a table that holds pending work, not history.
+
+### `demo.Reset` had to learn about the tenant root
+
+The Postgres path is one `TRUNCATE … CASCADE` naming every table from
+`pg_tables`, which took `workspaces` with it, and the re-seed's first
+`server_settings` INSERT then failed with SQLSTATE 23503. `workspaces` is now
+held back alongside `goose_db_version`: it is the tenant root, not visitor data,
+and in demo mode it holds exactly one constant row. This was the only pre-existing
+test the migration broke, on either engine.
+
+### Config
+
+`MULTI_TENANT`, `DATABASE_ADMIN_URL`, `CALNODE_PLATFORM_TOKEN`, and a new
+`(*Config).Validate` called from `main` before the database is opened. It is
+separate from `Load` because every optional knob in `Load` deliberately falls
+back on a typo rather than refusing to boot (`PoolFromEnv`); these are not typos.
+Five refusals, each one a combination whose only other outcome is silent:
+a non-`postgres://` `DATABASE_URL`, a missing or non-Postgres
+`DATABASE_ADMIN_URL`, **the two DSNs being equal** (one role means the
+application role owns the tables and every policy is inert against it — the
+misconfiguration hardest to notice, because everything works, including reading
+other tenants' rows), and `DEMO_MODE` (D13: demo mode periodically wipes the
+whole database, which here is every tenant's data).
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test ./...` **rc=0 on SQLite (28/28 packages)** and **rc=0 on PostgreSQL
+(28/28)**.
+
+### Not yet wired (later boundaries, stated so it is not mistaken for done)
+
+`cmd/calnode/main.go` opens the platform handle with a second `db.OpenDB` and
+uses it for `Migrate` + `EnableRLS`; Boundary 2 replaces that pair with
+`db.OpenPair`. The other entry points (`mcp`, `reset-admin`, `rotate-key`,
+`recover-key`) still open one handle from `DATABASE_URL` and are untouched —
+they are single-tenant operator tools today, and B3/B6 decide what they become.

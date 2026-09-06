@@ -32,10 +32,11 @@ import (
 const timestampColumnPredicate = `(c.column_name ~ '_(at|until)$'
 	  OR c.column_name IN ('date', 'start_time', 'end_time'))`
 
-// wantTimestampColumns is the number of columns 00059 altered. A floor, not an
-// equality: the assertion that matters is "every match is C", and a query that
-// silently stopped matching anything would satisfy that vacuously.
-const wantTimestampColumns = 54
+// wantTimestampColumns is the number of columns 00059 altered, plus the two
+// workspaces timestamps 00060 added. A floor, not an equality: the assertion that
+// matters is "every match is C", and a query that silently stopped matching
+// anything would satisfy that vacuously.
+const wantTimestampColumns = 56
 
 func TestPostgres_timestampColumnsCollateC(t *testing.T) {
 	handle := dbtest.RequirePostgres(t)

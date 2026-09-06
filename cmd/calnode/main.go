@@ -50,6 +50,14 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	// Before the database is opened: every combination Validate refuses would
+	// otherwise present as a bug somewhere much later — a tenant reading another
+	// tenant's rows, or a demo reset wiping a fleet.
+	if err := cfg.Validate(); err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+
 	bi := buildinfo.Get()
 	logger.Info("starting calnode", "version", bi.Version, "commit", bi.Commit, "build_time", bi.BuildTime, "dirty", bi.Dirty)
 
@@ -66,11 +74,43 @@ func main() {
 	}
 	defer database.Close()
 
-	if err := database.Migrate(); err != nil {
+	// Migrations and row-level-security enablement are the PLATFORM role's work,
+	// not the application role's. In multi-tenant mode DATABASE_URL is a
+	// NOBYPASSRLS role that does not own the schema and therefore cannot run DDL
+	// at all; DATABASE_ADMIN_URL is the owner. Single-tenant mode has one role and
+	// one handle, so migrator is just database.
+	//
+	// Boundary 2 replaces this pair of opens with db.OpenPair.
+	migrator := database
+	if cfg.MultiTenant {
+		admin, err := db.OpenDB(cfg.DatabaseAdminURL)
+		if err != nil {
+			logger.Error("failed to open the platform database handle", "error", err)
+			os.Exit(1)
+		}
+		defer admin.Close()
+		migrator = admin
+	}
+
+	if err := migrator.Migrate(); err != nil {
 		logger.Error("failed to run migrations", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("database migrations applied")
+
+	// ⛔ Refuse to serve if this fails. Without it every policy created by
+	// migration 00060 is inert, and the process would come up looking multi-tenant
+	// while separating nothing. It is idempotent, so booting twice is fine, and it
+	// is deliberately gated on MULTI_TENANT: FORCE ROW LEVEL SECURITY applies a
+	// policy to the table's owner too, and in single-tenant mode DATABASE_URL is
+	// that owner (see db.EnableRLS).
+	if cfg.MultiTenant {
+		if err := migrator.EnableRLS(context.Background()); err != nil {
+			logger.Error("failed to enable row-level security; refusing to serve", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("row-level security enabled", "tables", len(db.TenantTables))
+	}
 
 	// Open the key vault. devMode allows an ephemeral DEK when no secret is set
 	// (handy for local development); production deployments must set

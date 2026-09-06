@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
@@ -16,6 +17,32 @@ type Config struct {
 	BaseURL        string // identity host: OAuth callbacks, admin UI, team invites
 	PublicBaseURL  string // booker-facing host: booking links, emails; defaults to BaseURL
 	LogLevel       slog.Level
+
+	// MultiTenant serves many isolated workspaces from one process: the tenant of
+	// a request is resolved from its Host or from the credential it carries, and
+	// PostgreSQL row-level security — not the query author — is what keeps one
+	// workspace out of another's rows.
+	//
+	// Unset is the default and changes nothing: one workspace with the literal id
+	// "default", row-level security never enabled, SQLite still supported.
+	MultiTenant bool
+
+	// DatabaseAdminURL is the PLATFORM role's DSN: the owner of the schema, with
+	// BYPASSRLS, which runs migrations, the worker's cross-tenant claim loop, the
+	// reconciler's workspace enumeration and the platform API. DatabaseURL is then
+	// the APPLICATION role, which must be NOBYPASSRLS and must not own the tables —
+	// that is the whole of the isolation guarantee, since a role that owns a table
+	// or bypasses RLS is not constrained by its policy.
+	//
+	// Required when MultiTenant is set, ignored otherwise: in single-tenant mode
+	// both handles are the same one.
+	DatabaseAdminURL string
+
+	// PlatformToken authenticates the platform API (workspace provisioning,
+	// export/import, erasure) on the identity host. Empty means the platform API
+	// is not mounted at all — a 404, not a 401, so an instance that does not
+	// provision workspaces does not advertise that it could.
+	PlatformToken string
 
 	// Email / SMTP
 	SMTPHost      string
@@ -114,7 +141,62 @@ func Load() *Config {
 	cfg.DemoResetInterval = getDuration("DEMO_RESET_INTERVAL", 30*time.Minute)
 	cfg.DBMaxOpenConns, cfg.DBMaxIdleConns = PoolFromEnv()
 
+	cfg.MultiTenant = getBool("MULTI_TENANT", false)
+	cfg.DatabaseAdminURL = os.Getenv("DATABASE_ADMIN_URL")
+	cfg.PlatformToken = os.Getenv("CALNODE_PLATFORM_TOKEN")
+
 	return cfg
+}
+
+// Validate reports a configuration that cannot work, rather than letting it fail
+// later as something that reads like a bug in the code.
+//
+// It is separate from Load because Load has no error return and every optional
+// knob in it deliberately falls back on a typo rather than refusing to boot
+// (see PoolFromEnv). These are not typos: each one is a combination whose only
+// possible outcome is silent data loss or silent cross-tenant exposure.
+func (c *Config) Validate() error {
+	if !c.MultiTenant {
+		return nil
+	}
+
+	// SQLite has no row-level security, so there is nothing to enforce isolation
+	// with. Refusing is the only honest answer: the alternative is an instance
+	// that looks multi-tenant and separates nothing.
+	if !isPostgresURL(c.DatabaseURL) {
+		return errors.New("MULTI_TENANT requires a postgres:// DATABASE_URL — " +
+			"tenant isolation is PostgreSQL row-level security, which SQLite has no equivalent of")
+	}
+	if c.DatabaseAdminURL == "" {
+		return errors.New("MULTI_TENANT requires DATABASE_ADMIN_URL — " +
+			"the platform role that owns the schema and runs migrations, distinct from the application role in DATABASE_URL")
+	}
+	if !isPostgresURL(c.DatabaseAdminURL) {
+		return errors.New("DATABASE_ADMIN_URL must be a postgres:// DSN")
+	}
+	// Same DSN means one role, which means the application role owns the schema
+	// and every policy is inert against it. This is the misconfiguration that
+	// would be hardest to notice, because everything works — including reading
+	// other tenants' rows.
+	if c.DatabaseAdminURL == c.DatabaseURL {
+		return errors.New("DATABASE_ADMIN_URL must differ from DATABASE_URL — " +
+			"the application role must not own the tables or its row-level-security policies do not apply to it")
+	}
+	// Demo mode wipes and re-seeds the whole database every DemoResetInterval.
+	// Against a multi-tenant database that is every tenant's data.
+	if c.DemoMode {
+		return errors.New("DEMO_MODE and MULTI_TENANT are mutually exclusive — " +
+			"demo mode periodically wipes the entire database")
+	}
+	return nil
+}
+
+// isPostgresURL mirrors the classification internal/db does on the same string.
+// Duplicated rather than imported because db imports config, and one three-line
+// prefix check is a smaller price than a cycle.
+func isPostgresURL(u string) bool {
+	l := strings.ToLower(u)
+	return strings.HasPrefix(l, "postgres://") || strings.HasPrefix(l, "postgresql://")
 }
 
 // Pool defaults. Deliberately modest: one Calnode instance is one small process,

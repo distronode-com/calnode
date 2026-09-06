@@ -252,11 +252,20 @@ func listTables(ctx context.Context, db *db.DB) ([]string, error) {
 	// sqlite_master has no Postgres counterpart. pg_tables scoped to
 	// current_schema() is the equivalent, and honouring the current schema is what
 	// lets a test run inside its own isolated one.
+	//
+	// Two tables are held back. goose_db_version is migration bookkeeping, and
+	// wiping it would make the next boot re-run every migration. workspaces is the
+	// tenant root (migration 00060): every application table's workspace_id has a
+	// foreign key to it, so truncating it takes the 'default' row with it and the
+	// re-seed's first INSERT fails with SQLSTATE 23503. It holds no visitor data —
+	// in demo mode there is exactly one row, and it is a constant.
 	rows, err := db.QueryContext(ctx, db.Dialect().SQL(
 		`SELECT name FROM sqlite_master
-		 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'goose_db_version'`,
+		 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+		   AND name NOT IN ('goose_db_version', 'workspaces')`,
 		`SELECT tablename FROM pg_tables
-		 WHERE schemaname = current_schema() AND tablename != 'goose_db_version'`))
+		 WHERE schemaname = current_schema()
+		   AND tablename NOT IN ('goose_db_version', 'workspaces')`))
 	if err != nil {
 		return nil, fmt.Errorf("demo reset: list tables: %w", err)
 	}
