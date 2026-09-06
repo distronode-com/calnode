@@ -120,6 +120,13 @@ func main() {
 			logger.Error("failed to enable row-level security; refusing to serve", "error", err)
 			os.Exit(1)
 		}
+		// The seeded `default` workspace is nobody's tenant on a multi-tenant instance;
+		// suspending it keeps the background sweeps off it. Not fatal: a sweep over an
+		// empty workspace is waste, not damage, so a failure here is worth a line in the
+		// log and not a refusal to serve.
+		if err := platform.SuspendDefaultWorkspace(context.Background()); err != nil {
+			logger.Error("could not suspend the default workspace", "error", err)
+		}
 		if err := database.VerifyRoles(context.Background()); err != nil {
 			logger.Error("database roles cannot enforce tenant isolation; refusing to serve", "error", err)
 			os.Exit(1)

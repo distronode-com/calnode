@@ -66,6 +66,11 @@ type shared struct {
 	// carries a `wid` claim. The secret identifies the INSTANCE that minted the
 	// token; the workspace is inside the payload, which is what lets one identity
 	// host hand a session to any of its tenants' public hosts (D11).
+	// platformToken authorises the platform API (D12). Like the two below it is one
+	// process-wide env-var secret, and it is what makes an instance a control plane
+	// rather than just a tenant: with it unset every /v1/platform/* route 404s.
+	platformToken string
+
 	ssoSecret     string // HMAC key for the signed session hand-off; empty ⇒ /v1/auth/sso is off
 	metricsToken  string // bearer token for GET /metrics; empty ⇒ that endpoint 404s
 	sttBaseURLCfg string // STT_BASE_URL override; empty ⇒ stt.DefaultBaseURL (see sttBaseURL)

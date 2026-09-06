@@ -49,6 +49,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	h.SetDataDir("data")
 	h.SetEncKey(cfg.EncryptionKey)
 	h.SetSSOSecret(cfg.SSOSharedSecret)
+	h.SetPlatformToken(cfg.PlatformToken)
 	h.SetMetricsToken(cfg.MetricsToken)
 	h.SetSTTBaseURL(cfg.STTBaseURL)
 	h.SetDemoMode(cfg.DemoMode)
@@ -319,6 +320,21 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	// unbound handle it would report zero. Both are wrong in a way a dashboard cannot
 	// show you.
 	mux.HandleFunc("GET /metrics", h.Platform((*H).Metrics))
+
+	// Platform API (D12) — workspace provisioning on the identity host. Registered
+	// unconditionally and gated inside the handlers on CALNODE_PLATFORM_TOKEN *and*
+	// multi-tenant mode, both of which answer 404 when absent: a single-tenant instance
+	// has no workspaces to provision, and a prober should not be able to tell which of
+	// the two reasons applies.
+	//
+	// ⛔ Platform-wrapped, so h.db is the platform handle — which is the only handle that
+	// CAN create a tenant (the application role cannot see a workspace that does not
+	// exist yet, and RLS would refuse its first INSERT). Every INSERT in platform.go
+	// names workspace_id for that reason.
+	mux.HandleFunc("POST /v1/platform/workspaces", h.Platform((*H).CreateWorkspace))
+	mux.HandleFunc("GET /v1/platform/workspaces/{id}", h.Platform((*H).GetWorkspace))
+	mux.HandleFunc("PATCH /v1/platform/workspaces/{id}", h.Platform((*H).PatchWorkspace))
+	mux.HandleFunc("DELETE /v1/platform/workspaces/{id}", h.Platform((*H).DeleteWorkspace))
 
 	// Bootstrap — public, once-only
 	mux.HandleFunc("POST /v1/setup", h.Platform((*H).Setup))

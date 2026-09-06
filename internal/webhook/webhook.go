@@ -162,6 +162,44 @@ func New(db *db.DB, encKeyHex string) (*Service, error) {
 	return s, nil
 }
 
+// NewSecret prepares a webhook signing secret for a caller that must write the webhooks
+// row itself — the platform API, whose INSERT has to name workspace_id and has to ride the
+// provisioning transaction. It returns the plain hex to hand out once and the ciphertext
+// for secret_enc.
+//
+// ⛔ It exists so the encoding convention stays in ONE place. The column holds the
+// AES-GCM of the RAW secret bytes and Sign uses those bytes as the HMAC key, while the
+// string given to the subscriber is their hex encoding. A second implementation that
+// encrypted the hex string instead would store a key the subscriber cannot reproduce, and
+// every delivery would fail its signature check with nothing in the logs to point at.
+//
+// plainSecretHex may be empty, in which case a 32-byte secret is generated. A supplied
+// secret must be hex and at least 16 bytes for the same reason.
+func (s *Service) NewSecret(plainSecretHex string) (plain, encrypted string, err error) {
+	var rawSecret []byte
+	if plainSecretHex == "" {
+		rawSecret = make([]byte, 32)
+		if _, err := io.ReadFull(rand.Reader, rawSecret); err != nil {
+			return "", "", fmt.Errorf("webhook: generate secret: %w", err)
+		}
+		plainSecretHex = hex.EncodeToString(rawSecret)
+	} else {
+		decoded, err := hex.DecodeString(plainSecretHex)
+		if err != nil {
+			return "", "", fmt.Errorf("webhook: secret must be hex: %w", err)
+		}
+		if len(decoded) < 16 {
+			return "", "", fmt.Errorf("webhook: secret must be at least 16 bytes (32 hex characters)")
+		}
+		rawSecret = decoded
+	}
+	enc, err := s.encrypt(rawSecret)
+	if err != nil {
+		return "", "", fmt.Errorf("webhook: encrypt secret: %w", err)
+	}
+	return plainSecretHex, enc, nil
+}
+
 // ForDB returns a copy of s backed by handle, keeping the same signing key. It is
 // how a per-request handler gets a webhook service bound to its workspace; the
 // Service is a struct over a pool, so this pins nothing.

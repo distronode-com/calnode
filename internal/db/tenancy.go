@@ -106,6 +106,34 @@ var ExemptTables = []string{
 // Table names are interpolated into the DDL because PostgreSQL takes no
 // placeholder for an identifier. They come from TenantTables, a committed
 // constant list, never from input.
+// SuspendDefaultWorkspace marks the seeded `default` workspace suspended. It runs at
+// multi-tenant boot only, and is idempotent.
+//
+// Migration 00060 seeds `default` because it is the workspace every single-tenant row
+// belongs to and the SQLite column default names it. On a MULTI_TENANT instance that row
+// is a tenant nobody owns: it has no public_host (deliberately, so no Host can reach it),
+// no users, and no settings. Left `active` it is still enumerated by every background
+// sweep — the reconciler takes a pass over it on each cycle, and any future periodic loop
+// would too — so the instance does work on behalf of a tenant that cannot receive it.
+//
+// ⛔ Suspending it at BOOT rather than in the migration is the whole point. The migration
+// cannot see MULTI_TENANT, and in single-tenant mode `default` IS the workspace: a
+// suspended row there would make Scoped answer 503 to every request on the instance. So
+// the mode decides, and the mode is only known here.
+//
+// Suspension is the right shape rather than deletion: the row is referenced by
+// server_settings and by any single-tenant data a converted instance still holds, and
+// activeWorkspaceIDs already filters on status = 'active', so one status flip removes it
+// from every sweep at once (D12's suspended semantics, reused).
+func (h *DB) SuspendDefaultWorkspace(ctx context.Context) error {
+	if _, err := h.Platform().ExecContext(ctx,
+		`UPDATE workspaces SET status = 'suspended' WHERE id = ? AND status <> 'suspended'`,
+		DefaultWorkspaceID); err != nil {
+		return fmt.Errorf("suspend the default workspace: %w", err)
+	}
+	return nil
+}
+
 func (h *DB) EnableRLS(ctx context.Context) error {
 	if h.dialect != DialectPostgres {
 		return nil

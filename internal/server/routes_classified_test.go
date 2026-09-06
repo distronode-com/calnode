@@ -183,6 +183,13 @@ func TestPlatformRoutesAreTheIdentityHostSet(t *testing.T) {
 		// token IS the credential and the workspace is its `wid` claim, which
 		// SSOHandoff resolves itself (D11).
 		"GET /v1/auth/sso",
+		// The platform API: provisioning is an instance-level operation on the identity
+		// host, authorised by CALNODE_PLATFORM_TOKEN rather than by any tenant's
+		// credential (D12).
+		"POST /v1/platform/workspaces",
+		"GET /v1/platform/workspaces/{id}",
+		"PATCH /v1/platform/workspaces/{id}",
+		"DELETE /v1/platform/workspaces/{id}",
 		// Bootstrap: creates the first user of a single-tenant instance.
 		"POST /v1/setup",
 		// OAuth login and its callbacks live on the identity host, because that is

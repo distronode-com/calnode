@@ -1652,6 +1652,127 @@ quiet the failure is, and the distinction matters to anyone debugging a 23503 fr
 Platform route. Not corrected in place above, because those notes are the record of what
 was believed when each boundary was written.
 
+## Boundary 6, part one — the platform API (D12): create, get, patch, delete
+
+`internal/handler/platform.go`. Four routes on the identity host, all `Platform`-wrapped,
+bearer `CALNODE_PLATFORM_TOKEN` compared with `subtle.ConstantTimeCompare`.
+
+### Two gates, and they answer differently on purpose
+
+| state | answer | why |
+|---|---|---|
+| token unset | **404** | the API does not exist here, and a prober should not learn whether it could |
+| single-tenant instance | **404** | there are no workspaces to provision; same reasoning, and it is Setup's mirror image (Setup 404s in multi-tenant mode) |
+| token set, wrong token | **401** | an operator with a typo needs to tell that apart from a missing feature |
+
+### Provisioning is one transaction, and every INSERT names `workspace_id`
+
+The workspaces row, `server_settings` (id = 1 per workspace, D8), the owner user, that
+owner's first `cno_` key, the webhook subscription, the default event type and its
+availability rules. Either the tenant exists complete or it does not exist: a
+half-provisioned workspace would answer requests with no owner, or serve a booking page
+with no availability. `TestPlatform_duplicateIDOrHostIs409` asserts the rollback, not just
+the status code.
+
+⛔ **Every INSERT names `workspace_id` explicitly**, which is the rule this file exists to
+obey rather than to demonstrate. `h.db` here is the platform handle: it bypasses the
+policies and binds `''`, so an unnamed column resolves to `''` and the row fails its
+foreign key with 23503. **Reads are equally unscoped and carry their own predicate** —
+there is no policy behind this file to catch a forgotten `WHERE`.
+
+⚠️ `owner_timezone` is stored as the owner's `iana_timezone`, **not** UTC, and that is a
+correctness requirement rather than a nicety: `availability_rules` holds local `HH:MM` with
+no zone of its own, so defaulting the owner's zone would silently move the workspace's
+working hours. A test pins the stored value.
+
+### Two settings had no column, so migration 00062 gives them one
+
+`defaults.embed_allowed_origins` and `defaults.stt_base_url` are in the settled contract
+and `server_settings` had nowhere to put either — the enumerated column list has neither.
+Both are per-TENANT facts that the environment cannot express: one process-wide
+`EMBED_ALLOWED_ORIGINS` would let one tenant's allowlist govern another's embed, and the
+STT host is a residency knob, which is a property of the tenant.
+
+⚠️ **They are WRITTEN and not yet READ.** The embed CORS check still uses
+`config.EmbedAllowedOrigins` and the notetaker still uses `config.STTBaseURL`, so a
+multi-tenant deployment currently shares one embed allowlist and one STT host. Storing them
+now means a provisioned workspace does not silently lose what the caller sent; wiring the
+readers is separate work, because each has to go through the per-workspace settings cache
+(D7) rather than a process-wide read. Named here so it is not mistaken for done.
+`knownMigrationCount` 61 → 62.
+
+### The webhook secret's encoding has exactly one implementation
+
+`webhook.NewSecret` is new and the platform API calls it: the column holds the AES-GCM of
+the **raw** secret bytes, `Sign` uses those bytes as the HMAC key, and the string handed to
+the subscriber is their **hex**. A second implementation that encrypted the hex string
+would store a key the subscriber cannot reproduce, and every delivery would fail its
+signature check with nothing in the logs to point at. A caller-supplied secret must
+therefore be hex and at least 16 bytes; absent, one is generated. The INSERT itself stays
+in the provisioning transaction, where it can name `workspace_id`.
+
+### ⛔ Decision: the `default` workspace is SUSPENDED at multi-tenant boot
+
+`db.SuspendDefaultWorkspace`, called from `main` right after `EnableRLS`, idempotent, and
+non-fatal on error (a sweep over an empty workspace is waste, not damage).
+
+Migration 00060 seeds `default` because it is the workspace every single-tenant row belongs
+to and the one SQLite's column default names. On a multi-tenant instance it is a tenant
+nobody owns: no `public_host` (deliberately, so no Host reaches it), no users, no settings —
+and while it is `active`, every background sweep enumerates it, because
+`activeWorkspaceIDs` filters on `status = 'active'`.
+
+**Not in the migration, and that is the whole point:** a migration cannot see
+`MULTI_TENANT`, and in single-tenant mode `default` **is** the workspace — a suspended row
+there would make `Scoped` answer 503 to every request on the instance. The mode decides,
+and the mode is only known at boot. Suspension rather than deletion because the row is
+referenced by `server_settings` and by whatever single-tenant data a converted instance
+still holds, and because one status flip removes it from every sweep at once instead of
+adding a second exclusion rule a new loop could forget.
+`TestPostgres_defaultWorkspaceIsSuspendedAtMultiTenantBoot` asserts active-after-migrate
+(what single-tenant needs), suspended-after-call, idempotence, and that a real workspace
+beside it is untouched.
+
+### ⚠️ Two things the tests paid for
+
+- **`httptest.NewRequest` does not populate mux path values.** They come from the pattern
+  `ServeMux` matched, and these tests call the handler directly — so every `{id}` route
+  read an empty id and answered **404, which looks exactly like a missing workspace**. The
+  helper calls `SetPathValue` now.
+- **`location_type` and `routing_mode` have CHECK constraints** (migration 00001) that
+  admit no `'none'` or `'single'`. The event type seeds `'link'` / `'fixed'`, the schema's
+  own defaults, which is what a single-host event type created in the admin UI gets. The
+  first run failed with 23514 as a bare 500, and the reason was only visible with a live
+  logger.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test -count=1 ./...` **rc=0 on SQLite (30/30)**.
+PostgreSQL lane, per package: `internal/handler` **rc=0** (410.2s), `internal/db`,
+`internal/server`, `internal/webhook` **rc=0**.
+
+```
+--- PASS: TestPlatform_createProvisionsTheWholeWorkspace (1.04s)
+--- PASS: TestPlatform_createdWorkspacesAreIsolated (1.25s)
+--- PASS: TestPlatform_duplicateIDOrHostIs409 (1.10s)
+--- PASS: TestPlatform_getPatchDelete (1.08s)
+--- PASS: TestPlatform_tokenGate (1.08s)          [wrong token, no token]
+--- PASS: TestPlatform_404WithoutATokenConfigured (0.73s)
+--- PASS: TestPlatform_404OnASingleTenantInstance (0.74s)
+--- PASS: TestPlatform_createValidation (11.47s)  [9 cases, each asserting nothing was left behind]
+--- PASS: TestPostgres_defaultWorkspaceIsSuspendedAtMultiTenantBoot (0.76s)
+```
+
+### Still owed by B6
+
+Export/import/erasure; the SSO + OAuth hand-off on the public host (the plan is at the end
+of this file); the vendor webhooks resolving their workspace from the row they name. D13 is
+already done (B1's `config.Validate` refuses `MULTI_TENANT` with `DEMO_MODE`) and D14
+landed with the platform-hooks merge.
+
+---
+
 ## D11, the remaining half — the plan for B6
 
 The verify side is in. What is missing is that **nothing mints an SSO token yet**, so the
