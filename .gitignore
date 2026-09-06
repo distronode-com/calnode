@@ -62,3 +62,6 @@ pnpm-debug.log*
 # Vitest browser-mode artifacts (failure screenshots / attachments)
 __screenshots__/
 .vitest-attachments/
+
+# District Scheduler binary
+/district-scheduler

@@ -1,0 +1,86 @@
+# syntax=docker/dockerfile:1
+#
+# District Scheduler — the multi-tenant, PostgreSQL-only image of this fork.
+#
+# ⛔ NOT the upstream Dockerfile. That one ships SQLite + Litestream + a shell
+# entrypoint for the single-tenant "one binary, one file" story. This image is
+# what the four District regions run: MULTI_TENANT requires PostgreSQL (boot
+# refuses a sqlite DSN), so there is no Litestream, no /data volume and no
+# entrypoint script — just the static binary on a distroless base.
+#
+# What the fleet manifests (distronode-website/k8s/*/scheduler-deployment.yaml)
+# assume of this image, and this file guarantees:
+#   - listens on 3000 (PORT is fixed here; the Service targets it by name)
+#   - runs as uid 10001, non-root, matching the pod securityContext
+#   - needs no writable filesystem beyond what the binary creates in DATA_DIR
+#   - reads every setting from the environment (the district-scheduler-env Secret)
+#
+# Everything else — the frontend build, the Go build, VERSION/COMMIT stamping —
+# is byte-for-byte the upstream recipe, so an image built here reports the same
+# /version fields as an upstream one.
+
+# ── Frontend build stage ───────────────────────────────────────────────────────
+FROM node:22-alpine AS frontend-builder
+
+RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
+
+WORKDIR /app
+
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY frontend/ .
+RUN pnpm build
+
+# ── Go build stage ─────────────────────────────────────────────────────────────
+FROM golang:1.26.6-alpine AS builder
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+COPY --from=frontend-builder /app/build ./frontend/build
+
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=""
+# The module path stays github.com/calnode/calnode on purpose: it is an internal
+# identifier, and keeping it is what lets this fork rebase onto upstream without
+# a 188-file rename in every merge. The binary and the image carry the District
+# name; the import path does not need to.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+    -ldflags="-s -w -X github.com/calnode/calnode/internal/buildinfo.Version=${VERSION} -X github.com/calnode/calnode/internal/buildinfo.Commit=${COMMIT}" \
+    -o district-scheduler ./cmd/calnode
+
+# An empty directory to become /data in the runtime image: distroless has no shell,
+# so the only way to ship a directory with an owner is to COPY one in.
+RUN mkdir -p /build/data-empty
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+# distroless static: CA roots and tzdata included, no shell, no package manager.
+# The binary is CGO-free and fully static, which is the only thing this base can run.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /build/district-scheduler /district-scheduler
+# Uploads (avatars, branding) go here; owned by the uid below so the binary can
+# write it, and a volume may be mounted over it. DATA_DIR is what the binary reads
+# (config.go); without it the default is the RELATIVE "data", which under / and
+# uid 10001 is not creatable, and every avatar upload would fail with EACCES.
+COPY --from=builder --chown=10001:10001 /build/data-empty /data
+
+# 10001 is what the fleet's pod securityContext pins (runAsUser/runAsNonRoot); the
+# image agrees so a `docker run` of it behaves like the pod does.
+USER 10001:10001
+
+EXPOSE 3000
+ENV PORT=3000 \
+    DATA_DIR=/data
+
+# No default DATABASE_URL: in multi-tenant mode both DSNs are required and there is
+# no sensible default for either, so a missing one fails at boot with the config
+# error rather than starting on an empty SQLite file nobody asked for.
+ENTRYPOINT ["/district-scheduler"]

@@ -1,3 +1,27 @@
+# District Scheduler
+
+**A fork of [Calnode](https://github.com/Calnode/calnode)**, the Apache-2.0 scheduling engine,
+run by Distronode Corporation as the booking, meetings and notetaker engine behind District AI.
+
+What this fork adds, and offers back upstream as an opt-in mode:
+
+- **`MULTI_TENANT`** — one PostgreSQL-backed process serving many isolated workspaces,
+  with row-level security as the isolation mechanism, a platform API for provisioning, a
+  signed session hand-off, per-workspace vendor credentials, export/import and erasure.
+  Everything about it is in [docs/MULTI_TENANT.md](docs/MULTI_TENANT.md). With the variable
+  unset the software is upstream Calnode, byte for byte in behaviour.
+- **A PostgreSQL-only image** — `ghcr.io/distronode-com/district-scheduler`, built from
+  [Dockerfile.district](Dockerfile.district): distroless, non-root, no SQLite, no Litestream.
+  The upstream single-binary SQLite image is still built from the upstream `Dockerfile`.
+
+Branches: `district` is what the fleet runs; `feat/multi-tenant` is the upstream-facing
+branch the pull requests are cut from. The Go module path is kept as upstream's so the fork
+rebases cleanly. See [NOTICE](NOTICE) for attribution.
+
+The upstream README follows.
+
+---
+
 # Calnode
 
 **A lean, self-hostable scheduling engine that lives in your AI stack.**

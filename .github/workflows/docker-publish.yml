@@ -1,12 +1,18 @@
 name: Docker publish
 
-# Builds the multi-arch (amd64 + arm64) image from the repo Dockerfile.
+# District Scheduler: builds the multi-arch (amd64 + arm64) MULTI-TENANT image from
+# Dockerfile.district (PostgreSQL-only, distroless, no Litestream) and publishes it
+# as ghcr.io/distronode-com/district-scheduler. The upstream Dockerfile is untouched
+# and is not built here; the fleet pins this image BY DIGEST
+# (distronode-website/infra/scheduler/image-digest.env in the monorepo).
+#
+# Upstream's tag scheme is kept as is, with `district` in place of `main`:
 #   * PR                → build only (catches cross-arch build breaks early, e.g. an
 #                         amd64-only step slipping back in). Nothing is pushed.
 #   * push to dev       → push `:dev` + `:sha-<short>`. Pre-release, for deploying a
 #                         branch to a real instance to test it before it reaches main.
 #                         Deliberately does NOT move `:edge` or `:latest`.
-#   * push to main      → push `:edge` + `:sha-<short>` (bleeding edge).
+#   * push to district  → push `:edge` + `:sha-<short>` (bleeding edge).
 #   * push a `vX.Y.Z` tag → push `:X.Y.Z`, `:X.Y`, and `:latest`, then cut a GitHub
 #                         Release. So `:latest` always tracks the newest *release*,
 #                         never raw main.
@@ -15,7 +21,7 @@ name: Docker publish
 # you, and then nothing records which commit an instance is actually running.
 on:
   push:
-    branches: [main, dev]
+    branches: [district, dev]
     tags: ['v*.*.*']
   pull_request:
 
@@ -25,9 +31,9 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  # Hardcoded lowercase — GHCR tags reject the repo's actual "Calnode/calnode"
-  # casing (${{ github.repository }} would break the push).
-  IMAGE_NAME: calnode/calnode
+  # Hardcoded lowercase — GHCR tags are lowercase and ${{ github.repository }}
+  # carries the repo's own casing.
+  IMAGE_NAME: distronode-com/district-scheduler
 
 jobs:
   build:
@@ -51,7 +57,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Computes the tag set from the git ref:
-      #   main       → edge, sha-<short>
+      #   district   → edge, sha-<short>
       #   dev        → dev, sha-<short>
       #   vX.Y.Z tag → X.Y.Z, X.Y, and latest (latest=auto only fires on a semver tag)
       #
@@ -63,7 +69,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=edge,branch=main
+            type=edge,branch=district
             type=ref,event=branch,enable=${{ github.ref == 'refs/heads/dev' }}
             type=sha
             type=semver,pattern={{version}}
@@ -73,6 +79,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.district
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

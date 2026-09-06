@@ -40,3 +40,6 @@ calnode.exe
 **/.svelte-kit
 **/build
 fly.toml
+
+# District Scheduler binary (Dockerfile.district)
+district-scheduler

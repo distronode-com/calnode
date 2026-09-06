@@ -1,0 +1,17 @@
+District Scheduler
+Copyright 2026 Distronode Corporation
+
+This product is a fork of Calnode (https://github.com/Calnode/calnode),
+Copyright the Calnode contributors, licensed under the Apache License,
+Version 2.0. The original LICENSE file is retained unchanged in this
+repository.
+
+Modifications made by Distronode Corporation are also licensed under the
+Apache License, Version 2.0, and are recorded in the git history of this
+repository. The multi-tenant mode (docs/MULTI_TENANT.md) is offered back to
+the Calnode project as an opt-in feature; where it has not been accepted
+upstream it is carried here.
+
+"Calnode" is a name used by the Calnode project. Distronode Corporation
+distributes this software as "District Scheduler" and does not claim any
+endorsement by, or affiliation with, the Calnode project.
