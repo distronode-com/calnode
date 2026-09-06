@@ -37,6 +37,12 @@ const (
 type mcpCaller struct {
 	UserID  string
 	IsAdmin bool // owner or admin → full workspace access
+
+	// WorkspaceID is the tenant the bearer credential belongs to. The /mcp mount
+	// is on the identity host, so there is no Host to resolve from: the credential
+	// is the only source (D10). MCPServerForRequest reads it to hand the tools a
+	// handler bound to that workspace.
+	WorkspaceID string
 }
 
 type mcpCallerKey struct{}
@@ -48,6 +54,15 @@ func withMCPCaller(ctx context.Context, c mcpCaller) context.Context {
 func mcpCallerFromContext(ctx context.Context) (mcpCaller, bool) {
 	c, ok := ctx.Value(mcpCallerKey{}).(mcpCaller)
 	return c, ok
+}
+
+// mcpCallerWorkspace returns the workspace of the bound /mcp caller, or "" when
+// there is none (the stdio transport, run by the local operator).
+func mcpCallerWorkspace(ctx context.Context) string {
+	if c, ok := mcpCallerFromContext(ctx); ok {
+		return c.WorkspaceID
+	}
+	return ""
 }
 
 // mcpCallerScope returns the calling user's id and whether they have full-workspace
@@ -83,9 +98,15 @@ func (h *Handler) MCPCallerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ti := auth.TokenInfoFromContext(r.Context()); ti != nil && ti.UserID != "" {
 			var owner, admin bool
-			_ = h.db.QueryRowContext(r.Context(),
-				`SELECT is_owner, is_admin FROM users WHERE id = ?`, ti.UserID).Scan(&owner, &admin)
-			r = r.WithContext(withMCPCaller(r.Context(), mcpCaller{UserID: ti.UserID, IsAdmin: owner || admin}))
+			var workspaceID string
+			// platformDB: this read resolves the workspace, so it cannot be bound
+			// to one. See RequireAuth for the same reasoning.
+			_ = h.platformDB().QueryRowContext(r.Context(),
+				`SELECT is_owner, is_admin, workspace_id FROM users WHERE id = ?`, ti.UserID).
+				Scan(&owner, &admin, &workspaceID)
+			r = r.WithContext(withMCPCaller(r.Context(), mcpCaller{
+				UserID: ti.UserID, IsAdmin: owner || admin, WorkspaceID: workspaceID,
+			}))
 		}
 		next.ServeHTTP(w, r)
 	})

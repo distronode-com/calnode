@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/oauth2"
 
 	"github.com/calnode/calnode/internal/calendar"
@@ -64,6 +65,12 @@ type shared struct {
 	demoResetInterval time.Duration
 	demoMu            sync.RWMutex
 	demoNextResetAt   time.Time
+
+	// mcpServers caches one MCP server per workspace, keyed by workspace id ("" in
+	// single-tenant mode). The tools close over their handler, so one shared
+	// instance would run every tenant's tool calls on one workspace's handle.
+	mcpMu      sync.RWMutex
+	mcpServers map[string]*mcp.Server
 
 	// multiTenant mirrors config.MultiTenant. It is what turns host and
 	// credential resolution on; unset, every request runs on the default

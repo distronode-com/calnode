@@ -251,45 +251,57 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 
 // New wires services via BuildHandler, then registers all HTTP routes. It returns the
 // http.Handler and the worker drain func.
+// H is handler.Handler under a shorter name, so a registration reads
+// (*H).ListBookings rather than (*handler.Handler).ListBookings 163 times.
+//
+// The method EXPRESSION is the point, not the brevity: h.Scoped takes
+// func(*Handler, http.ResponseWriter, *http.Request), so passing h.ListBookings —
+// a bound method value on the UNSCOPED handler, which is exactly the bug Scoped
+// exists to prevent — does not compile.
+type H = handler.Handler
+
 func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger) (http.Handler, func()) {
 	h, drain := BuildHandler(ctx, cfg, db, logger)
 	mux := http.NewServeMux()
 
 	// Ops
-	mux.HandleFunc("GET /healthz", h.Healthz)
-	mux.HandleFunc("GET /readyz", h.Readyz)
-	mux.HandleFunc("GET /version", h.Version)
+	mux.HandleFunc("GET /healthz", h.Platform((*H).Healthz))
+	mux.HandleFunc("GET /readyz", h.Platform((*H).Readyz))
+	mux.HandleFunc("GET /version", h.Platform((*H).Version))
 
 	// Bootstrap — public, once-only
-	mux.HandleFunc("POST /v1/setup", h.Setup)
+	mux.HandleFunc("POST /v1/setup", h.Platform((*H).Setup))
 
 	// Auth status (public — drives login page rendering).
-	mux.HandleFunc("GET /v1/auth/status", h.AuthStatus)
+	mux.HandleFunc("GET /v1/auth/status", h.Scoped(handler.HostWorkspace, (*H).AuthStatus))
 
 	// First-user claim (public — only succeeds when no users exist).
 	claimRL := RateLimit(5, time.Minute)
-	mux.HandleFunc("POST /v1/auth/claim", claimRL(h.Claim))
+	mux.HandleFunc("POST /v1/auth/claim", claimRL(h.Scoped(handler.HostWorkspace, (*H).Claim)))
 
 	// Email + password login.
 	loginRL := RateLimit(10, time.Minute)
-	mux.HandleFunc("POST /v1/auth/login/email", loginRL(h.LoginEmail))
-	mux.HandleFunc("POST /v1/auth/magic-link/request", loginRL(h.RequestMagicLink))
-	mux.HandleFunc("GET /v1/auth/magic-link/verify", loginRL(h.VerifyMagicLink))
+	mux.HandleFunc("POST /v1/auth/login/email", loginRL(h.Scoped(handler.HostWorkspace, (*H).LoginEmail)))
+	mux.HandleFunc("POST /v1/auth/magic-link/request", loginRL(h.Scoped(handler.HostWorkspace, (*H).RequestMagicLink)))
+	mux.HandleFunc("GET /v1/auth/magic-link/verify", loginRL(h.Scoped(handler.HostWorkspace, (*H).VerifyMagicLink)))
 
 	// OAuth login (browser sessions for admin UI).
 	authRL := RateLimit(10, time.Minute)
-	mux.HandleFunc("GET /v1/auth/login", authRL(h.LoginGoogle))
-	mux.HandleFunc("GET /v1/auth/callback", authRL(h.CallbackGoogle))
-	mux.HandleFunc("GET /v1/auth/microsoft/login", authRL(h.LoginMicrosoft))
-	mux.HandleFunc("GET /v1/auth/microsoft/callback", authRL(h.CallbackMicrosoft))
-	mux.HandleFunc("POST /v1/auth/logout", h.Logout)
+	mux.HandleFunc("GET /v1/auth/login", authRL(h.Platform((*H).LoginGoogle)))
+	mux.HandleFunc("GET /v1/auth/callback", authRL(h.Platform((*H).CallbackGoogle)))
+	mux.HandleFunc("GET /v1/auth/microsoft/login", authRL(h.Platform((*H).LoginMicrosoft)))
+	mux.HandleFunc("GET /v1/auth/microsoft/callback", authRL(h.Platform((*H).CallbackMicrosoft)))
+	mux.HandleFunc("POST /v1/auth/logout", h.Scoped(handler.HostWorkspace, (*H).Logout))
 
 	// MCP server (Model Context Protocol) — Streamable HTTP transport for remote
 	// agents. One server instance reused across requests. Guarded by a bearer token:
 	// an OAuth access token (the "Connect" flow) or a cno_ API key, both resolved by
 	// verifyMCPBearer. A 401 advertises the OAuth discovery doc so clients can connect.
-	mcpSrv := h.MCPServer()
-	mcpHTTP := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpSrv }, nil)
+	// One server per workspace, not one per process: the tools close over their
+	// handler, so a shared instance would run every tenant's tool calls on
+	// whichever handler built it. MCPCallerMiddleware below has resolved the
+	// caller's workspace into the request context by the time the factory runs.
+	mcpHTTP := mcp.NewStreamableHTTPHandler(h.MCPServerForRequest, nil)
 	mcpAuth := auth.RequireBearerToken(h.VerifyMCPBearer, &auth.RequireBearerTokenOptions{
 		ResourceMetadataURL: cfg.BaseURL + "/.well-known/oauth-protected-resource",
 	})
@@ -300,110 +312,110 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	// OAuth 2.1 authorization server for MCP (discovery + dynamic client registration;
 	// the interactive /oauth/authorize + /oauth/token live with the consent flow). All
 	// public — the security gate is the user login + consent at /oauth/authorize.
-	mux.HandleFunc("GET /.well-known/oauth-protected-resource", h.OAuthProtectedResourceMetadata)
-	mux.HandleFunc("GET /.well-known/oauth-authorization-server", h.OAuthAuthServerMetadata)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", h.Platform((*H).OAuthProtectedResourceMetadata))
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", h.Platform((*H).OAuthAuthServerMetadata))
 	oauthRegRL := RateLimit(20, time.Minute)
-	mux.HandleFunc("POST /oauth/register", oauthRegRL(h.RegisterOAuthClient))
-	mux.HandleFunc("GET /oauth/authorize", h.AuthorizeMCP)
-	mux.HandleFunc("POST /oauth/authorize", h.AuthorizeMCPDecision)
+	mux.HandleFunc("POST /oauth/register", oauthRegRL(h.Platform((*H).RegisterOAuthClient)))
+	mux.HandleFunc("GET /oauth/authorize", h.Platform((*H).AuthorizeMCP))
+	mux.HandleFunc("POST /oauth/authorize", h.Platform((*H).AuthorizeMCPDecision))
 	tokenRL := RateLimit(30, time.Minute)
-	mux.HandleFunc("POST /oauth/token", tokenRL(h.TokenMCP))
+	mux.HandleFunc("POST /oauth/token", tokenRL(h.Platform((*H).TokenMCP)))
 
 	// Password management.
-	mux.HandleFunc("POST /v1/users/me/password", h.RequireAuth(h.ChangePassword))
-	mux.HandleFunc("POST /v1/users/{id}/password", h.RequireAuth(h.AdminSetPassword))
+	mux.HandleFunc("POST /v1/users/me/password", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ChangePassword)))
+	mux.HandleFunc("POST /v1/users/{id}/password", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).AdminSetPassword)))
 
 	// Invite management.
 	inviteRL := RateLimit(20, time.Minute)
-	mux.HandleFunc("POST /v1/invites", inviteRL(h.RequireAuth(h.CreateInvite)))
-	mux.HandleFunc("GET /v1/invites", h.RequireAuth(h.ListInvites))
-	mux.HandleFunc("DELETE /v1/invites/{id}", h.RequireAuth(h.RevokeInvite))
-	mux.HandleFunc("POST /v1/invites/{id}/resend", inviteRL(h.RequireAuth(h.ResendInvite)))
-	mux.HandleFunc("GET /v1/invites/{token}", h.GetInvite)
-	mux.HandleFunc("POST /v1/invites/{token}/claim", inviteRL(h.ClaimInvite))
+	mux.HandleFunc("POST /v1/invites", inviteRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateInvite))))
+	mux.HandleFunc("GET /v1/invites", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListInvites)))
+	mux.HandleFunc("DELETE /v1/invites/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RevokeInvite)))
+	mux.HandleFunc("POST /v1/invites/{id}/resend", inviteRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ResendInvite))))
+	mux.HandleFunc("GET /v1/invites/{token}", h.Scoped(handler.HostWorkspace, (*H).GetInvite))
+	mux.HandleFunc("POST /v1/invites/{token}/claim", inviteRL(h.Scoped(handler.HostWorkspace, (*H).ClaimInvite)))
 
 	// Users
-	mux.HandleFunc("GET /v1/users", h.RequireAuth(h.ListUsers))
-	mux.HandleFunc("DELETE /v1/users/{id}", h.RequireAuth(h.DeleteUser))
-	mux.HandleFunc("PATCH /v1/users/{id}/role", h.RequireAuth(h.SetUserRole))
-	mux.HandleFunc("POST /v1/users/{id}/transfer-ownership", h.RequireAuth(h.TransferOwnership))
-	mux.HandleFunc("POST /v1/users/{id}/archive", h.RequireAuth(h.ArchiveUser))
-	mux.HandleFunc("POST /v1/users/{id}/restore", h.RequireAuth(h.RestoreUser))
-	mux.HandleFunc("GET /v1/users/{id}/upcoming-bookings", h.RequireAuth(h.ListUserUpcomingBookings))
+	mux.HandleFunc("GET /v1/users", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListUsers)))
+	mux.HandleFunc("DELETE /v1/users/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteUser)))
+	mux.HandleFunc("PATCH /v1/users/{id}/role", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).SetUserRole)))
+	mux.HandleFunc("POST /v1/users/{id}/transfer-ownership", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).TransferOwnership)))
+	mux.HandleFunc("POST /v1/users/{id}/archive", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ArchiveUser)))
+	mux.HandleFunc("POST /v1/users/{id}/restore", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RestoreUser)))
+	mux.HandleFunc("GET /v1/users/{id}/upcoming-bookings", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListUserUpcomingBookings)))
 
 	// Teams
-	mux.HandleFunc("POST /v1/teams", h.RequireAuth(h.CreateTeam))
-	mux.HandleFunc("GET /v1/teams", h.RequireAuth(h.ListTeams))
-	mux.HandleFunc("GET /v1/teams/{id}", h.RequireAuth(h.GetTeam))
-	mux.HandleFunc("PATCH /v1/teams/{id}", h.RequireAuth(h.PatchTeam))
-	mux.HandleFunc("DELETE /v1/teams/{id}", h.RequireAuth(h.DeleteTeam))
-	mux.HandleFunc("POST /v1/teams/{id}/members", h.RequireAuth(h.AddTeamMember))
-	mux.HandleFunc("PATCH /v1/teams/{id}/members/{userId}", h.RequireAuth(h.UpdateTeamMember))
-	mux.HandleFunc("DELETE /v1/teams/{id}/members/{userId}", h.RequireAuth(h.RemoveTeamMember))
-	mux.HandleFunc("GET /v1/users/me", h.RequireAuth(h.GetMe))
-	mux.HandleFunc("PATCH /v1/users/me", h.RequireAuth(h.PatchMe))
+	mux.HandleFunc("POST /v1/teams", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateTeam)))
+	mux.HandleFunc("GET /v1/teams", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListTeams)))
+	mux.HandleFunc("GET /v1/teams/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetTeam)))
+	mux.HandleFunc("PATCH /v1/teams/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchTeam)))
+	mux.HandleFunc("DELETE /v1/teams/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteTeam)))
+	mux.HandleFunc("POST /v1/teams/{id}/members", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).AddTeamMember)))
+	mux.HandleFunc("PATCH /v1/teams/{id}/members/{userId}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UpdateTeamMember)))
+	mux.HandleFunc("DELETE /v1/teams/{id}/members/{userId}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RemoveTeamMember)))
+	mux.HandleFunc("GET /v1/users/me", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetMe)))
+	mux.HandleFunc("PATCH /v1/users/me", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchMe)))
 	avatarRL := RateLimit(20, time.Minute)
-	mux.HandleFunc("POST /v1/users/me/avatar", avatarRL(h.RequireAuth(h.UploadAvatar)))
-	mux.HandleFunc("DELETE /v1/users/me/avatar", avatarRL(h.RequireAuth(h.DeleteAvatar)))
-	mux.HandleFunc("GET /avatars/{userID}", h.ServeAvatar)
-	mux.HandleFunc("GET /branding/logo", h.ServeBrandingLogo)
-	mux.HandleFunc("GET /branding/banner", h.ServeBrandingBanner)
+	mux.HandleFunc("POST /v1/users/me/avatar", avatarRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UploadAvatar))))
+	mux.HandleFunc("DELETE /v1/users/me/avatar", avatarRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteAvatar))))
+	mux.HandleFunc("GET /avatars/{userID}", h.Scoped(handler.HostWorkspace, (*H).ServeAvatar))
+	mux.HandleFunc("GET /branding/logo", h.Scoped(handler.HostWorkspace, (*H).ServeBrandingLogo))
+	mux.HandleFunc("GET /branding/banner", h.Scoped(handler.HostWorkspace, (*H).ServeBrandingBanner))
 
 	// Server settings — email (SMTP) and Google OAuth
 	settingsRL := RateLimit(20, time.Minute)
-	mux.HandleFunc("GET /v1/settings/email", h.RequireAuth(h.GetEmailSettings))
-	mux.HandleFunc("PATCH /v1/settings/email", settingsRL(h.RequireAuth(h.PatchEmailSettings)))
-	mux.HandleFunc("POST /v1/settings/email/test", settingsRL(h.RequireAuth(h.TestEmailConnection)))
-	mux.HandleFunc("GET /v1/settings/google", h.RequireAuth(h.GetGoogleSettings))
-	mux.HandleFunc("PATCH /v1/settings/google", settingsRL(h.RequireAuth(h.PatchGoogleSettings)))
-	mux.HandleFunc("GET /v1/settings/zoom", h.RequireAuth(h.GetZoomSettings))
-	mux.HandleFunc("PATCH /v1/settings/zoom", settingsRL(h.RequireAuth(h.PatchZoomSettings)))
-	mux.HandleFunc("GET /v1/settings/livekit", h.RequireAuth(h.GetLiveKitSettings))
-	mux.HandleFunc("PATCH /v1/settings/livekit", settingsRL(h.RequireAuth(h.PatchLiveKitSettings)))
-	mux.HandleFunc("GET /v1/settings/storage", h.RequireAuth(h.GetStorageSettings))
-	mux.HandleFunc("PATCH /v1/settings/storage", settingsRL(h.RequireAuth(h.PatchStorageSettings)))
-	mux.HandleFunc("GET /v1/settings/notetaker", h.RequireAuth(h.GetNotetakerSettings))
-	mux.HandleFunc("PATCH /v1/settings/notetaker", settingsRL(h.RequireAuth(h.PatchNotetakerSettings)))
-	mux.HandleFunc("GET /v1/bookings/{id}/notes", h.RequireAuth(h.GetBookingNotes))
-	mux.HandleFunc("POST /v1/bookings/{id}/notes/regenerate", h.RequireAuth(h.RegenerateBookingNotes))
-	mux.HandleFunc("GET /v1/bookings/{id}/transcript", h.RequireAuth(h.GetBookingTranscript))
-	mux.HandleFunc("GET /v1/settings/stripe", h.RequireAuth(h.GetStripeSettings))
-	mux.HandleFunc("PATCH /v1/settings/stripe", settingsRL(h.RequireAuth(h.PatchStripeSettings)))
-	mux.HandleFunc("GET /v1/settings/tracking", h.RequireAuth(h.GetTrackingSettings))
-	mux.HandleFunc("PATCH /v1/settings/tracking", settingsRL(h.RequireAuth(h.PatchTrackingSettings)))
-	mux.HandleFunc("GET /v1/settings/llm", h.RequireAuth(h.GetLLMSettings))
-	mux.HandleFunc("PATCH /v1/settings/llm", settingsRL(h.RequireAuth(h.PatchLLMSettings)))
-	mux.HandleFunc("POST /v1/settings/llm/test", settingsRL(h.RequireAuth(h.TestLLMSettings)))
-	mux.HandleFunc("GET /v1/settings/branding", h.RequireAuth(h.GetBranding))
-	mux.HandleFunc("PATCH /v1/settings/branding", settingsRL(h.RequireAuth(h.PatchBranding)))
-	mux.HandleFunc("POST /v1/settings/branding/logo", settingsRL(h.RequireAuth(h.UploadBrandingLogo)))
-	mux.HandleFunc("DELETE /v1/settings/branding/logo", h.RequireAuth(h.DeleteBrandingLogo))
-	mux.HandleFunc("POST /v1/settings/branding/banner", settingsRL(h.RequireAuth(h.UploadBrandingBanner)))
-	mux.HandleFunc("DELETE /v1/settings/branding/banner", h.RequireAuth(h.DeleteBrandingBanner))
+	mux.HandleFunc("GET /v1/settings/email", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetEmailSettings)))
+	mux.HandleFunc("PATCH /v1/settings/email", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchEmailSettings))))
+	mux.HandleFunc("POST /v1/settings/email/test", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).TestEmailConnection))))
+	mux.HandleFunc("GET /v1/settings/google", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetGoogleSettings)))
+	mux.HandleFunc("PATCH /v1/settings/google", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchGoogleSettings))))
+	mux.HandleFunc("GET /v1/settings/zoom", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetZoomSettings)))
+	mux.HandleFunc("PATCH /v1/settings/zoom", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchZoomSettings))))
+	mux.HandleFunc("GET /v1/settings/livekit", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetLiveKitSettings)))
+	mux.HandleFunc("PATCH /v1/settings/livekit", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchLiveKitSettings))))
+	mux.HandleFunc("GET /v1/settings/storage", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetStorageSettings)))
+	mux.HandleFunc("PATCH /v1/settings/storage", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchStorageSettings))))
+	mux.HandleFunc("GET /v1/settings/notetaker", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetNotetakerSettings)))
+	mux.HandleFunc("PATCH /v1/settings/notetaker", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchNotetakerSettings))))
+	mux.HandleFunc("GET /v1/bookings/{id}/notes", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetBookingNotes)))
+	mux.HandleFunc("POST /v1/bookings/{id}/notes/regenerate", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RegenerateBookingNotes)))
+	mux.HandleFunc("GET /v1/bookings/{id}/transcript", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetBookingTranscript)))
+	mux.HandleFunc("GET /v1/settings/stripe", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetStripeSettings)))
+	mux.HandleFunc("PATCH /v1/settings/stripe", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchStripeSettings))))
+	mux.HandleFunc("GET /v1/settings/tracking", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetTrackingSettings)))
+	mux.HandleFunc("PATCH /v1/settings/tracking", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchTrackingSettings))))
+	mux.HandleFunc("GET /v1/settings/llm", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetLLMSettings)))
+	mux.HandleFunc("PATCH /v1/settings/llm", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchLLMSettings))))
+	mux.HandleFunc("POST /v1/settings/llm/test", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).TestLLMSettings))))
+	mux.HandleFunc("GET /v1/settings/branding", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetBranding)))
+	mux.HandleFunc("PATCH /v1/settings/branding", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchBranding))))
+	mux.HandleFunc("POST /v1/settings/branding/logo", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UploadBrandingLogo))))
+	mux.HandleFunc("DELETE /v1/settings/branding/logo", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteBrandingLogo)))
+	mux.HandleFunc("POST /v1/settings/branding/banner", settingsRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UploadBrandingBanner))))
+	mux.HandleFunc("DELETE /v1/settings/branding/banner", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteBrandingBanner)))
 
 	// Event types
-	mux.HandleFunc("POST /v1/event-types", h.RequireAuth(h.CreateEventType))
-	mux.HandleFunc("GET /v1/event-types", h.RequireAuth(h.ListEventTypes))
-	mux.HandleFunc("GET /v1/event-types/{slug}", h.RequireAuth(h.GetEventType))
-	mux.HandleFunc("PATCH /v1/event-types/{slug}", h.RequireAuth(h.PatchEventType))
-	mux.HandleFunc("DELETE /v1/event-types/{slug}", h.RequireAuth(h.DeleteEventType))
-	mux.HandleFunc("GET /v1/event-types/{slug}/hosts", h.RequireAuth(h.ListEventTypeHosts))
-	mux.HandleFunc("PUT /v1/event-types/{slug}/hosts", h.RequireAuth(h.SetEventTypeHosts))
+	mux.HandleFunc("POST /v1/event-types", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateEventType)))
+	mux.HandleFunc("GET /v1/event-types", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListEventTypes)))
+	mux.HandleFunc("GET /v1/event-types/{slug}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetEventType)))
+	mux.HandleFunc("PATCH /v1/event-types/{slug}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchEventType)))
+	mux.HandleFunc("DELETE /v1/event-types/{slug}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteEventType)))
+	mux.HandleFunc("GET /v1/event-types/{slug}/hosts", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListEventTypeHosts)))
+	mux.HandleFunc("PUT /v1/event-types/{slug}/hosts", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).SetEventTypeHosts)))
 	testEmailRL := RateLimit(10, time.Minute)
-	mux.HandleFunc("POST /v1/event-types/{slug}/test-email", testEmailRL(h.RequireAuth(h.SendTestEmail)))
+	mux.HandleFunc("POST /v1/event-types/{slug}/test-email", testEmailRL(h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).SendTestEmail))))
 
 	// Availability rules
-	mux.HandleFunc("POST /v1/availability-rules", h.RequireAuth(h.CreateAvailabilityRule))
-	mux.HandleFunc("GET /v1/availability-rules", h.RequireAuth(h.ListAvailabilityRules))
-	mux.HandleFunc("PATCH /v1/availability-rules/{id}", h.RequireAuth(h.UpdateAvailabilityRule))
-	mux.HandleFunc("DELETE /v1/availability-rules/{id}", h.RequireAuth(h.DeleteAvailabilityRule))
+	mux.HandleFunc("POST /v1/availability-rules", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateAvailabilityRule)))
+	mux.HandleFunc("GET /v1/availability-rules", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListAvailabilityRules)))
+	mux.HandleFunc("PATCH /v1/availability-rules/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UpdateAvailabilityRule)))
+	mux.HandleFunc("DELETE /v1/availability-rules/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteAvailabilityRule)))
 
 	// Availability overrides
-	mux.HandleFunc("POST /v1/availability-overrides", h.RequireAuth(h.CreateAvailabilityOverride))
-	mux.HandleFunc("GET /v1/availability-overrides", h.RequireAuth(h.ListAvailabilityOverrides))
-	mux.HandleFunc("PATCH /v1/availability-overrides/{id}", h.RequireAuth(h.UpdateAvailabilityOverride))
-	mux.HandleFunc("DELETE /v1/availability-overrides/{id}", h.RequireAuth(h.DeleteAvailabilityOverride))
-	mux.HandleFunc("DELETE /v1/availability-overrides/group/{groupId}", h.RequireAuth(h.DeleteAvailabilityOverrideGroup))
+	mux.HandleFunc("POST /v1/availability-overrides", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateAvailabilityOverride)))
+	mux.HandleFunc("GET /v1/availability-overrides", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListAvailabilityOverrides)))
+	mux.HandleFunc("PATCH /v1/availability-overrides/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UpdateAvailabilityOverride)))
+	mux.HandleFunc("DELETE /v1/availability-overrides/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteAvailabilityOverride)))
+	mux.HandleFunc("DELETE /v1/availability-overrides/group/{groupId}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteAvailabilityOverrideGroup)))
 
 	// Slots — public, rate-limited per IP. Browsed more than booked (so a higher cap
 	// than booking), but each call fans out Google free/busy per host, so leaving it
@@ -413,112 +425,112 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	cors := PublicCORS(cfg.EmbedAllowedOrigins)
 
 	// Public event-type display info for the widget (name/duration/location/brand).
-	mux.HandleFunc("GET /v1/event-types/{slug}/public", cors(h.PublicEventType))
+	mux.HandleFunc("GET /v1/event-types/{slug}/public", cors(h.Scoped(handler.HostWorkspace, (*H).PublicEventType)))
 
 	// unthrottled is a CPU + API-quota abuse vector on an openly-public page.
 	slotsRL := RateLimit(60, time.Minute)
-	mux.HandleFunc("GET /v1/event-types/{slug}/slots", cors(slotsRL(h.GetSlots)))
+	mux.HandleFunc("GET /v1/event-types/{slug}/slots", cors(slotsRL(h.Scoped(handler.HostWorkspace, (*H).GetSlots))))
 
 	// Conversational booking assistant (optional AI; public, anonymous → tighter limit).
 	assistantRL := RateLimit(15, time.Minute)
-	mux.HandleFunc("POST /v1/event-types/{slug}/assistant", cors(assistantRL(h.BookingAssistant)))
+	mux.HandleFunc("POST /v1/event-types/{slug}/assistant", cors(assistantRL(h.Scoped(handler.HostWorkspace, (*H).BookingAssistant))))
 	mux.HandleFunc("OPTIONS /v1/event-types/{slug}/assistant", cors(func(http.ResponseWriter, *http.Request) {}))
 
 	// Intake questions
-	mux.HandleFunc("GET /v1/event-types/{slug}/questions", cors(h.ListQuestions))
-	mux.HandleFunc("GET /v1/event-types/{slug}/questions/admin", h.RequireAuth(h.ListQuestionsAdmin))
-	mux.HandleFunc("POST /v1/event-types/{slug}/questions", h.RequireAuth(h.CreateQuestion))
-	mux.HandleFunc("PATCH /v1/event-types/{slug}/questions/{id}", h.RequireAuth(h.UpdateQuestion))
-	mux.HandleFunc("DELETE /v1/event-types/{slug}/questions/{id}", h.RequireAuth(h.DeleteQuestion))
+	mux.HandleFunc("GET /v1/event-types/{slug}/questions", cors(h.Scoped(handler.HostWorkspace, (*H).ListQuestions)))
+	mux.HandleFunc("GET /v1/event-types/{slug}/questions/admin", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListQuestionsAdmin)))
+	mux.HandleFunc("POST /v1/event-types/{slug}/questions", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateQuestion)))
+	mux.HandleFunc("PATCH /v1/event-types/{slug}/questions/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).UpdateQuestion)))
+	mux.HandleFunc("DELETE /v1/event-types/{slug}/questions/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteQuestion)))
 
 	bookingRL := RateLimit(20, time.Minute)
 	manageRL := RateLimit(30, time.Minute)
 
 	// Bookings — public create is CORS-enabled for the widget; the JSON body makes it
 	// a non-simple request, so the OPTIONS preflight is handled too.
-	mux.HandleFunc("POST /v1/bookings", cors(bookingRL(h.CreateBooking)))
+	mux.HandleFunc("POST /v1/bookings", cors(bookingRL(h.Scoped(handler.HostWorkspace, (*H).CreateBooking))))
 	mux.HandleFunc("OPTIONS /v1/bookings", cors(func(http.ResponseWriter, *http.Request) {}))
-	mux.HandleFunc("GET /v1/bookings/{id}", h.GetBooking)
-	mux.HandleFunc("GET /v1/bookings", h.RequireAuth(h.ListBookings))
-	mux.HandleFunc("POST /v1/bookings/{id}/cancel", h.RequireAuth(h.CancelBooking))
-	mux.HandleFunc("PATCH /v1/bookings/{id}/reschedule", h.RequireAuth(h.RescheduleBooking))
-	mux.HandleFunc("POST /v1/bookings/{id}/reassign", h.RequireAuth(h.ReassignBooking))
-	mux.HandleFunc("GET /v1/bookings/{id}/answers", h.RequireAuth(h.GetBookingAnswers))
+	mux.HandleFunc("GET /v1/bookings/{id}", h.Scoped(handler.HostWorkspace, (*H).GetBooking))
+	mux.HandleFunc("GET /v1/bookings", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListBookings)))
+	mux.HandleFunc("POST /v1/bookings/{id}/cancel", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CancelBooking)))
+	mux.HandleFunc("PATCH /v1/bookings/{id}/reschedule", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RescheduleBooking)))
+	mux.HandleFunc("POST /v1/bookings/{id}/reassign", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ReassignBooking)))
+	mux.HandleFunc("GET /v1/bookings/{id}/answers", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetBookingAnswers)))
 
 	// Public booking page
-	mux.HandleFunc("GET /embed.js", h.EmbedJS)
-	mux.HandleFunc("GET /booking.css", h.BookingCSS)
-	mux.HandleFunc("GET /book/{slug}", h.BookPage)
+	mux.HandleFunc("GET /embed.js", h.Scoped(handler.HostWorkspace, (*H).EmbedJS))
+	mux.HandleFunc("GET /booking.css", h.Scoped(handler.HostWorkspace, (*H).BookingCSS))
+	mux.HandleFunc("GET /book/{slug}", h.Scoped(handler.HostWorkspace, (*H).BookPage))
 
 	// Built-in LiveKit video room (public): the page, its vendored assets, and the token
 	// exchange. The signed room token in the join URL is the capability — no auth.
-	mux.HandleFunc("GET /room/{room}", h.LiveKitRoom)
-	mux.HandleFunc("GET /assets/livekit-client.js", h.LiveKitSDKAsset)
-	mux.HandleFunc("GET /assets/livekit-room.js", h.LiveKitRoomJSAsset)
-	mux.HandleFunc("POST /v1/livekit/token", bookingRL(h.LiveKitToken))
-	mux.HandleFunc("POST /v1/livekit/room/end", bookingRL(h.EndRoom))
-	mux.HandleFunc("POST /v1/livekit/room/reassign-host", bookingRL(h.ReassignHost))
-	mux.HandleFunc("POST /v1/livekit/room/screenshare", bookingRL(h.ScreenShareToggle))
-	mux.HandleFunc("POST /v1/livekit/record/start", bookingRL(h.RecordStart))
-	mux.HandleFunc("POST /v1/livekit/record/stop", bookingRL(h.RecordStop))
-	mux.HandleFunc("POST /v1/livekit/consent", bookingRL(h.RecordConsent))
-	mux.HandleFunc("POST /v1/livekit/webhook", h.LiveKitWebhook)
-	mux.HandleFunc("POST /v1/livekit/egress-webhook", h.LiveKitWebhook) // legacy alias — keep old LiveKit registrations working
-	mux.HandleFunc("GET /v1/recordings", h.RequireAuth(h.ListRecordings))
-	mux.HandleFunc("DELETE /v1/recordings", h.RequireAuth(h.DeleteAllRecordings))
-	mux.HandleFunc("GET /v1/recordings/{id}/consent", h.RequireAuth(h.ListRecordingConsent))
-	mux.HandleFunc("GET /v1/recordings/{id}/download", h.RequireAuth(h.DownloadRecording))
-	mux.HandleFunc("DELETE /v1/recordings/{id}", h.RequireAuth(h.DeleteRecording))
+	mux.HandleFunc("GET /room/{room}", h.Scoped(handler.HostWorkspace, (*H).LiveKitRoom))
+	mux.HandleFunc("GET /assets/livekit-client.js", h.Platform((*H).LiveKitSDKAsset))
+	mux.HandleFunc("GET /assets/livekit-room.js", h.Platform((*H).LiveKitRoomJSAsset))
+	mux.HandleFunc("POST /v1/livekit/token", bookingRL(h.Scoped(handler.HostWorkspace, (*H).LiveKitToken)))
+	mux.HandleFunc("POST /v1/livekit/room/end", bookingRL(h.Scoped(handler.HostWorkspace, (*H).EndRoom)))
+	mux.HandleFunc("POST /v1/livekit/room/reassign-host", bookingRL(h.Scoped(handler.HostWorkspace, (*H).ReassignHost)))
+	mux.HandleFunc("POST /v1/livekit/room/screenshare", bookingRL(h.Scoped(handler.HostWorkspace, (*H).ScreenShareToggle)))
+	mux.HandleFunc("POST /v1/livekit/record/start", bookingRL(h.Scoped(handler.HostWorkspace, (*H).RecordStart)))
+	mux.HandleFunc("POST /v1/livekit/record/stop", bookingRL(h.Scoped(handler.HostWorkspace, (*H).RecordStop)))
+	mux.HandleFunc("POST /v1/livekit/consent", bookingRL(h.Scoped(handler.HostWorkspace, (*H).RecordConsent)))
+	mux.HandleFunc("POST /v1/livekit/webhook", h.Platform((*H).LiveKitWebhook))
+	mux.HandleFunc("POST /v1/livekit/egress-webhook", h.Platform((*H).LiveKitWebhook)) // legacy alias — keep old LiveKit registrations working
+	mux.HandleFunc("GET /v1/recordings", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListRecordings)))
+	mux.HandleFunc("DELETE /v1/recordings", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteAllRecordings)))
+	mux.HandleFunc("GET /v1/recordings/{id}/consent", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListRecordingConsent)))
+	mux.HandleFunc("GET /v1/recordings/{id}/download", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DownloadRecording)))
+	mux.HandleFunc("DELETE /v1/recordings/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteRecording)))
 
 	// Manage booking (reschedule / cancel via token link)
-	mux.HandleFunc("GET /manage/{token}", manageRL(h.ManagePage))
-	mux.HandleFunc("POST /manage/{token}/reschedule", manageRL(h.RescheduleByToken))
-	mux.HandleFunc("POST /manage/{token}/cancel", manageRL(h.CancelByToken))
+	mux.HandleFunc("GET /manage/{token}", manageRL(h.Scoped(handler.HostWorkspace, (*H).ManagePage)))
+	mux.HandleFunc("POST /manage/{token}/reschedule", manageRL(h.Scoped(handler.HostWorkspace, (*H).RescheduleByToken)))
+	mux.HandleFunc("POST /manage/{token}/cancel", manageRL(h.Scoped(handler.HostWorkspace, (*H).CancelByToken)))
 
 	// Webhooks
-	mux.HandleFunc("POST /v1/webhooks", h.RequireAuth(h.CreateWebhook))
-	mux.HandleFunc("GET /v1/webhooks", h.RequireAuth(h.ListWebhooks))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}", h.RequireAuth(h.PatchWebhook))
-	mux.HandleFunc("DELETE /v1/webhooks/{id}", h.RequireAuth(h.DeleteWebhook))
-	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", h.RequireAuth(h.ListWebhookDeliveries))
+	mux.HandleFunc("POST /v1/webhooks", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateWebhook)))
+	mux.HandleFunc("GET /v1/webhooks", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListWebhooks)))
+	mux.HandleFunc("PATCH /v1/webhooks/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PatchWebhook)))
+	mux.HandleFunc("DELETE /v1/webhooks/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteWebhook)))
+	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListWebhookDeliveries)))
 
 	// Google Calendar — connect/callback/status/disconnect
-	mux.HandleFunc("GET /v1/calendar/connect", h.RequireAuth(h.ConnectCalendar))
-	mux.HandleFunc("GET /v1/calendar/callback", h.CalendarCallback)
-	mux.HandleFunc("POST /v1/calendar/caldav/connect", h.RequireAuth(h.ConnectCalDAV))
-	mux.HandleFunc("GET /v1/calendar/status", h.RequireAuth(h.CalendarStatus))
-	mux.HandleFunc("POST /v1/calendar/connections/{id}/destination", h.RequireAuth(h.SetCalendarDestination))
-	mux.HandleFunc("GET /v1/calendar/connections/{id}/calendars", h.RequireAuth(h.GetConnectionCalendars))
-	mux.HandleFunc("PUT /v1/calendar/connections/{id}/calendars", h.RequireAuth(h.PutConnectionCalendars))
-	mux.HandleFunc("DELETE /v1/calendar/connections/{id}", h.RequireAuth(h.DisconnectCalendarConnection))
-	mux.HandleFunc("DELETE /v1/calendar", h.RequireAuth(h.DisconnectCalendar))
+	mux.HandleFunc("GET /v1/calendar/connect", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ConnectCalendar)))
+	mux.HandleFunc("GET /v1/calendar/callback", h.Platform((*H).CalendarCallback))
+	mux.HandleFunc("POST /v1/calendar/caldav/connect", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ConnectCalDAV)))
+	mux.HandleFunc("GET /v1/calendar/status", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CalendarStatus)))
+	mux.HandleFunc("POST /v1/calendar/connections/{id}/destination", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).SetCalendarDestination)))
+	mux.HandleFunc("GET /v1/calendar/connections/{id}/calendars", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).GetConnectionCalendars)))
+	mux.HandleFunc("PUT /v1/calendar/connections/{id}/calendars", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).PutConnectionCalendars)))
+	mux.HandleFunc("DELETE /v1/calendar/connections/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DisconnectCalendarConnection)))
+	mux.HandleFunc("DELETE /v1/calendar", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DisconnectCalendar)))
 
 	// Zoom — per-host OAuth connect (auto-mint meeting links).
-	mux.HandleFunc("GET /v1/zoom/connect", h.RequireAuth(h.ConnectZoom))
-	mux.HandleFunc("GET /v1/zoom/callback", h.ZoomCallback)
-	mux.HandleFunc("GET /v1/zoom/status", h.RequireAuth(h.ZoomStatus))
-	mux.HandleFunc("DELETE /v1/zoom", h.RequireAuth(h.DisconnectZoom))
+	mux.HandleFunc("GET /v1/zoom/connect", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ConnectZoom)))
+	mux.HandleFunc("GET /v1/zoom/callback", h.Platform((*H).ZoomCallback))
+	mux.HandleFunc("GET /v1/zoom/status", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ZoomStatus)))
+	mux.HandleFunc("DELETE /v1/zoom", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DisconnectZoom)))
 
 	// Stripe payment webhook — public, authenticated by the signing secret (no session
 	// cookie, so the CSRF check doesn't apply). Must receive the raw body.
-	mux.HandleFunc("POST /v1/stripe/webhook", h.StripeWebhook)
+	mux.HandleFunc("POST /v1/stripe/webhook", h.Platform((*H).StripeWebhook))
 
 	// API keys
-	mux.HandleFunc("GET /v1/api-keys", h.RequireAuth(h.ListAPIKeys))
-	mux.HandleFunc("POST /v1/api-keys", h.RequireAuth(h.CreateAPIKey))
-	mux.HandleFunc("DELETE /v1/api-keys/{id}", h.RequireAuth(h.DeleteAPIKey))
+	mux.HandleFunc("GET /v1/api-keys", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListAPIKeys)))
+	mux.HandleFunc("POST /v1/api-keys", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).CreateAPIKey)))
+	mux.HandleFunc("DELETE /v1/api-keys/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).DeleteAPIKey)))
 
 	// Connected apps — MCP OAuth grants the user can review and revoke.
-	mux.HandleFunc("GET /v1/oauth/connections", h.RequireAuth(h.ListOAuthConnections))
-	mux.HandleFunc("DELETE /v1/oauth/connections/{id}", h.RequireAuth(h.RevokeOAuthConnection))
+	mux.HandleFunc("GET /v1/oauth/connections", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).ListOAuthConnections)))
+	mux.HandleFunc("DELETE /v1/oauth/connections/{id}", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RevokeOAuthConnection)))
 
 	// Demo instance only — one-click login, on-demand reset, and a disallow-all
 	// robots.txt. Never registered on a real deployment.
 	if cfg.DemoMode {
-		mux.HandleFunc("GET /v1/demo/enter", h.DemoEnter)
+		mux.HandleFunc("GET /v1/demo/enter", h.Platform((*H).DemoEnter))
 		demoResetRL := RateLimit(2, time.Minute)
-		mux.HandleFunc("POST /v1/demo/reset", demoResetRL(h.DemoReset))
-		mux.HandleFunc("GET /robots.txt", h.Robots)
+		mux.HandleFunc("POST /v1/demo/reset", demoResetRL(h.Platform((*H).DemoReset)))
+		mux.HandleFunc("GET /robots.txt", h.Platform((*H).Robots))
 	}
 
 	// Favicon at the root, shared by the public server-rendered pages and the

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -20,6 +21,64 @@ import (
 // transports: stdio (the `calnode mcp` subcommand, for local agents) and Streamable
 // HTTP (mounted at POST /mcp behind API-key auth, for remote agents). Tools call the
 // same internal services the REST handlers use — no parallel code path.
+// MCPServerForRequest returns the MCP server for the workspace the request's
+// bearer credential belongs to.
+//
+// ⛔ The tools close over their handler, so a single cached server would run every
+// workspace's tool calls on whichever handler built it. /mcp is mounted on the
+// identity host and carries no tenant Host, so the credential is the only source —
+// MCPCallerMiddleware has already resolved it into the request context by the time
+// this runs.
+//
+// One server per workspace, cached: building one allocates eight tool
+// registrations and their JSON schemas, which is not something to do per request.
+// In single-tenant mode there is exactly one entry, keyed "", so this is the old
+// "one instance reused across requests" with a map in front of it.
+func (h *Handler) MCPServerForRequest(r *http.Request) *mcp.Server {
+	wsID := ""
+	if h.multiTenant {
+		wsID = mcpCallerWorkspace(r.Context())
+	}
+
+	h.mcpMu.RLock()
+	cached := h.mcpServers[wsID]
+	h.mcpMu.RUnlock()
+	if cached != nil {
+		return cached
+	}
+
+	scoped := h
+	if wsID != "" {
+		// A workspace the credential named; resolution already happened, so a
+		// failure here means the row went away between the two reads.
+		ws, err := h.workspaceByID(r.Context(), wsID)
+		if err != nil {
+			h.logger.ErrorContext(r.Context(), "mcp: resolve caller workspace", "error", err)
+			// Bound to a workspace id that does not exist: under RLS this handle
+			// matches no row, which is the safe answer.
+			scoped = h.forWorkspace(&Workspace{ID: wsID, Status: "active"})
+		} else {
+			scoped = h.forWorkspace(ws)
+		}
+	}
+
+	built := scoped.MCPServer()
+
+	h.mcpMu.Lock()
+	if h.mcpServers == nil {
+		h.mcpServers = map[string]*mcp.Server{}
+	}
+	// Another request may have built it first; either is correct, keep one.
+	if existing := h.mcpServers[wsID]; existing != nil {
+		built = existing
+	} else {
+		h.mcpServers[wsID] = built
+	}
+	h.mcpMu.Unlock()
+
+	return built
+}
+
 func (h *Handler) MCPServer() *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{
 		Name:    "calnode",

@@ -759,3 +759,88 @@ Neither is implemented, and neither is faked:
 `gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
 `go test ./...` **rc=0 on SQLite (28/28)** and **rc=0 on PostgreSQL (28/28)**.
 The 21 new resolver cases all run on both lanes.
+
+## Boundary 3, part two — the registrations, and the gate that keeps them honest
+
+⚠️ **The end-to-end request tests through a real `OpenPair` are NOT in this
+commit.** Everything else part two owed is: the 160 rewritten registrations, the
+MCP per-workspace scoping, the classification gate, and `/v1/bookings/{id}`. The
+e2e file is the next thing, before B4.
+
+### 169 routes, every one of them classified
+
+```
+169 routes: 31 host-scoped, 106 credential-scoped, 24 platform, 8 allowlisted
+```
+
+`type H = handler.Handler` in `internal/server` so a registration reads
+`(*H).ListBookings`. The brevity is incidental; the **method expression** is the
+point. `Scoped` takes `func(*Handler, http.ResponseWriter, *http.Request)`, so
+passing `h.ListBookings` — a bound method value on the *unscoped* handler, which
+is precisely the bug `Scoped` exists to prevent — **does not compile**.
+
+Credential-scoped routes are `h.RequireAuth(h.Scoped(handler.CredentialWorkspace,
+(*H).Method))`, in that order: `CredentialWorkspace` reads the caller out of the
+request context, so the auth middleware has to have run first.
+`TestCredentialScopedRoutesAuthenticateFirst` checks both the presence and the
+nesting order across all 106.
+
+### The gate, and why it reads the file
+
+`internal/server/routes_classified_test.go` scans `server.go` and fails on a
+registration that is neither `Scoped(HostWorkspace, …)`,
+`Scoped(CredentialWorkspace, …)`, `Platform(…)`, nor on an 8-entry allowlist whose
+every member is a handler that is **not a `*handler.Handler` method at all** (two
+empty CORS preflights, the embedded favicon/SPA/redirects, the MCP mount).
+
+⛔ A source scan rather than a runtime walk because `http.ServeMux` exposes no way
+to enumerate its patterns, and the thing to catch is a registration written
+without a wrapper — a property of the text. Three guards against a vacuous pass: a
+floor of 150 registrations, a floor of 3 per bucket (so a refactor that classified
+everything one way fails), and a check that every allowlist entry is still a live
+route.
+
+`TestPlatformRoutesAreTheIdentityHostSet` pins the 24-member platform set exactly
+against D11, with a one-line reason per group. A route joining or leaving the
+identity host is a decision about which host serves it, and this makes it
+impossible to make silently.
+
+⚠️ **The rewrite missed one route and the gate caught it.** `POST
+/v1/livekit/egress-webhook` carries a trailing `// legacy alias` comment, so the
+scripted edit's line pattern did not match it and it stayed unwrapped. That is the
+gate doing exactly the job it was written for, on its first run.
+
+### ⛔ The MCP tools close over their handler, so one cached server was wrong
+
+`/mcp` was `mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return
+mcpSrv }, nil)` over a single instance built at boot. The eight tools capture `h`,
+so **every workspace's tool calls would have run on whichever handler built that
+instance**. The mount is on the identity host and carries no tenant Host, so the
+credential is the only source (D10).
+
+`MCPCallerMiddleware` now also reads `users.workspace_id` — through
+`platformDB()`, same reasoning as `RequireAuth` — into `mcpCaller.WorkspaceID`,
+and the factory becomes `h.MCPServerForRequest`, which returns a server per
+workspace from a cache on `shared` (`map[string]*mcp.Server` behind an RWMutex).
+One entry keyed `""` in single-tenant mode, so that path is the old behaviour with
+a map in front of it. Building one allocates eight tool registrations and their
+JSON schemas, which is not something to do per request.
+
+### `/v1/bookings/{id}` — the tenant check is the scoping, and the missing auth is still missing
+
+`GET /v1/bookings/{id}` is now `h.Scoped(handler.HostWorkspace, (*H).GetBooking)`,
+so the handle it runs on is bound to the workspace of the request Host and a
+booking id belonging to another workspace is simply not visible — the 404 comes
+from the row not existing, enforced by the policy rather than by a predicate the
+handler has to remember.
+
+⚠️ **It still has no auth middleware at all**, alone among `/v1/bookings/{id}/*`
+(`server.go`, and every sibling is wrapped in `h.RequireAuth`). Reported in the
+first packet turn and deliberately not changed: adding auth to a route the booking
+page may depend on is a product decision, not a tenancy one. What multi-tenancy
+changes is the blast radius — it is now bounded to one workspace instead of the
+whole instance.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
