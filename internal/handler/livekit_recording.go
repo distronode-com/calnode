@@ -545,16 +545,7 @@ var timeNow = func() time.Time { return time.Now() }
 // egress) — and 200-ACKs everything else (room_started, participant_joined/left, track_*, …)
 // without acting on them. Lifecycle events (attendance, duration, etc.) are not yet wired up.
 func (h *Handler) LiveKitWebhook(w http.ResponseWriter, r *http.Request) {
-	lk := h.getLiveKit()
-	if lk == nil {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err := lk.VerifyWebhook(r.Header.Get("Authorization"), body); err != nil {
-		h.writeError(w, http.StatusForbidden, "invalid webhook signature")
-		return
-	}
 	var ev struct {
 		Event string `json:"event"`
 		Room  struct {
@@ -571,6 +562,44 @@ func (h *Handler) LiveKitWebhook(w http.ResponseWriter, r *http.Request) {
 		} `json:"egressInfo"`
 	}
 	_ = json.Unmarshal(body, &ev)
+
+	// ⛔ Resolve the tenant, then verify with ITS credentials, then act — and in
+	// single-tenant mode verify first, exactly as before. The order differs by mode because
+	// the LiveKit API secret lives in server_settings, i.e. per workspace: on this
+	// Platform-wrapped route the handle bypasses the policies, so loading "the" settings row
+	// would hand back an arbitrary tenant's secret and verifying against that is not
+	// verification. See internal/handler/vendor_webhook.go for the full argument, including
+	// the two properties that make an unverified resolve safe (no write, no disclosure).
+	room := ev.Room.Name
+	if room == "" {
+		room = ev.EgressInfo.RoomName
+	}
+	scoped := h
+	if h.multiTenant {
+		resolved, ok := h.livekitEventWorkspace(r.Context(), ev.EgressInfo.EgressID, room)
+		if !ok {
+			// No row owns this event: a stale egress from a deleted workspace, or a room
+			// this instance never created. 200, because a retry cannot make it ours and a
+			// 4xx would make LiveKit retry it forever.
+			h.logger.InfoContext(r.Context(), "livekit: event for no known workspace",
+				"event", ev.Event, "room", room, "egress_id", ev.EgressInfo.EgressID)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		scoped = resolved
+	}
+	lk := scoped.getLiveKit()
+	if lk == nil {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if err := lk.VerifyWebhook(r.Header.Get("Authorization"), body); err != nil {
+		h.writeError(w, http.StatusForbidden, "invalid webhook signature")
+		return
+	}
+	// From here every read and write is the workspace's own.
+	h = scoped
+
 	// Self-diagnose a future field-name drift: log the raw body if an egress event parsed no id.
 	if ev.EgressInfo.EgressID == "" && strings.HasPrefix(ev.Event, "egress_") {
 		raw := string(body)

@@ -45,14 +45,36 @@ func (h *Handler) startBookingCheckout(ctx context.Context, sc *stripe.Client, b
 // StripeWebhook handles POST /v1/stripe/webhook — Stripe's payment notifications. Public, but
 // authenticated by the signing secret (no session cookie, so CSRF middleware doesn't apply).
 func (h *Handler) StripeWebhook(w http.ResponseWriter, r *http.Request) {
-	sc := h.getStripe()
-	if sc == nil || !sc.WebhookConfigured() {
-		h.writeError(w, http.StatusServiceUnavailable, "payments not configured")
-		return
-	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		h.writeError(w, http.StatusBadRequest, "could not read body")
+		return
+	}
+
+	// ⛔ Resolve the tenant from the booking the session belongs to, then verify with THAT
+	// workspace's signing secret. The secret is in server_settings, i.e. per workspace, and
+	// this Platform-wrapped route's handle bypasses the policies — so "the" settings row is
+	// an arbitrary tenant's, and a signature checked against it proves nothing. Single-tenant
+	// keeps the original order (verify, then act): one workspace, one secret, nothing to
+	// resolve. The argument in full, including why an unverified resolve is safe here, is in
+	// internal/handler/vendor_webhook.go.
+	scoped := h
+	if h.multiTenant {
+		sessionID, metaBooking := peekStripeIDs(body)
+		resolved, ok := h.stripeEventWorkspace(r.Context(), sessionID, metaBooking)
+		if !ok {
+			// No booking of ours owns this session. 200, because Stripe retries a 4xx for
+			// days and no retry can make the row exist.
+			h.logger.InfoContext(r.Context(), "stripe webhook: event for no known workspace",
+				"session_id", sessionID, "metadata_booking_id", metaBooking)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		scoped = resolved
+	}
+	sc := scoped.getStripe()
+	if sc == nil || !sc.WebhookConfigured() {
+		h.writeError(w, http.StatusServiceUnavailable, "payments not configured")
 		return
 	}
 	ev, err := sc.VerifyWebhook(body, r.Header.Get("Stripe-Signature"), time.Now())
@@ -63,6 +85,9 @@ func (h *Handler) StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every write below is the resolved workspace's. ⚠️ These two calls deliberately use
+	// context.Background(): they outlive the request, and the scoped handler is safe to carry
+	// into them because a workspace handle pins no connection (D5).
 	switch ev.Type {
 	case "checkout.session.completed":
 		sess, perr := ev.Session()
@@ -71,13 +96,13 @@ func (h *Handler) StripeWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		if sess.PaymentStatus == "paid" {
 			if id := sess.Metadata["booking_id"]; id != "" {
-				h.confirmPaidBooking(context.Background(), id, sess.PaymentIntent, int(sess.AmountTotal), sess.Currency)
+				scoped.confirmPaidBooking(context.Background(), id, sess.PaymentIntent, int(sess.AmountTotal), sess.Currency)
 			}
 		}
 	case "checkout.session.expired":
 		if sess, perr := ev.Session(); perr == nil {
 			if id := sess.Metadata["booking_id"]; id != "" {
-				h.releaseUnpaidHold(context.Background(), id)
+				scoped.releaseUnpaidHold(context.Background(), id)
 			}
 		}
 	}

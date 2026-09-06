@@ -113,10 +113,23 @@ func (h *Handler) forWorkspace(ws *Workspace) *Handler {
 		// single-tenant path allocation-for-allocation what it was.
 		return &scoped
 	}
-	scoped.db = h.db.ForWorkspace(ws.ID)
+	// ⛔ From the APPLICATION handle, not from h.db. On a Platform-wrapped route h.db is the
+	// platform handle, whose role bypasses the policies — binding a workspace onto that gives
+	// a handle that names a tenant and is not confined to it. See shared.appDB.
+	scoped.db = h.appBase().ForWorkspace(ws.ID)
 	scoped.bookingSvc = h.bookingSvc.ForDB(scoped.db)
 	scoped.webhookSvc = h.webhookSvc.ForDB(scoped.db)
 	return &scoped
+}
+
+// appBase is the application handle every scoped copy is built from. It falls back to h.db for
+// a handler constructed without one (older tests), where there is no pair and the two are the
+// same handle anyway.
+func (h *Handler) appBase() *db.DB {
+	if h.appDB != nil {
+		return h.appDB
+	}
+	return h.db
 }
 
 // workspaceForJob returns a handler scoped to a workspace named by a background

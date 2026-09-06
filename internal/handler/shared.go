@@ -9,6 +9,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/calnode/calnode/internal/calendar"
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/livekit"
 	"github.com/calnode/calnode/internal/llm"
 	"github.com/calnode/calnode/internal/mailer"
@@ -66,6 +67,21 @@ type shared struct {
 	// carries a `wid` claim. The secret identifies the INSTANCE that minted the
 	// token; the workspace is inside the payload, which is what lets one identity
 	// host hand a session to any of its tenants' public hosts (D11).
+	// appDB is the APPLICATION handle as server.New built it: unbound, and belonging to the
+	// role the row-level-security policies constrain.
+	//
+	// ⛔ forWorkspace binds from THIS, never from h.db, and the difference is the whole
+	// isolation guarantee on a Platform route. Platform() replaces h.db with the platform
+	// handle, whose role BYPASSES RLS — so a handle derived from it with ForWorkspace binds
+	// app.workspace_id and is then not FILTERED by it. A `WHERE id = 1` read through such a
+	// handle matches every workspace's row and returns an arbitrary one; a write lands
+	// wherever the statement says. Both are silent.
+	//
+	// Found by a vendor-webhook test: the hand-off from a Platform route to
+	// forWorkspace(ws).getLiveKit() read the DEFAULT workspace's empty settings row instead of
+	// the resolved tenant's, so the handler answered 200 and verified nothing.
+	appDB *db.DB
+
 	// platformToken authorises the platform API (D12). Like the two below it is one
 	// process-wide env-var secret, and it is what makes an instance a control plane
 	// rather than just a tenant: with it unset every /v1/platform/* route 404s.

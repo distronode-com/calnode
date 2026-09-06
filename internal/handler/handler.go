@@ -186,6 +186,7 @@ func New(database *db.DB, logger *slog.Logger) *Handler {
 			zoomCache:    newTenantCache[*zoom.Client](),
 			stripeCache:  newTenantCache[*stripe.Client](),
 			livekitCache: newTenantCache[*livekit.Client](),
+			appDB:        database,
 		},
 		db:         database,
 		ws:         DefaultWorkspace,

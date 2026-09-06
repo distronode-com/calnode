@@ -2079,7 +2079,148 @@ Only the vendor webhooks: `POST /v1/livekit/webhook` (+ its alias) and `POST /v1
 must resolve their workspace from the room or session row they name, then hand off to
 `forWorkspace`. D12, D13 and D14 are done.
 
-## D11 — the plan this replaced
+## Boundary 6, part four — the vendor webhooks, and a hole they exposed
+
+`POST /v1/livekit/webhook` (+ its legacy alias) and `POST /v1/stripe/webhook`. Both stay
+`Platform`-classified, because the caller is a vendor: no tenant Host (the URL was registered
+once in a dashboard) and no credential of ours (the signature is theirs).
+
+### The workspace comes from OUR row, keyed on an id WE issued
+
+`internal/handler/vendor_webhook.go`. LiveKit resolves in three steps — the egress id on a
+`recordings` row, then the room's `recordings` row, then the booking the room name encodes
+(`booking-<id>`, which is the only room name this application creates, and is what a
+`room_finished` for a never-recorded meeting needs). Stripe resolves from
+`bookings.stripe_session_id`, falling back to the metadata booking id — and even then takes
+`workspace_id` from the ROW, not the payload.
+
+⛔ **No resolver consults a `workspace_id` in a vendor payload.** Such a field would be a
+tenant selector supplied by whoever can forge a body, and every read here names `workspace_id`
+in its own SELECT list instead.
+
+An event no row owns is **2xx and ignored**. A 4xx would make LiveKit and Stripe retry for days,
+and no retry can make a row exist that never did.
+
+### ⚠️ Decision: in multi-tenant mode the RESOLVE precedes the VERIFY
+
+The turn asked for verify-then-resolve. That is impossible here, and the reason is worth
+recording: **both vendors' credentials live in `server_settings`, i.e. per workspace (D7).** On
+a Platform-wrapped route the handle bypasses the policies, so `LoadLiveKitSettingsFromDB`'s
+`WHERE id = 1` matches every tenant's row and returns an arbitrary one — verifying a signature
+against a randomly chosen tenant's secret is not verification. There is no process-wide
+credential to fall back on either, because boot priming is single-tenant-only (B5, deliverable 4).
+
+So: resolve (one keyed SELECT), then verify with **that workspace's** secret, then act. Two
+properties make it safe and both are load-bearing: **nothing is written before the signature
+verifies**, and **nothing is disclosed** (the body is empty either way).
+
+⚠️ The residual is an existence oracle — an unsigned request naming a real egress id gets 403
+while an unknown one gets 200. The ids are opaque (`booking-<uuid>`, LiveKit egress ids) and a
+caller holding a valid signature already knows the id it sent. Closing it would mean 403 for an
+unknown row, i.e. the retry storm this design exists to avoid.
+
+**Single-tenant keeps the original order exactly** (verify, then act): one workspace, one set of
+credentials, nothing to resolve, and no reason to change what a working deployment does.
+
+### ⛔ THE HOLE: `forWorkspace` was binding onto the PLATFORM pool
+
+Found by the vendor-webhook test, and it reached further than this group.
+
+`Platform()` replaces `h.db` with the platform handle, whose role **BYPASSES** row-level
+security. `forWorkspace` then built its scoped copy with `h.db.ForWorkspace(ws.ID)` — so the
+result **named** a tenant and was not **confined** to it. A `WHERE id = 1` read through such a
+handle matches every workspace's `server_settings` row and returns an arbitrary one; a write
+lands wherever the statement says. Both silent.
+
+The symptom was oblique: the hand-off from the LiveKit webhook to
+`forWorkspace(ws).getLiveKit()` read the **default** workspace's empty settings row instead of
+the resolved tenant's, so the client was nil and the handler answered 200 having verified
+nothing. No error, no log line.
+
+Fixed by holding the application handle on `shared` (`appDB`, set once in `handler.New`) and
+binding every scoped copy from **that**: `h.appBase().ForWorkspace(ws.ID)`. A tenant-scoped
+handler now always rides the role the policies constrain, whichever route it came from.
+
+⚠️ **Why nothing else caught it:** every other Platform-route hand-off either names
+`workspace_id` explicitly on its writes (the platform API, the SSO endpoint — which is why
+those tests pass either way) or runs on the worker's path, where the base handler's `db` IS the
+application handle. The vendor webhooks are the first code to depend on a scoped handle's
+**reads** being filtered.
+
+Negative control, the bind put back on `h.db`:
+
+```
+--- FAIL: TestVendorWebhook_livekitBadSignatureWritesNothing
+    status = 200; want 403
+```
+
+200 means it never reached verification, because it loaded the wrong tenant's (absent)
+credentials.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test -count=1 ./...` **rc=0 on SQLite (30/30)**. PostgreSQL: `internal/handler` **rc=0**
+(321.2s), `internal/server` **rc=0** — including the whole B3/B4/B5 tenancy suite, which is
+what says the `appDB` change did not move anything else.
+
+```
+--- PASS: TestVendorWebhook_livekitResolvesTheOwningWorkspace      [7 cases]
+--- PASS: TestVendorWebhook_livekitEventWritesOnlyItsOwnWorkspace
+--- PASS: TestVendorWebhook_livekitUnknownRoomIs2xxWithNoWrite
+--- PASS: TestVendorWebhook_livekitBadSignatureWritesNothing
+--- PASS: TestVendorWebhook_stripeResolvesTheOwningWorkspace       [6 cases]
+--- PASS: TestVendorWebhook_stripeUnknownSessionIs2xxWithNoWrite
+--- PASS: TestVendorWebhook_stripeBadSignatureWritesNothing
+```
+
+---
+
+# Boundary 6 — done. D11, D12, D13, D14 all closed
+
+| decision | state |
+|---|---|
+| **D11** hosts, per-workspace `publicURL`, the OAuth hand-off through SSO, the calendar callback's workspace | **done** (B3 for the hosts, B6 part three for both hand-off halves) |
+| **D12** platform API: create, get, patch, delete, export, import, attendee erasure; suspended ⇒ 503 | **done** (B6 parts one and two; 503 was already in `Scoped`) |
+| **D13** demo mode and multi-tenant mutually exclusive | **done** in B1 (`config.Validate`) |
+| **D14** rate limits keyed `(workspace, client IP)` via `TRUSTED_PROXY_CIDRS` | **done** with the platform-hooks merge |
+
+## What a bring-up needs from this side
+
+Environment, on every instance:
+
+| key | value |
+|---|---|
+| `MULTI_TENANT` | any non-empty value turns the mode on. ⛔ Requires a `postgres://` DSN and refuses `DEMO_MODE` (D13) |
+| `DATABASE_URL` | the **application** role: `NOBYPASSRLS`, owns no table in the schema. `VerifyRoles` refuses the boot otherwise |
+| `DATABASE_ADMIN_URL` | the **platform** role: owner, `BYPASSRLS`. ⛔ Must not equal `DATABASE_URL` — one role means every policy is inert against it, and everything appears to work |
+| `CALNODE_PLATFORM_TOKEN` | bearer for `/v1/platform/*`. Unset ⇒ those routes 404 |
+| `CALNODE_SSO_SHARED_SECRET` | HMAC key for `/v1/auth/sso`. ⛔ **Required** in multi-tenant mode if Google or Microsoft login is configured: the callbacks hand off through it, and unset means every social login ends at `error=sso` |
+| `TRUSTED_PROXY_CIDRS` | the networks whose forwarded headers are believed. ⚠️ Unset behind a proxy makes every tenant one rate-limit bucket (D14's IP half) |
+| `CALNODE_ENCRYPTION_KEY` | as before, and ⛔ it must travel with any workspace moved between instances — import refuses a document whose `dek_fingerprint` differs |
+| `BASE_URL` | the identity host: OAuth callbacks, `/oauth/*`, `/mcp`, `/v1/platform/*`, `/healthz`, `/readyz`, `/version`, `/metrics` |
+| `PUBLIC_BASE_URL` | **ignored** in multi-tenant mode; each workspace's `public_host` replaces it |
+
+Per workspace, through `POST /v1/platform/workspaces`: `public_host` (its own hostname, DNS
+pointed at the instance) and the `defaults` block. The response's `api_key` and
+`webhook_secret` are shown once.
+
+At boot, in this order: migrate on the platform handle → `EnableRLS` → suspend the `default`
+workspace → `VerifyRoles` on the application handle. The first, second and fourth are fatal on
+failure; the third is logged.
+
+## The two known follow-ups
+
+1. ⛔ **Per-tenant DEKs.** `crypto_keystore` is exempt and holds one wrapped DEK per process
+   (D3), so every tenant's secrets are encrypted under one key: an operator who can read the
+   database can decrypt every workspace, and a workspace cannot be moved between instances
+   without moving the key. Import's `dek_fingerprint` check makes the coupling loud rather than
+   silent, which is as far as this packet goes. Making it per tenant changes D3, the schema
+   (`crypto_keystore` gains `workspace_id`), and the export format.
+2. ⚠️ **The D7 reader wiring for `embed_allowed_origins` and `stt_base_url`.** Both columns are
+   written by the platform API and read by nothing, so a multi-tenant instance still shares one
+   embed allowlist and one STT host across tenants. Details and the two specifics are in the
+   open item above.
 
 ⚠️ This file carried a plan for the SSO mint half between the merge and part three above.
 It is now BUILT, and part three is the record; the plan is deleted rather than annotated,
@@ -2087,3 +2228,13 @@ because a plan left beside its implementation is the next reader's wrong answer.
 three points survived contact unchanged (the callback to change, and the `<nonce>|<wid>`
 state cookie). The third did not: the plan had the SSO endpoint resolving its workspace from
 `wid`, and doing that on a public host is what part three had to fix.
+
+---
+
+## The D11 plan this file used to carry
+
+⚠️ Deleted rather than annotated once it was built: a plan left beside its implementation is the
+next reader's wrong answer. Two of its three points survived contact unchanged (the callback to
+change, and the `<nonce>|<wid>` state cookie). The third did not — it had the SSO endpoint
+resolving its workspace from `wid`, and doing that on a public host is exactly what part three
+had to fix.

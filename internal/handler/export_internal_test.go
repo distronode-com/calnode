@@ -38,3 +38,37 @@ func FinishOAuthLoginForTest(h *Handler, email, workspaceID string) string {
 	})(rec, req)
 	return rec.Header().Get("Location")
 }
+
+// LiveKitEventWorkspaceForTest and StripeEventWorkspaceForTest expose the vendor-webhook
+// resolvers, which is where the tenancy decision is actually made.
+//
+// ⛔ They are bridged rather than tested through the HTTP handler because verification needs a
+// real vendor secret: an end-to-end test can only ever observe the 403, which says nothing
+// about WHICH workspace the event resolved to. Both run through Platform, because that is the
+// handle the route gives them — on the bare handler the reads would use the unbound application
+// handle and resolve nothing.
+func LiveKitEventWorkspaceForTest(h *Handler, egressID, room string) (string, bool) {
+	var id string
+	var found bool
+	h.Platform(func(p *Handler, _ http.ResponseWriter, r *http.Request) {
+		scoped, ok := p.livekitEventWorkspace(r.Context(), egressID, room)
+		found = ok
+		if ok {
+			id = scoped.Workspace().ID
+		}
+	})(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/livekit/webhook", nil))
+	return id, found
+}
+
+func StripeEventWorkspaceForTest(h *Handler, sessionID, metadataBookingID string) (string, bool) {
+	var id string
+	var found bool
+	h.Platform(func(p *Handler, _ http.ResponseWriter, r *http.Request) {
+		scoped, ok := p.stripeEventWorkspace(r.Context(), sessionID, metadataBookingID)
+		found = ok
+		if ok {
+			id = scoped.Workspace().ID
+		}
+	})(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/stripe/webhook", nil))
+	return id, found
+}
