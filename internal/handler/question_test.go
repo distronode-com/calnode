@@ -232,6 +232,86 @@ func TestCreateQuestion_autoPosition(t *testing.T) {
 	}
 }
 
+// TestCreateQuestion_returningPosition covers the one RETURNING clause in the
+// tree (question_handler.go): when the caller sends no position, the handler
+// computes it inside the INSERT — VALUES (…, (SELECT COALESCE(MAX(position)+1, 0)
+// …)) RETURNING position — rather than SELECT-then-INSERT, so two concurrent
+// creates cannot land on the same position.
+//
+// Boundary 2 left that clause as the one piece of ported SQL verified on SQLite
+// and unverified on PostgreSQL. It runs on whichever engine dbtest selects, and
+// it asserts the value the handler SCANNED from RETURNING, not just the row that
+// ended up in the table: the two agreeing is the whole point, and a RETURNING
+// that silently returned a zero value would still leave a correct row behind.
+func TestCreateQuestion_returningPosition(t *testing.T) {
+	h, database, key, _ := setupWorkspaceWithDB(t)
+	ctx := context.Background()
+	slug, _ := seedEventTypeHTTP(t, h, key)
+	t.Logf("engine: %s", database.Dialect())
+
+	// create posts a question and returns (id, position) as the CREATE response
+	// reported them — i.e. what RETURNING produced on the auto-position path.
+	create := func(body string) (string, int) {
+		t.Helper()
+		req := authReq(http.MethodPost, "/v1/event-types/"+slug+"/questions", body, key)
+		req.SetPathValue("slug", slug)
+		rec := httptest.NewRecorder()
+		h.RequireAuth(h.CreateQuestion)(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s: got %d — %s", body, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			ID       string `json:"id"`
+			Position int    `json:"position"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode create response: %v", err)
+		}
+		return resp.ID, resp.Position
+	}
+
+	stored := func(id string) int {
+		t.Helper()
+		var pos int
+		if err := database.QueryRowContext(ctx,
+			`SELECT position FROM event_type_questions WHERE id = ?`, id).Scan(&pos); err != nil {
+			t.Fatalf("read stored position for %s: %v", id, err)
+		}
+		return pos
+	}
+
+	// First three, no position in the request: RETURNING must hand back 0, 1, 2.
+	for want := 0; want < 3; want++ {
+		id, got := create(fmt.Sprintf(`{"label":"Q%d","type":"text"}`, want))
+		if got != want {
+			t.Errorf("auto position #%d: RETURNING gave %d; want %d", want, got, want)
+		}
+		if s := stored(id); s != got {
+			t.Errorf("auto position #%d: RETURNING gave %d but the row holds %d", want, got, s)
+		}
+	}
+
+	// An explicit position takes the other branch (a plain INSERT, no RETURNING),
+	// and then the next auto position must be MAX+1 over it — 10, not 3. This is
+	// what proves the subselect inside VALUES is evaluated by the engine rather
+	// than the value being an accident of insertion order.
+	explicitID, explicitPos := create(`{"label":"Pinned","type":"text","position":9}`)
+	if explicitPos != 9 {
+		t.Errorf("explicit position: got %d; want 9", explicitPos)
+	}
+	if s := stored(explicitID); s != 9 {
+		t.Errorf("explicit position: row holds %d; want 9", s)
+	}
+
+	nextID, nextPos := create(`{"label":"After the pinned one","type":"text"}`)
+	if nextPos != 10 {
+		t.Errorf("auto position after an explicit 9: RETURNING gave %d; want 10", nextPos)
+	}
+	if s := stored(nextID); s != nextPos {
+		t.Errorf("auto position after an explicit 9: RETURNING gave %d but the row holds %d", nextPos, s)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // UpdateQuestion
 // ---------------------------------------------------------------------------
