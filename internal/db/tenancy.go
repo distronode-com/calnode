@@ -68,6 +68,12 @@ var TenantTables = []string{
 //   - crypto_keystore holds the wrapped DEK, and there is one DEK per process
 //     (ARCHITECTURE §5). Per-tenant DEKs are a later hardening.
 //   - goose_db_version is migration bookkeeping.
+//   - sso_nonces holds the replay guard for /v1/auth/sso. A nonce is a jti: it is
+//     meaningful GLOBALLY, because the question it answers is "has this exact token
+//     been spent", and the answer must be the same regardless of which workspace the
+//     token names. Per workspace it would be weaker for no benefit — the same jti
+//     could be replayed once per tenant. It also has no natural owner: the row exists
+//     before the token's `wid` claim has been trusted.
 //   - oauth_clients is dynamic client registration, which is per client
 //     APPLICATION rather than per tenant: one connector registration serves
 //     every workspace it is later authorised against, and the grant that IS
@@ -76,6 +82,7 @@ var ExemptTables = []string{
 	"crypto_keystore",
 	"goose_db_version",
 	"oauth_clients",
+	"sso_nonces",
 	"workspaces",
 }
 

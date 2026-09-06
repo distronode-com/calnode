@@ -11,6 +11,108 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 
 ## [Unreleased]
 
+### Added
+- **Canadian French (`fr-CA`) on the booker-facing surfaces.** A visitor whose browser asks
+  for `fr-CA` now gets Canadian French rather than the France copy; `fr` and `fr-FR` are
+  unaffected. It is the first regional locale, and a separate file rather than a fallback
+  because the differences are real: `courriel` rather than `e-mail`, `reporter`/`report`
+  rather than `reprogrammer`, `renseignements personnels` (the Quebec statutory term) rather
+  than `données personnelles`, no space before `!` `?` `;` where France puts one, and CLDR
+  itself spells July `juill.` here against `juil.` in France.
+
+  ⚠️ **The wording is an unreviewed draft**, like every non-English locale in this
+  repository: the structure is verified by the same three guards (same keys, printf-verb
+  parity, date tables cross-checked against CLDR), but no native Canadian French speaker has
+  read the copy. Corrections are welcome and easy to merge — see CONTRIBUTING.
+
+- **`booking.reminder` webhook event.** Reminders were email-only, so an integration had no
+  way to know one had gone out — you could hear about a booking being made, moved or
+  cancelled, but not about the nudge before it. Subscribe to it in Settings → Webhooks.
+
+  The payload is booking-shaped like the other booking events plus `hours_before`, because
+  an event type can configure several reminders and a subscriber needs to know which one
+  fired. It is sent after the email and only when the email succeeded: the event means the
+  attendee has been reminded, and the job retries, so firing it on a failed send would be
+  both untrue and eventually duplicated. A host who has reminder emails switched off sends
+  no reminder, so there is no event either.
+
+- **`STT_BASE_URL`: choose which speech-to-text endpoint transcribes your recordings.**
+  The host was hardcoded, so meeting audio always went to the provider's global endpoint —
+  a problem if you need it transcribed inside one jurisdiction. The default is unchanged.
+
+  Only the host is configurable; the path, model and transcription options stay ours, so
+  this picks a region rather than a different request. The effective value is reported
+  read-only as `stt_base_url` in `GET /v1/settings/notetaker`, because an admin should be
+  able to see where audio is sent without reading a running container's environment — and
+  should not be able to repoint it from a browser session, which is why it is not a
+  settings field.
+
+- **`GET /metrics`: Prometheus metrics, off until you set `METRICS_TOKEN`.** Build
+  identity, requests by surface and status, a request-duration histogram, pending and
+  failed job counts, bookings created/cancelled/rescheduled, process start time and two Go
+  runtime gauges. No new dependency — the exposition format is a page of text, and a
+  scrape endpoint is not worth a dependency tree in a binary you self-host.
+
+  Without the token, and with a wrong one, it answers 404 rather than 401: these numbers
+  are a business feed, and an operator who has not configured a token has not agreed to
+  publish it, so there is nothing to advertise either. The `class` label comes from the
+  path prefix and nothing else, so the series count is fixed at five times the handful of
+  status codes and a request cannot invent a new one.
+
+- **`FRAME_ANCESTORS`: embed the admin UI in your own console.** Space-separated origins
+  (`https://console.example.com 'self'`); when set, `/admin/` sends
+  `Content-Security-Policy: frame-ancestors <list>`. The public booking pages are
+  untouched and still deny framing outright — this is about the console, not the pages
+  that take card details.
+
+  Two deliberate refusals. An entry that is not `https://host[:port]` or `'self'` stops
+  the app booting rather than being ignored, because a browser drops a source list it
+  cannot parse, which would leave the admin UI *more* embeddable than the setting being
+  unset. And no `X-Frame-Options` is sent beside it: that header has no allow-list form,
+  so the only value it could carry is `SAMEORIGIN`, which browsers honour instead of the
+  CSP and would break the embedding this exists for.
+
+- **`TRUSTED_PROXY_CIDRS`: per-IP rate limits that work behind a CDN.** Rate limits key
+  on the TCP peer, which is right for a directly-reachable instance and useless behind a
+  fronting CDN, where every visitor arrives from the same handful of addresses and shares
+  one bucket. List the networks you control and the client IP is taken from
+  `CF-Connecting-IP`, or from `X-Forwarded-For` walked right to left past your own hops.
+
+  Nothing changes if you do not set it: a header from a peer you have not listed is still
+  not read at all, because it is a value the client chose. Within the header the *leftmost*
+  entry is likewise client-chosen, so the walk stops at the rightmost address one of your
+  proxies actually observed, and a malformed hop ends the walk on the peer rather than
+  being stepped over.
+
+- **Sign out everywhere.** `POST /v1/auth/sessions/revoke-all` ends every session you
+  have except the one you asked from, so losing a laptop no longer means waiting out a
+  30-day cookie. Pass `{"user_id": "..."}` and an admin can do the same for someone
+  else: an admin may revoke a member, only the owner may revoke another admin, and the
+  owner's own sessions can only be ended by the owner.
+
+  It also revokes that person's MCP OAuth tokens, which is the part that makes it an
+  offboarding tool rather than a convenience. A connected agent authenticates with a
+  bearer token and not the session cookie, so ending the sessions alone would have left
+  it holding exactly the access that was just withdrawn.
+
+- **Signed session hand-off, so an identity system you already run can sign people in.**
+  `GET /v1/auth/sso?token=<jwt>` accepts a short-lived HS256 JWT signed with a shared
+  secret and starts an ordinary Calnode session, redirecting to `/admin/` (or to a
+  same-origin `?next=` path). Off unless `CALNODE_SSO_SHARED_SECRET` is set — an
+  unconfigured instance answers 404, so it cannot be turned on by accident.
+
+  The token must carry `iss`, `aud` (your `BASE_URL`), `sub` (email), `name`, `role`,
+  `iat`, `exp` and a unique `jti`. It may live at most 60 seconds, 30 seconds of clock
+  skew is tolerated either way, and the `jti` is recorded in a new `sso_nonces` table
+  before the session is created, so a replay inside that window is refused rather than
+  handed a second session. A `wid` claim is accepted and ignored today.
+
+  This is the only path that creates a user without an invite, which is the trade the
+  shared secret buys: the caller is your own identity system, not a visitor with a
+  Google account. On creation the claimed role is applied; for someone who already
+  exists the role is left alone, except that a claim asking for `owner` bootstraps
+  ownership when the instance has none. Archived accounts are still refused.
+
 ## [0.8.0] - 2026-09-03
 
 ### Added

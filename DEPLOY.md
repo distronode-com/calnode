@@ -25,6 +25,8 @@ This guide covers a generic Docker deploy and a step-by-step **Railway** deploy
 |---|---|---|---|
 | `CALNODE_ENCRYPTION_KEY` | **prod: yes** | — | KEK input (Argon2id). **Required when `BASE_URL` is https** — the app refuses to start without it. Use a long random string: `openssl rand -hex 32`. **Losing it makes encrypted data unrecoverable** unless you set the recovery secret below. |
 | `CALNODE_RECOVERY_SECRET` | recommended | — | Escrow secret so the data key can be recovered if the encryption key is rotated/lost. Store it somewhere separate. |
+| `CALNODE_SSO_SHARED_SECRET` | no | — | HMAC key for the signed session hand-off (`GET /v1/auth/sso`). Unset ⇒ that endpoint **404s**. Anything holding this secret can mint a session and create a user, so treat it like the encryption key: `openssl rand -hex 32`, env only, never in the admin UI. |
+| `METRICS_TOKEN` | no | — | Bearer token for `GET /metrics` (Prometheus text exposition). Unset ⇒ that endpoint **404s**, so an instance never publishes its request volume, booking rate or queue depth by accident. Scrape with `Authorization: Bearer $METRICS_TOKEN`; a wrong token gets the same 404 as an unconfigured one. |
 | `BASE_URL` | **yes (prod)** | `http://localhost:3000` | Identity host — admin UI, OAuth callbacks, invite links. **Must include the scheme** (`https://booking.example.com`). The `https://` prefix flips the app into production mode (secure cookies, encryption-key enforcement). |
 | `PUBLIC_BASE_URL` | no | = `BASE_URL` | Booker-facing host for booking links/emails, if different from the identity host. |
 | `DATABASE_URL` | no | `sqlite://./data/calnode.db` | Point at the persistent volume, e.g. `sqlite:///data/calnode.db`. A `postgres://user:pass@host:5432/dbname` URL selects PostgreSQL instead; anything else is SQLite. |
@@ -37,7 +39,10 @@ This guide covers a generic Docker deploy and a step-by-step **Railway** deploy
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | no | — | Google sign-in + calendar. Can also be set in Settings → Google OAuth. |
 | `LITESTREAM_REPLICA_URL` | recommended | — | Enables continuous SQLite backup (see §6). |
 | `COOKIE_SECURE` | no | https→true | Override cookie Secure flag; defaults from `BASE_URL` scheme. |
+| `TRUSTED_PROXY_CIDRS` | no | — | Comma-separated CIDRs (a bare address = one host) whose `CF-Connecting-IP` / `X-Forwarded-For` are believed when keying per-IP rate limits, e.g. `10.0.0.0/8`. Unset ⇒ those headers are ignored and the limit keys on the TCP peer, so behind a fronting CDN every visitor shares one bucket. **Only list networks you control**: anything in the list can name any client IP it likes. |
+| `FRAME_ANCESTORS` | no | — | **Space**-separated origins allowed to embed the **admin UI** in a frame, e.g. `https://console.example.com 'self'`. Each entry must be `https://host[:port]` or `'self'` — anything else and **the app refuses to start**, because browsers drop a policy they cannot parse. Does not affect the public booking pages, which always deny framing. |
 | `LOG_LEVEL` | no | `info` | `debug`/`info`/`warn`/`error`. |
+| `STT_BASE_URL` | no | `https://api.deepgram.com` | Speech-to-text endpoint **host** for meeting transcription, e.g. a regional endpoint so recording audio stays in one jurisdiction. Host only — the path, model and options are fixed. Shown read-only in Settings → Notetaker as `stt_base_url`. |
 
 ¹ Email is optional to boot, but bookings won't send confirmations until SMTP is configured (env **or** the admin UI). Precedence is **env var > DB setting > default**.
 

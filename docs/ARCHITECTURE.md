@@ -54,6 +54,15 @@ app you must `pnpm build` in `frontend/` **and** rebuild/restart the Go binary
   - `MICROSOFT_CLIENT_ID/SECRET` and `MICROSOFT_TENANT` (default `common`; use the
     multi-tenant `common` so any work/personal Microsoft account can connect/sign in)
   - `COOKIE_SECURE` (defaults true when BASE_URL is https)
+  - `STT_BASE_URL` — speech-to-text endpoint **host** for the notetaker; defaults to
+    `stt.DefaultBaseURL` (`https://api.deepgram.com`). Set it to a regional endpoint to
+    keep recording audio inside one jurisdiction. Only the host is configurable: the path,
+    model and transcription options stay Calnode's (`internal/stt`'s `listenPath`), so an
+    operator picks a region and not a different request. Surfaced **read-only** as
+    `stt_base_url` in `GET /v1/settings/notetaker` — an admin should be able to read where
+    audio is sent without shelling into the container, and should not be able to repoint it
+    from a browser session, which is why it is env-only rather than a DB setting like the
+    API key beside it.
 - Startup (`internal/server/server.go: New`): open DB → run goose migrations →
   open keyvault (unwrap DEK) → configure mailer (DB settings override env) → start
   webhook/reminder **worker** → load Google creds (DB > env) → build one
@@ -63,6 +72,30 @@ app you must `pnpm build` in `frontend/` **and** rebuild/restart the Go binary
   return handler + a `drain` func.
 - Ops endpoints: `GET /healthz`, `GET /readyz` (readiness gate), `GET /version`
   (build stamp from `internal/buildinfo`).
+- **`GET /metrics`** — Prometheus text exposition, hand-written in `internal/metrics`
+  (no client library, for the reason `internal/livekit` signs its own tokens: a
+  one-page stable text protocol is not worth a dependency tree in a self-hosted
+  binary). Series: `calnode_build_info{version,commit}`,
+  `calnode_http_requests_total{class,status}`,
+  `calnode_http_request_duration_seconds` (histogram, fixed buckets),
+  `calnode_jobs_pending`, `calnode_jobs_failed_total`,
+  `calnode_bookings_total{event}` for created/cancelled/rescheduled,
+  `process_start_time_seconds`, `go_goroutines`, `go_memstats_alloc_bytes`.
+  ⛔ **Gated on `Authorization: Bearer $METRICS_TOKEN`, and it answers 404** — identical
+  to the mux's own not-found — when the token is unset or wrong. Not 401: a 401 confirms
+  the endpoint exists, and these numbers are a business feed (bookings per hour, request
+  volume by surface) on an instance meant to be publicly reachable. Not rate-limited
+  either; a scrape runs every few seconds by design and a limiter would punch gaps that
+  read as downtime.
+  `class` is derived from the path **prefix only** (`public|admin|api|mcp|ops`), so the
+  label set is closed and can never be attacker-chosen — the usual way a metrics endpoint
+  becomes an out-of-memory vector. Read it as "which surface of the URL space", not "how
+  the request authenticated": `POST /v1/bookings` is public and unauthenticated and still
+  counts as `api`. Requests are counted in the existing `Logging` middleware, the only
+  place that already knows the final status and elapsed time; job depth is read from the
+  `jobs` table per scrape, because any instance can claim any job. A host **reassignment**
+  fires the `booking.rescheduled` webhook but is deliberately **not** counted as a
+  reschedule — it does not move the meeting.
 - Graceful shutdown drains the worker and in-flight requests before `db.Close()`.
 
 ---
@@ -226,6 +259,43 @@ the platform/recovery secret doesn't expose secrets.
   Owner-gated actions: grant/revoke admin, transfer ownership. Admins can cancel
   any booking, see all bookings, manage teams/members. Safe-removal + archive
   guards prevent orphaning.
+- **Sign out everywhere** (`POST /v1/auth/sessions/revoke-all`, `session.go`). With no
+  body it drops all of the caller's sessions **except the one that made the request** —
+  "sign out my other devices", as distinct from `POST /v1/auth/logout`, which ends the
+  current one. (An API-key caller has no current session, so for them every session
+  goes.) With `{"user_id": "..."}` it is an offboarding tool, gated on the same tiers as
+  `roles.go`: an admin may revoke a member, only the owner may revoke another admin, and
+  the owner's sessions are reachable only by the owner. The actor's tier is checked
+  *before* the target is loaded, so the 404 cannot be used to enumerate user ids.
+  ⛔ It also deletes the target's rows in **`oauth_access_tokens`**, cutting off any MCP
+  connector (§19) — those authenticate with a bearer token, not the session cookie, so
+  revoking sessions alone would leave an agent holding the authority just withdrawn.
+  Both deletes run in one transaction, so "revoked" is never half-true.
+- **Signed session hand-off** (`GET /v1/auth/sso?token=<jwt>`, `sso.go`) lets an
+  external identity system that has already authenticated someone drop them into a
+  Calnode session without a second login. **Off unless `CALNODE_SSO_SHARED_SECRET` is
+  set** — an unconfigured instance answers **404**, deliberately indistinguishable from
+  a build without the feature. The token is a compact **HS256** JWT verified in-tree
+  (`crypto/hmac`, like `internal/livekit`'s signing) with a constant-time compare; only
+  HS256 is accepted, checked *before* the signature so the `alg: none` downgrade never
+  reaches it. Claims: `iss` (any non-empty string, logged only), `aud` = `BASE_URL`
+  (what stops a staging token being spent on production when a secret is shared by
+  mistake), `sub` = email, `name`, `role` ∈ owner|admin|member, `iat`, `exp` at most
+  **60 s** after `iat` with **30 s** of clock skew allowed either way, and a unique
+  `jti`. `wid` is parsed and ignored — a multi-workspace mode will use it. The `jti` is
+  claimed in **`sso_nonces`** *before* the session is created, so a replay inside the
+  validity window collides on the primary key rather than racing a read-then-write; the
+  worker purges expired rows in its GC pass (§13). Success is a 302 to `/admin/`, or to
+  `?next=` when that is a same-origin absolute path (anything with a scheme, a `//`
+  prefix, a backslash or a control character is a 400, refused rather than sanitised).
+  Every other failure is a 401 whose JSON body names the claim that failed. Rate-limited
+  like the OAuth callbacks.
+  ⛔ **This is the one path that creates a user without an invite.** Everywhere else an
+  unknown email is refused (`no_account`); here the shared secret is the difference — the
+  caller is the operator's own identity system. On creation the claim's `role` is applied;
+  on an existing user the role is **not** rewritten, except that a claim asking for
+  `owner` bootstraps ownership when the instance has none (the one-owner invariant §6
+  maintains means there is nothing to displace). An archived user is still refused.
 - **Offboarding = archive** (`users.archived_at`), never hard-delete — preserves
   bookings, event-type ownership, team links. Archived ⇒ no login, hidden from
   lists, skipped in routing/slots, event types deactivated. Reversible (restore).
@@ -675,14 +745,27 @@ as the desired state:
   reset to pending +1 min). Retry **backoff is a fixed two-step: 60s then 5 min**
   (not exponential), `max_attempts` 3. Atomic claim via
   `UPDATE … WHERE status='pending'` + RowsAffected.
-- `internal/webhook`: enqueues `booking.created` / `.cancelled` / `.rescheduled`
-  plus the notetaker events `recording.completed` / `transcript.ready` / `notes.ready`
+- `internal/webhook`: enqueues `booking.created` / `.cancelled` / `.rescheduled` /
+  `.reminder` plus the notetaker events `recording.completed` / `transcript.ready` /
+  `notes.ready`
   (reference payloads — booking-shaped, keyed by id; consumers fetch the artifact body
-  via REST/MCP). There is **no** `booking.reminder` webhook event. Deliveries are signed
+  via REST/MCP). Deliveries are signed
   **HMAC-SHA256**, header `X-Calnode-Signature` (+ `X-Calnode-Event`/`-Delivery`),
   secret stored encrypted. The worker's HTTP client is **SSRF-guarded** (resolves
   DNS, blocks private/loopback/CGNAT/ULA IPs, dials the resolved IP to avoid
   re-resolution) since webhook URLs are user-supplied.
+- **`booking.reminder`** is fired by the `reminder.send` job (`internal/worker`), booking-shaped
+  like its siblings plus **`hours_before`** — an event type can configure several reminders, so
+  the payload has to say which one this is. It carries no payment fields: those come from
+  create/cancel, and `paymentStatusForWebhook`'s mapping lives in the handler package.
+  ⛔ **Fired after the email and only on success**, because the event means "the attendee has
+  been reminded". Emitting it beside a failed send would be untrue, and the job retries — which
+  would deliver it twice for one reminder. Conversely an *enqueue* failure does **not** fail the
+  job: the email has already gone and a retry would send a second one, so it is logged and
+  dropped. `sendReminder`'s early returns (booking deleted, no longer confirmed, host has
+  reminder emails off) are all "no reminder happened", so none of them fires it either.
+  ⚠️ The event needs the **booking's** `host_id`, not the event type's owner — a rotation or a
+  reassignment moves it, and `Enqueue` selects a subscriber's webhooks by that id.
 - **Per-webhook payload fields:** each webhook chooses which fields land in the `data`
   object (`webhooks.fields` JSON, migration 00027) — incl. attendee PII + intake
   answers. NULL ⇒ the original default set (so existing webhooks are unchanged and
@@ -734,10 +817,24 @@ as the desired state:
   **original `Host` header**. The CSRF same-origin check (§6) compares the request's
   `Origin`/`Referer` against `Host`, so a proxy that rewrites Host would *false-block
   admin writes* (403). Fly and Railway preserve Host by default; a hand-rolled nginx
-  needs `proxy_set_header Host $host;`. Related: per-IP rate limits (§8) key on the
-  **TCP remote address** (proxy headers like `X-Forwarded-For` are intentionally
-  ignored as forgeable), so behind a shared proxy the limit keys on the proxy's
-  connection — fine for per-instance Fly/Railway, worth knowing for a fronting proxy.
+  needs `proxy_set_header Host $host;`.
+- **Per-IP rate limits (§8) key on the TCP remote address by default**, and
+  `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` are not read at all. That is not
+  an oversight: those headers are client-chosen values, so believing them unconditionally
+  would let anyone split their own rate-limit bucket by sending a different one each
+  request. Behind a shared proxy the limit therefore keys on the proxy's connection —
+  fine for a per-instance Fly/Railway deploy, worth knowing for a fronting CDN.
+  **`TRUSTED_PROXY_CIDRS`** (comma-separated CIDRs, a bare address meaning one host)
+  opts in per network: for a peer inside one of those ranges, `TrustClientIP`
+  (`internal/server/middleware.go`) resolves the client IP from `CF-Connecting-IP` if
+  present, else by walking `X-Forwarded-For` **right to left past trusted hops** and
+  taking the first untrusted address, else the peer. ⛔ Not the leftmost entry: the left
+  of that header is whatever the original client sent, and every well-behaved proxy
+  preserves it. A hop that does not parse ends the walk and falls back to the peer rather
+  than being skipped, so one malformed entry cannot push the walk onto a value the client
+  chose. Headers from an **untrusted** peer are never read, which is what keeps the
+  default un-weakenable by a header. Resolution happens once, in the outermost
+  middleware, and is carried in the request context.
 
 ---
 
@@ -761,6 +858,24 @@ as the desired state:
    strict default and relaxes only when head code-injection is configured (broad
    `https:` or the operator's `tracking_csp_allow`). Don't re-hardcode the CSP on the
    `book`/`manage` handlers — route it through `publicCSP`.
+9. **`FRAME_ANCESTORS` is the admin SPA's only, and it must stay that way.** Set it
+   (space-separated `https://host[:port]` / `'self'`) and the handler under `/admin/`
+   sends `Content-Security-Policy: frame-ancestors <list>` so an operator can embed the
+   console in their own tooling. `internal/server`'s `FrameAncestors` middleware wraps
+   `frontend.Handler()` and nothing else: the public booking pages keep
+   `frame-ancestors 'none'` + `X-Frame-Options: DENY` unconditionally, because they are
+   unauthenticated pages collecting names, emails and card details and clickjacking one
+   is worth more than framing a console nobody reaches without a session.
+   ⚠️ **Unset sends no frame header at all, which is what `/admin/` has always sent** —
+   the SPA is framable by default. This setting deliberately does *not* add a default
+   deny, since an opt-in flag must not smuggle in a behaviour change;
+   `TestAdminSPA_sendsNoFrameHeadersWhenUnset` pins the current answer so changing it is
+   a decision. No `X-Frame-Options` is sent beside the CSP either: that header has no
+   allow-list form (`ALLOW-FROM` is dead), so the only value it could carry is
+   `SAMEORIGIN`, which browsers apply *instead of* the CSP and would break the embedding.
+   An entry that isn't `https://host[:port]` or `'self'` fails `config.Validate()` and the
+   process **refuses to start** — a browser drops a source list it cannot parse, so a
+   typo would otherwise leave `/admin/` more embeddable than with the setting unset.
 
 ---
 
@@ -1026,7 +1141,18 @@ LLM summary) — the next build; consent-gated (§8.11/§15 of the PRD).
 
 ## 23. Languages (i18n)
 
-Calnode ships **8 locales**: `en` (source) · `es` · `fr` · `de` · `it` · `pt` · `nl` · `sv`.
+Calnode ships **9 locales**: `en` (source) · `es` · `fr` · `fr-CA` · `de` · `it` · `pt` · `nl` · `sv`.
+
+`fr-CA` is the first **regional** locale, and it is a separate file rather than a fallback
+because the differences are real: `courriel` not `e-mail`, `reporter`/`report` not
+`reprogrammer`/`reprogrammation`, `renseignements personnels` never `données personnelles`
+(the Quebec statutory term), no space before `!` `?` `;` where France puts one, and CLDR
+itself disagrees on one abbreviation — `month_short_jul` is `juill.` in fr-CA and `juil.` in
+fr, which is exactly what `TestDateTablesMatchCLDR` exists to catch. Both keep the 24-hour
+clock and the day-month `date_format`. Currency and percent take a non-breaking space before
+`$` and `%` in Canadian French; no key carries either today, so the rule is recorded here
+rather than applied. A visitor sending `fr-FR` or plain `fr` is unaffected — the matcher
+picks the exact tag first (pinned in `TestResolve`).
 
 ### What is translated, and what is not
 

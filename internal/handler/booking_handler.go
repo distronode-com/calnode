@@ -18,6 +18,7 @@ import (
 	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/i18n"
 	"github.com/calnode/calnode/internal/mailer"
+	"github.com/calnode/calnode/internal/metrics"
 	"github.com/calnode/calnode/internal/slots"
 	"github.com/calnode/calnode/internal/uid"
 	"github.com/calnode/calnode/internal/webhook"
@@ -1166,6 +1167,10 @@ func (h *Handler) dispatchBookingConfirmation(b *booking.Booking, in bookingConf
 			h.logger.Error("booking confirmation email (attendee)", "error", err, "booking_id", b.ID)
 		}
 	}
+	// Counted where the lifecycle event is dispatched, not where the webhook is enqueued:
+	// an instance with no webhooks configured still has bookings worth counting. This runs
+	// on every create path (REST + MCP) because dispatchBookingConfirmation is shared.
+	metrics.BookingEvent(metrics.BookingCreated)
 	if h.webhookSvc != nil {
 		if err := h.webhookSvc.Enqueue(ctx, "booking.created", webhook.BookingPayload{
 			ID:                 b.ID,
@@ -1593,6 +1598,7 @@ func (h *Handler) cancelSideEffects(b booking.Booking) {
 	_ = h.db.QueryRowContext(ctx,
 		`SELECT payment_status, amount_paid_cents, amount_paid_currency FROM bookings WHERE id = ?`, b.ID).
 		Scan(&payStatus, &payAmt, &payCur)
+	metrics.BookingEvent(metrics.BookingCancelled)
 	if h.webhookSvc != nil {
 		if err := h.webhookSvc.Enqueue(ctx, "booking.cancelled", webhook.BookingPayload{
 			ID:                 b.ID,

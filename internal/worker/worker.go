@@ -147,6 +147,13 @@ func (w *Worker) Poll(ctx context.Context) {
 		`DELETE FROM magic_link_tokens WHERE expires_at < ? OR used_at IS NOT NULL`, now); err != nil {
 		w.logger.Error("worker: purge magic link tokens", "error", err)
 	}
+	// SSO hand-off nonces exist only to refuse a replay inside the token's own validity
+	// window (at most ~60s), so a row past its expires_at can never reject anything and
+	// is pure growth. Nothing reads them back except the INSERT that claims one.
+	if _, err := w.db.ExecContext(ctx,
+		`DELETE FROM sso_nonces WHERE expires_at < ?`, now); err != nil {
+		w.logger.Error("worker: purge sso nonces", "error", err)
+	}
 	// Idempotency keys are only useful for the retry window of the original
 	// request; purge them 24h after creation so the table stays small.
 	idemCutoff := time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)
@@ -316,7 +323,8 @@ func (w *Worker) processJob(ctx context.Context, workspaceID, typ, payload strin
 
 func (w *Worker) sendReminder(ctx context.Context, deps TenantDeps, payload string) error {
 	var p struct {
-		BookingID string `json:"booking_id"`
+		BookingID   string `json:"booking_id"`
+		HoursBefore int    `json:"hours_before"`
 	}
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
 		return fmt.Errorf("worker: reminder: parse payload: %w", err)
@@ -330,15 +338,21 @@ func (w *Worker) sendReminder(ctx context.Context, deps TenantDeps, payload stri
 	var startAt, endAt, status string
 	var locVal, msgReminder, subjReminder sql.NullString
 	var notifyReminder int
+	// hostID and createdAt are for the booking.reminder webhook below, not the email:
+	// Enqueue selects a subscriber's webhooks by the BOOKING's host, which is not
+	// necessarily the event type's owner (a rotation or a reassignment moves it).
+	var hostID, createdAt string
+	// deps.DB, not w.db: the reminder job runs bound to its own workspace (B5), and
+	// this read plus the booking.reminder Enqueue below must both stay inside it.
 	err := deps.DB.QueryRowContext(ctx, `
-		SELECT b.status, b.start_at, b.end_at, b.location_value,
+		SELECT b.status, b.start_at, b.end_at, b.location_value, b.host_id, b.created_at,
 		       et.name, et.slug, et.msg_reminder, et.subj_reminder,
 		       u.name, u.email, COALESCE(u.notify_reminder, 1)
 		FROM bookings b
 		JOIN event_types et ON et.id = b.event_type_id
 		JOIN users u ON u.id = et.user_id
 		WHERE b.id = ?`, p.BookingID).
-		Scan(&status, &startAt, &endAt, &locVal,
+		Scan(&status, &startAt, &endAt, &locVal, &hostID, &createdAt,
 			&d.EventTypeName, &d.EventTypeSlug, &msgReminder, &subjReminder,
 			&d.HostName, &d.HostEmail, &notifyReminder)
 	if err == sql.ErrNoRows {
@@ -392,6 +406,37 @@ func (w *Worker) sendReminder(ctx context.Context, deps TenantDeps, payload stri
 
 	if err := mailer.SendReminder(ctx, deps.Mailer, d); err != nil {
 		return fmt.Errorf("worker: reminder: send: %w", err)
+	}
+
+	// booking.reminder fires AFTER the email and only on success, because the event means
+	// "this booking's attendee has been reminded". Emitting it beside a failed send would
+	// tell a subscriber something untrue, and the job retries, which would then deliver it
+	// twice for one reminder.
+	//
+	// Conversely, an enqueue failure here must NOT fail the job: the email has already
+	// gone, and a retry would send a second one. Logged and dropped, the same trade every
+	// other webhook enqueue in the tree makes after a committed side effect.
+	//
+	// The early returns above are all "no reminder happened" — booking deleted, no longer
+	// confirmed, host has reminder emails off — so none of them fires this either.
+	// deps.Webhook, not w.svc: the subscriber lookup and the delivery row it writes
+	// are this workspace's, and the secret it will be signed with is this
+	// workspace's too (B5, deliverable 2).
+	if deps.Webhook != nil {
+		if err := deps.Webhook.Enqueue(ctx, "booking.reminder", webhook.BookingPayload{
+			ID:            p.BookingID,
+			EventTypeSlug: d.EventTypeSlug,
+			HostID:        hostID,
+			StartAt:       d.StartAt.UTC().Format(time.RFC3339),
+			EndAt:         d.EndAt.UTC().Format(time.RFC3339),
+			Status:        status,
+			LocationValue: d.LocationValue,
+			CreatedAt:     createdAt,
+			HoursBefore:   p.HoursBefore,
+		}); err != nil {
+			w.logger.Error("worker: reminder: enqueue booking.reminder webhook",
+				"error", err, "booking_id", p.BookingID)
+		}
 	}
 	return nil
 }

@@ -36,3 +36,35 @@ func TestParseDeepgram_fallbackText(t *testing.T) {
 		t.Errorf("fallback text = %q", res.Text)
 	}
 }
+
+// The base URL is configurable and the path/query are not: an operator picks a region,
+// not a model or a set of transcription options.
+func TestNewDeepgram_listenURLComposition(t *testing.T) {
+	cases := map[string]string{
+		"":                               DefaultBaseURL,
+		"https://api.eu.deepgram.com":    "https://api.eu.deepgram.com",
+		"https://api.eu.deepgram.com/":   "https://api.eu.deepgram.com",
+		"  https://stt.internal:8443/  ": "https://stt.internal:8443",
+		"http://localhost:9000":          "http://localhost:9000",
+	}
+	for in, wantBase := range cases {
+		d := NewDeepgram("key", in)
+		if d.BaseURL() != wantBase {
+			t.Errorf("NewDeepgram(%q).BaseURL() = %q; want %q", in, d.BaseURL(), wantBase)
+		}
+		want := wantBase + listenPath
+		if got := d.listenURL(); got != want {
+			t.Errorf("NewDeepgram(%q).listenURL() = %q; want %q", in, got, want)
+		}
+	}
+}
+
+// The default must stay exactly what it was before the setting existed, and the query has
+// to survive base-URL substitution — a dropped `diarize` would silently return a
+// transcript with no speaker labels rather than an error.
+func TestNewDeepgram_defaultIsUnchanged(t *testing.T) {
+	const want = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&diarize=true&utterances=true"
+	if got := NewDeepgram("key", "").listenURL(); got != want {
+		t.Errorf("default listenURL = %q; want %q", got, want)
+	}
+}

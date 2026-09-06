@@ -176,6 +176,13 @@ func TestPlatformRoutesAreTheIdentityHostSet(t *testing.T) {
 	want := []string{
 		// Ops (D11).
 		"GET /healthz", "GET /readyz", "GET /version",
+		// Prometheus exposition: an instance-level number, and its jobs read goes
+		// through Platform() inside the handler (feat/platform-hooks + D11).
+		"GET /metrics",
+		// The signed session hand-off. No tenant Host and no credential yet — the
+		// token IS the credential and the workspace is its `wid` claim, which
+		// SSOHandoff resolves itself (D11).
+		"GET /v1/auth/sso",
 		// Bootstrap: creates the first user of a single-tenant instance.
 		"POST /v1/setup",
 		// OAuth login and its callbacks live on the identity host, because that is

@@ -12,11 +12,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/calnode/calnode/internal/metrics"
 )
 
 type contextKey string
 
 const requestIDKey contextKey = "request_id"
+
+// clientIPKey carries the client IP resolved by TrustClientIP. Absent unless
+// TRUSTED_PROXY_CIDRS is configured, in which case remoteIP falls back to the peer.
+const clientIPKey contextKey = "client_ip"
 
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,12 +45,18 @@ func Logging(logger *slog.Logger, next http.Handler) http.Handler {
 
 		next.ServeHTTP(rw, r)
 
+		// Counted here rather than in a middleware of its own: this is already the one
+		// place that knows the final status and the elapsed time, and a second wrapper
+		// measuring the same thing would drift from the log line it is supposed to match.
+		elapsed := time.Since(start)
+		metrics.HTTPRequest(metrics.ClassifyPath(r.URL.Path), rw.status, elapsed)
+
 		reqID, _ := r.Context().Value(requestIDKey).(string)
 		logger.InfoContext(r.Context(), "request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.status,
-			"duration_ms", time.Since(start).Milliseconds(),
+			"duration_ms", elapsed.Milliseconds(),
 			"remote_addr", r.RemoteAddr,
 			"request_id", reqID,
 		)
@@ -181,8 +193,7 @@ func RateLimit(limit int, period time.Duration) func(http.HandlerFunc) http.Hand
 	go rl.cleanup()
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			ip := remoteIP(r)
-			if !rl.allow(ip) {
+			if !rl.allow(rateLimitKey(r)) {
 				w.Header().Set("Retry-After", fmt.Sprintf("%d", int(period.Seconds())))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusTooManyRequests)
@@ -193,6 +204,48 @@ func RateLimit(limit int, period time.Duration) func(http.HandlerFunc) http.Hand
 		}
 	}
 }
+
+// rateLimitKey is the bucket a request counts against (D14).
+//
+// ⛔ In multi-tenant mode it is (workspace, client IP), not the IP alone. Two
+// tenants' bookers routinely arrive from the same address — a shared office, a
+// corporate NAT, a CDN — and with one bucket the busier workspace would spend the
+// quieter one's allowance, which is one tenant degrading another's service through
+// no fault of either.
+//
+// ⚠️ And the IP half has to be the RESOLVED client IP, not the peer, or the
+// workspace prefix makes things WORSE rather than better: behind a shared proxy
+// every request from a workspace would key on the proxy's address, so one workspace
+// would become one bucket and its first 20 bookers a minute would exhaust it for
+// everyone else in that tenant. TrustClientIP (TRUSTED_PROXY_CIDRS) is what makes
+// remoteIP the client's own address; without it configured, remoteIP is the peer and
+// the pair degrades to exactly the behaviour that existed before.
+//
+// The workspace comes from the Host rather than from a resolved *Workspace, because
+// the limiter runs before any handler and must not do a database read to decide
+// whether to reject. An unrecognised host keys on the host string itself, which is
+// the safe direction: an attacker rotating Host values gets a bucket per value and
+// no tenant's allowance.
+func rateLimitKey(r *http.Request) string {
+	ip := remoteIP(r)
+	if !multiTenantLimits {
+		return ip
+	}
+	host := strings.ToLower(r.Host)
+	if i := strings.LastIndexByte(host, ':'); i >= 0 && !strings.Contains(host[i+1:], ".") {
+		host = host[:i]
+	}
+	return host + "|" + ip
+}
+
+// multiTenantLimits mirrors config.MultiTenant. It is a package variable rather than
+// a parameter because RateLimit is called ~15 times at registration and every caller
+// would otherwise thread the same boolean; SetMultiTenantLimits is called once from
+// New before any of them.
+var multiTenantLimits bool
+
+// SetMultiTenantLimits switches rate-limit buckets to (workspace host, client IP).
+func SetMultiTenantLimits(v bool) { multiTenantLimits = v }
 
 type rlWindow struct {
 	count     int
@@ -236,18 +289,187 @@ func (rl *rateLimiter) cleanup() {
 	}
 }
 
-// remoteIP returns the TCP-level remote address, stripped of its port.
-// X-Real-IP and X-Forwarded-For are intentionally ignored: without a
-// configured trusted-proxy allowlist, those headers can be forged by any
-// client and would bypass the rate limit entirely. Operators behind a reverse
-// proxy should strip proxy headers at the proxy level and rely on the TCP
-// address the proxy connects with. See audit/claims.yaml's
-// rate-limit-keys-on-tcp-source-address claim, recorded specifically because a
-// prior Layer 2 audit pass mistook this deliberate behavior for a spoofable gap.
+// FrameAncestors returns middleware that sets `Content-Security-Policy:
+// frame-ancestors <origins>` on the responses it wraps, so an operator can embed the
+// admin SPA in their own console. An empty list is a pass-through.
+//
+// ⛔ Scoped to the admin SPA on purpose, and it must stay that way. The public booking
+// pages set `frame-ancestors 'none'` plus `X-Frame-Options: DENY` in their own handlers
+// (book.go, manage_handler.go, tracking_settings.go's publicCSP) and this must never
+// reach them: they are unauthenticated pages that collect names, emails and card
+// details, and clickjacking one is worth more to an attacker than framing an admin UI
+// nobody can reach without a session.
+//
+// No `X-Frame-Options` is set beside the CSP. That header has no allow-list form — its
+// `ALLOW-FROM` was only ever implemented by one browser and is dead — so the only value
+// it could carry here is `SAMEORIGIN`, which every browser that reads it would apply
+// INSTEAD of honouring the CSP, breaking the embedding this exists to enable. Every
+// browser that can frame anything today supports frame-ancestors.
+//
+// ⚠️ With the list empty the wrapped handler sends no frame header at all, which is what
+// /admin/ has always sent: this middleware does not add a default deny, because that
+// would be a behaviour change smuggled in on an opt-in setting. See
+// TestAdminSPA_sendsNoFrameHeadersWhenUnset, which pins it.
+func FrameAncestors(origins []string) func(http.Handler) http.Handler {
+	if len(origins) == 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	policy := "frame-ancestors " + strings.Join(origins, " ")
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Set before next writes: a header added after the first Write is dropped.
+			w.Header().Set("Content-Security-Policy", policy)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// remoteIP returns the IP a per-IP limit keys on.
+//
+// By default that is the TCP-level remote address, stripped of its port, and the
+// forwarded headers are ignored: without a configured trusted-proxy allowlist those
+// headers can be forged by any client and would bypass the rate limit entirely.
+// Operators behind a reverse proxy should strip proxy headers at the proxy and rely on
+// the TCP address the proxy connects with. See audit/claims.yaml's
+// rate-limit-keys-on-tcp-source-address claim, recorded specifically because a prior
+// Layer 2 audit pass mistook this deliberate behavior for a spoofable gap.
+//
+// When TRUSTED_PROXY_CIDRS is set, TrustClientIP has already resolved the client IP for
+// this request and left it in the context — see resolveClientIP for what that means and
+// what it deliberately does not do. This function reads that value when it is there, so
+// the untrusted-peer path stays byte-for-byte the old behaviour.
 func remoteIP(r *http.Request) string {
+	if ip, ok := r.Context().Value(clientIPKey).(string); ok && ip != "" {
+		return ip
+	}
+	return peerIP(r)
+}
+
+// peerIP returns the TCP-level remote address, stripped of its port. This is the only
+// value in a request that a client cannot choose.
+func peerIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// ParseTrustedProxies parses TRUSTED_PROXY_CIDRS entries. A bare address is accepted and
+// treated as a single-host range (/32 or /128), because "10.0.0.7" is what an operator
+// naming one proxy will write.
+//
+// Every parseable entry is returned even when others fail, and the error names the ones
+// that did not: one typo should cost that hop's trust, not the whole list's. The caller
+// is expected to log the error — an unparsed entry means that proxy's headers are NOT
+// believed, which degrades to per-proxy rate limiting rather than to trusting a forgery.
+func ParseTrustedProxies(entries []string) ([]*net.IPNet, error) {
+	var nets []*net.IPNet
+	var bad []string
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(e); err == nil {
+			nets = append(nets, n)
+			continue
+		}
+		if ip := net.ParseIP(e); ip != nil {
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		bad = append(bad, e)
+	}
+	if len(bad) > 0 {
+		return nets, fmt.Errorf("not a CIDR or IP address: %s", strings.Join(bad, ", "))
+	}
+	return nets, nil
+}
+
+// TrustClientIP returns middleware that resolves the client IP once per request and
+// stores it in the request context for remoteIP to read. With no trusted proxies it is a
+// pass-through, so an instance that has not configured any is unchanged.
+//
+// It is middleware rather than a package-level setting because the trust list belongs to
+// one server instance: a mutable global would leak between instances in a test binary
+// and would make "which requests are affected" unanswerable from the wiring.
+func TrustClientIP(trusted []*net.IPNet) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if len(trusted) == 0 {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := context.WithValue(r.Context(), clientIPKey, resolveClientIP(r, trusted))
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// resolveClientIP applies the forwarded headers, but only for a peer inside a trusted
+// CIDR. A header from an untrusted peer is never read at all — that is the whole point,
+// and it is why the default (no trusted proxies) cannot be weakened by a header.
+//
+// Preference order for a trusted peer:
+//
+//  1. CF-Connecting-IP, which a single fronting CDN sets to one value and does not append
+//     to, so there is no chain to reason about.
+//  2. X-Forwarded-For, walked RIGHT TO LEFT past trusted hops, returning the first
+//     untrusted address. ⛔ Not the leftmost entry: the left of that header is whatever
+//     the original client sent, so a client that pre-seeds "X-Forwarded-For: 1.2.3.4"
+//     gets it prepended and preserved by every well-behaved proxy. The rightmost
+//     non-trusted hop is the last address a trusted proxy actually observed, which is the
+//     only one in the header that anything vouched for.
+//  3. The peer, whenever the headers are absent or unusable.
+//
+// A hop that does not parse ends the walk and falls back to the peer rather than being
+// skipped. Skipping it would let a client inject one malformed entry to push the walk
+// past the real hop and onto a value it chose. Note this also means a proxy that appends
+// "ip:port" (rather than a bare address) reads as malformed and lands on the peer, which
+// is the safe direction to be wrong in.
+func resolveClientIP(r *http.Request, trusted []*net.IPNet) string {
+	peer := peerIP(r)
+	if !ipInAny(peer, trusted) {
+		return peer
+	}
+
+	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+		if ip := net.ParseIP(cf); ip != nil {
+			return ip.String()
+		}
+	}
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		hops := strings.Split(xff, ",")
+		for i := len(hops) - 1; i >= 0; i-- {
+			ip := net.ParseIP(strings.TrimSpace(hops[i]))
+			if ip == nil {
+				break
+			}
+			if ipInAny(ip.String(), trusted) {
+				continue // a trusted hop of our own; keep walking left
+			}
+			return ip.String()
+		}
+	}
+
+	return peer
+}
+
+// ipInAny reports whether ip (a textual address) falls inside any of nets.
+func ipInAny(ip string, nets []*net.IPNet) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }

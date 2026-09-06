@@ -38,6 +38,9 @@ import (
 // MCP server over stdio. The returned drain func blocks until the background worker
 // has finished its current poll cycle.
 func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger) (*handler.Handler, func()) {
+	// Before any RateLimit call below: the bucket key depends on it (D14).
+	SetMultiTenantLimits(cfg.MultiTenant)
+
 	h := handler.New(db, logger)
 	// Before anything else: it decides whether every route resolves a tenant.
 	h.SetMultiTenant(cfg.MultiTenant)
@@ -45,6 +48,9 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	h.SetPublicBaseURL(cfg.PublicBaseURL)
 	h.SetDataDir("data")
 	h.SetEncKey(cfg.EncryptionKey)
+	h.SetSSOSecret(cfg.SSOSharedSecret)
+	h.SetMetricsToken(cfg.MetricsToken)
+	h.SetSTTBaseURL(cfg.STTBaseURL)
 	h.SetDemoMode(cfg.DemoMode)
 	h.SetDemoResetInterval(cfg.DemoResetInterval)
 
@@ -303,6 +309,16 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	mux.HandleFunc("GET /healthz", h.Platform((*H).Healthz))
 	mux.HandleFunc("GET /readyz", h.Platform((*H).Readyz))
 	mux.HandleFunc("GET /version", h.Platform((*H).Version))
+	// Prometheus exposition. Registered unconditionally and gated inside the handler on
+	// METRICS_TOKEN, which answers 404 when it is unset — so an instance never publishes
+	// its request volume or booking rate by accident, and never advertises the endpoint.
+	//
+	// ⛔ Platform, and its jobs read goes through Platform() inside the handler. The
+	// queue depth of an instance is an instance-level number: on the bound handle it
+	// would report one workspace's backlog as if it were the whole queue, and on the
+	// unbound handle it would report zero. Both are wrong in a way a dashboard cannot
+	// show you.
+	mux.HandleFunc("GET /metrics", h.Platform((*H).Metrics))
 
 	// Bootstrap — public, once-only
 	mux.HandleFunc("POST /v1/setup", h.Platform((*H).Setup))
@@ -326,7 +342,28 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	mux.HandleFunc("GET /v1/auth/callback", authRL(h.Platform((*H).CallbackGoogle)))
 	mux.HandleFunc("GET /v1/auth/microsoft/login", authRL(h.Platform((*H).LoginMicrosoft)))
 	mux.HandleFunc("GET /v1/auth/microsoft/callback", authRL(h.Platform((*H).CallbackMicrosoft)))
+	// Signed session hand-off from an external identity system. Registered
+	// unconditionally and gated inside the handler on the shared secret, so an
+	// unconfigured instance answers 404 rather than exposing whether the route exists
+	// at all. Same limiter as the OAuth callbacks: it is an unauthenticated endpoint
+	// that does an HMAC and a write.
+	//
+	// ⛔ Platform, on the identity host, because there is no tenant Host to resolve
+	// from and no credential yet — the TOKEN is the credential, and the workspace is
+	// the `wid` claim inside it. SSOHandoff therefore resolves its own workspace from
+	// that claim and names workspace_id explicitly on every row it writes; the
+	// platform handle binds '', so an omitted column would seat the user and their
+	// session in the default workspace (D11).
+	mux.HandleFunc("GET /v1/auth/sso", authRL(h.Platform((*H).SSOHandoff)))
 	mux.HandleFunc("POST /v1/auth/logout", h.Scoped(handler.HostWorkspace, (*H).Logout))
+	// Sign out everywhere. Own sessions for anyone; someone else's for an admin, which
+	// is the offboarding half. Also cuts that user's MCP OAuth tokens. Credential
+	// scoped: whose sessions to cut is a question about one workspace's users.
+	//
+	// ⚠️ One line, like every other registration: routes_classified_test.go scans this
+	// file line by line, so a wrapper on a continuation line reads as an unclassified
+	// route — which is what it caught when this arrived from feat/platform-hooks.
+	mux.HandleFunc("POST /v1/auth/sessions/revoke-all", h.RequireAuth(h.Scoped(handler.CredentialWorkspace, (*H).RevokeAllSessions)))
 
 	// MCP server (Model Context Protocol) — Streamable HTTP transport for remote
 	// agents. One server instance reused across requests. Guarded by a bearer token:
@@ -575,7 +612,10 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	mux.Handle("GET /favicon.ico", favicon)
 
 	// Admin SPA — served at /admin/* with SPA fallback for client-side routing.
-	adminSPA := frontend.Handler()
+	// FrameAncestors is applied here and nowhere else: FRAME_ANCESTORS is about embedding
+	// the admin console, and the public pages' own DENY must not be reachable from a
+	// config flag.
+	adminSPA := FrameAncestors(cfg.FrameAncestors)(frontend.Handler())
 	mux.Handle("GET /admin", http.RedirectHandler("/admin/", http.StatusMovedPermanently))
 	mux.Handle("/admin/", http.StripPrefix("/admin", adminSPA))
 
@@ -586,7 +626,19 @@ func New(ctx context.Context, cfg *config.Config, db *db.DB, logger *slog.Logger
 	// permanently if a marketing landing page is ever added here.
 	mux.Handle("GET /{$}", http.RedirectHandler("/admin/", http.StatusFound))
 
-	return RequestID(Logging(logger, SameOriginCheck(mux))), drain
+	// Trusted-proxy resolution wraps everything, so the per-IP limiters and anything else
+	// asking for the client IP see one answer computed once. A bad CIDR is logged and
+	// dropped rather than fatal: the consequence is that that hop's headers are not
+	// believed, which costs shared rate-limit buckets, never a trusted forgery.
+	trustedProxies, err := ParseTrustedProxies(cfg.TrustedProxyCIDRs)
+	if err != nil {
+		logger.Error("TRUSTED_PROXY_CIDRS: ignoring unparseable entries", "error", err)
+	}
+	if len(trustedProxies) > 0 {
+		logger.Info("trusting forwarded headers from proxies", "cidrs", cfg.TrustedProxyCIDRs)
+	}
+
+	return TrustClientIP(trustedProxies)(RequestID(Logging(logger, SameOriginCheck(mux)))), drain
 }
 
 // seedSMTPToDB writes env-var SMTP settings into the DB on first boot so they

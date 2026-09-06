@@ -2,7 +2,9 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -67,6 +69,25 @@ type Config struct {
 	ZoomClientID     string
 	ZoomClientSecret string
 
+	// SSOSharedSecret is the HMAC key for the signed session hand-off
+	// (GET /v1/auth/sso). Empty ⇒ that endpoint is off and 404s. Env-only and
+	// deliberately not settable from the admin UI: it can create users and mint
+	// sessions, so it belongs with the platform secrets rather than in a settings
+	// page an admin session can reach.
+	SSOSharedSecret string
+
+	// MetricsToken is the bearer token that authorises GET /metrics. Empty ⇒ that
+	// endpoint 404s, so an instance never publishes its request volume, booking rate or
+	// queue depth by accident. Env-only, for the same reason as SSOSharedSecret.
+	MetricsToken string
+
+	// STTBaseURL overrides the speech-to-text endpoint host for the notetaker, e.g. a
+	// regional endpoint so recordings are transcribed inside one jurisdiction. Empty ⇒
+	// stt.DefaultBaseURL. Only the host is configurable; the path, model and options are
+	// Calnode's. Surfaced read-only in GET /v1/settings/notetaker so an operator can see
+	// where audio is being sent without reading the environment of a running container.
+	STTBaseURL string
+
 	// CookieSecure sets the Secure flag on session cookies. Defaults to true
 	// when BASE_URL starts with https://, but can be overridden explicitly via
 	// COOKIE_SECURE=false for HTTPS-terminated-at-proxy setups where the binary
@@ -78,6 +99,26 @@ type Config struct {
 	// (`*`). CORS only constrains browsers; it is not an access-control boundary —
 	// the public endpoints are rate-limited regardless. Comma-separated.
 	EmbedAllowedOrigins []string
+
+	// TrustedProxyCIDRs lists the networks whose forwarded headers are believed when
+	// resolving the client IP for per-IP rate limiting. Empty (the default) ⇒ the limit
+	// keys on the TCP peer and CF-Connecting-IP / X-Forwarded-For are ignored entirely,
+	// because a header from an unvetted peer is a client-chosen value. Comma-separated
+	// CIDRs; a bare address is taken as a single host.
+	TrustedProxyCIDRs []string
+
+	// FrameAncestors lists the origins allowed to embed the admin SPA in a frame, as a
+	// Content-Security-Policy frame-ancestors source list. Space-separated, matching the
+	// CSP syntax it becomes. Empty (the default) ⇒ nothing is sent and /admin/ behaves
+	// exactly as it did. Each entry must be `https://host[:port]` or `'self'`; anything
+	// else fails Validate and the process refuses to start, because a directive the
+	// browser cannot parse is a directive that silently allows everything.
+	//
+	// Only the admin SPA is affected. The public booking pages keep their
+	// `frame-ancestors 'none'` + `X-Frame-Options: DENY` unconditionally — those are
+	// unauthenticated pages that take payment details, and no operator convenience is
+	// worth making them embeddable.
+	FrameAncestors []string
 
 	// DemoMode turns this instance into a public, self-resetting demo: seeds sample
 	// data on every boot (there's no persistent volume, so every boot is a fresh DB),
@@ -128,10 +169,17 @@ func Load() *Config {
 		ZoomClientSecret: getEnv("ZOOM_CLIENT_SECRET", ""),
 
 		EmbedAllowedOrigins: splitCSV(getEnv("EMBED_ALLOWED_ORIGINS", "")),
+		TrustedProxyCIDRs:   splitCSV(getEnv("TRUSTED_PROXY_CIDRS", "")),
+		STTBaseURL:          getEnv("STT_BASE_URL", ""),
+		// Space-separated, not comma: the value goes into a CSP source list verbatim, so
+		// it reads the same in the env var as it does in the header.
+		FrameAncestors: strings.Fields(getEnv("FRAME_ANCESTORS", "")),
 	}
 
 	cfg.EncryptionKey = os.Getenv("CALNODE_ENCRYPTION_KEY")
 	cfg.RecoverySecret = os.Getenv("CALNODE_RECOVERY_SECRET")
+	cfg.SSOSharedSecret = os.Getenv("CALNODE_SSO_SHARED_SECRET")
+	cfg.MetricsToken = os.Getenv("METRICS_TOKEN")
 	// PUBLIC_BASE_URL overrides the booker-facing host (custom/vanity domain).
 	// Unset → inherits BASE_URL, so single-domain deploys need only set BASE_URL.
 	cfg.PublicBaseURL = getEnv("PUBLIC_BASE_URL", cfg.BaseURL)
@@ -148,14 +196,27 @@ func Load() *Config {
 	return cfg
 }
 
-// Validate reports a configuration that cannot work, rather than letting it fail
-// later as something that reads like a bug in the code.
+// Validate reports the configuration errors an operator has to fix before the process
+// can safely serve traffic. Called from main after Load; a non-nil error is fatal.
 //
-// It is separate from Load because Load has no error return and every optional
-// knob in it deliberately falls back on a typo rather than refusing to boot
-// (see PoolFromEnv). These are not typos: each one is a combination whose only
-// possible outcome is silent data loss or silent cross-tenant exposure.
+// It is separate from Load because Load has no error return and every optional knob in
+// it deliberately falls back on a typo rather than refusing to boot (see PoolFromEnv).
+// Nothing here is a typo. It holds two families, and both share the property that a
+// wrong value is worse than an absent one:
+//
+//   - settings whose malformed value weakens a defence silently. A bad CSP directive is
+//     the example: browsers drop a source list they cannot parse, so the admin UI would
+//     end up MORE embeddable than with the setting unset, and nothing in the response
+//     would say so.
+//   - multi-tenant combinations whose only possible outcome is silent data loss or
+//     silent cross-tenant exposure.
 func (c *Config) Validate() error {
+	for _, origin := range c.FrameAncestors {
+		if err := validFrameAncestor(origin); err != nil {
+			return fmt.Errorf("FRAME_ANCESTORS: %w", err)
+		}
+	}
+
 	if !c.MultiTenant {
 		return nil
 	}
@@ -248,6 +309,44 @@ func getPositiveInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// validFrameAncestor accepts 'self' or an https origin with no path, credentials, query
+// or fragment.
+//
+// Wildcards are deliberately refused even though CSP allows them. `https://*.example.com`
+// trusts every host any subdomain of that name ever points at, including one taken over
+// later; an operator who needs two hosts can name two hosts. Plain http is refused for
+// the same reason the admin session cookie is Secure — the framing page would be able to
+// read nothing, but its own compromise becomes a foothold.
+func validFrameAncestor(origin string) error {
+	if origin == "'self'" {
+		return nil
+	}
+	if strings.HasPrefix(origin, "'") {
+		// 'none', 'unsafe-inline' and friends are keywords this setting has no use for:
+		// 'none' is not "unset" (see FrameAncestors) and the rest are not source
+		// expressions at all. Refusing them keeps the accepted grammar one line long.
+		return fmt.Errorf("%q is not a supported keyword; use 'self' or an https:// origin", origin)
+	}
+	u, err := url.Parse(origin)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%q is not a URL: %w", origin, err)
+	case u.Scheme != "https":
+		return fmt.Errorf("%q must use https://", origin)
+	case u.Host == "":
+		return fmt.Errorf("%q has no host", origin)
+	case strings.Contains(u.Host, "*"):
+		return fmt.Errorf("%q must name one host, not a wildcard", origin)
+	case u.User != nil:
+		return fmt.Errorf("%q must not carry credentials", origin)
+	case u.Path != "" && u.Path != "/":
+		return fmt.Errorf("%q must be an origin, with no path", origin)
+	case u.RawQuery != "" || u.Fragment != "":
+		return fmt.Errorf("%q must be an origin, with no query or fragment", origin)
+	}
+	return nil
 }
 
 func parseLogLevel(s string) slog.Level {

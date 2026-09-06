@@ -13,6 +13,7 @@ import (
 	"github.com/calnode/calnode/internal/booking"
 	"github.com/calnode/calnode/internal/i18n"
 	"github.com/calnode/calnode/internal/mailer"
+	"github.com/calnode/calnode/internal/metrics"
 	"github.com/calnode/calnode/internal/webhook"
 )
 
@@ -307,6 +308,11 @@ func (h *Handler) rescheduleSideEffects(bCopy booking.Booking, capturedEtID stri
 		}
 	}
 
+	// ⚠️ Only a real time change is counted. A host reassignment (reassign.go) also fires
+	// the booking.rescheduled webhook, because a subscriber does need to hear about it, but
+	// it does not move the meeting — counting it here would make "reschedules" answer a
+	// question nobody asked.
+	metrics.BookingEvent(metrics.BookingRescheduled)
 	if h.webhookSvc != nil {
 		if err := h.webhookSvc.Enqueue(ctx, "booking.rescheduled", webhook.BookingPayload{
 			ID:              bCopy.ID,

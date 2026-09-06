@@ -135,7 +135,7 @@ func (h *Handler) JobNotetakerTranscribe(ctx context.Context, workspaceID, paylo
 		return nil
 	}
 	url := presignS3Get(s3, objectKey, time.Hour, timeNow())
-	res, err := stt.NewDeepgram(key).TranscribeURL(ctx, url)
+	res, err := stt.NewDeepgram(key, h.sttBaseURL()).TranscribeURL(ctx, url)
 	if err != nil {
 		return err // transient — retry
 	}

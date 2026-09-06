@@ -57,6 +57,19 @@ type shared struct {
 	publicBaseURL string
 	dataDir       string
 
+	// ssoSecret, metricsToken and sttBaseURLCfg arrive with feat/platform-hooks. They
+	// live on shared, not on the per-request Handler: each is one process-wide
+	// setting read from the environment at boot, none is per workspace, and putting
+	// them on the value would copy three strings per request for nothing.
+	//
+	// ⚠️ ssoSecret is deliberately platform-level even though the token it signs
+	// carries a `wid` claim. The secret identifies the INSTANCE that minted the
+	// token; the workspace is inside the payload, which is what lets one identity
+	// host hand a session to any of its tenants' public hosts (D11).
+	ssoSecret     string // HMAC key for the signed session hand-off; empty ⇒ /v1/auth/sso is off
+	metricsToken  string // bearer token for GET /metrics; empty ⇒ that endpoint 404s
+	sttBaseURLCfg string // STT_BASE_URL override; empty ⇒ stt.DefaultBaseURL (see sttBaseURL)
+
 	authMu        sync.RWMutex
 	googleAuth    *oauth2.Config
 	microsoftAuth *oauth2.Config
