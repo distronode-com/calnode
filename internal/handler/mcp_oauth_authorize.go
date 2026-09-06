@@ -159,10 +159,19 @@ func (h *Handler) AuthorizeMCPDecision(w http.ResponseWriter, r *http.Request) {
 	code := "mcac_" + randHex(32)
 	expires := time.Now().UTC().Add(mcpAuthCodeTTL).Format(time.RFC3339)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// ⛔ workspace_id is NAMED because this route is Platform-wrapped: the platform
+	// handle binds '', and the column default would put the row in the DEFAULT
+	// workspace rather than the consenting user's.
+	workspaceID, wsErr := h.workspaceOfUser(r.Context(), userID)
+	if wsErr != nil {
+		h.logger.ErrorContext(r.Context(), "oauth: resolve consenting user's workspace", "error", wsErr)
+		h.redirectAuthError(w, r, ar, "server_error", "could not issue code")
+		return
+	}
 	if _, err := h.db.ExecContext(r.Context(), `
-		INSERT INTO oauth_auth_codes (code_hash, client_id, user_id, redirect_uri, code_challenge, scope, resource, expires_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		hashAPIKey(code), ar.ClientID, userID, ar.RedirectURI, ar.CodeChallenge, ar.Scope, ar.Resource, expires, now); err != nil {
+		INSERT INTO oauth_auth_codes (workspace_id, code_hash, client_id, user_id, redirect_uri, code_challenge, scope, resource, expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		workspaceID, hashAPIKey(code), ar.ClientID, userID, ar.RedirectURI, ar.CodeChallenge, ar.Scope, ar.Resource, expires, now); err != nil {
 		h.logger.ErrorContext(r.Context(), "oauth: store auth code", "error", err)
 		h.redirectAuthError(w, r, ar, "server_error", "could not issue code")
 		return
@@ -275,10 +284,21 @@ func (h *Handler) issueAndWriteTokens(w http.ResponseWriter, r *http.Request, cl
 			UPDATE oauth_access_tokens SET token_hash = ?, refresh_hash = ?, expires_at = ?, last_used_at = NULL
 			WHERE id = ?`, hashAPIKey(access), hashAPIKey(refresh), exp.Format(time.RFC3339), replaceID)
 	} else {
+		// ⛔ workspace_id NAMED, for the same reason as the auth code above: this
+		// runs on a Platform-wrapped route, so an omitted column lands the grant in
+		// the default workspace — where MCP would still verify it (the platform
+		// handle bypasses) but the owning workspace's Connected-apps page could
+		// neither list nor revoke it, and deleting the workspace would not remove it.
+		workspaceID, wsErr := h.workspaceOfUser(r.Context(), userID)
+		if wsErr != nil {
+			h.logger.ErrorContext(r.Context(), "oauth: resolve token owner's workspace", "error", wsErr)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue token")
+			return
+		}
 		_, err = h.db.ExecContext(r.Context(), `
-			INSERT INTO oauth_access_tokens (id, token_hash, refresh_hash, client_id, user_id, scope, resource, expires_at, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			uid.New(), hashAPIKey(access), hashAPIKey(refresh), clientID, userID, scope, resource, exp.Format(time.RFC3339), now.Format(time.RFC3339Nano))
+			INSERT INTO oauth_access_tokens (workspace_id, id, token_hash, refresh_hash, client_id, user_id, scope, resource, expires_at, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			workspaceID, uid.New(), hashAPIKey(access), hashAPIKey(refresh), clientID, userID, scope, resource, exp.Format(time.RFC3339), now.Format(time.RFC3339Nano))
 	}
 	if err != nil {
 		h.logger.ErrorContext(r.Context(), "oauth: issue token", "error", err)

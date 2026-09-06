@@ -14,6 +14,20 @@ import (
 // Setup handles POST /v1/setup — creates the first user and API key.
 // Returns 409 if the workspace is already configured.
 func (h *Handler) Setup(w http.ResponseWriter, r *http.Request) {
+	// ⛔ Refused in multi-tenant mode. This route is Platform-wrapped (it runs
+	// before any workspace exists, on the identity host), so its INSERTs into
+	// users and api_keys would land in the DEFAULT workspace — a first user and a
+	// live API key in a tenant nobody owns, reachable by no host. Workspaces and
+	// their owners are provisioned through the platform API instead.
+	//
+	// 404 rather than 403: on a multi-tenant instance this endpoint does not
+	// exist, and saying so is better than describing a bootstrap the caller
+	// cannot perform.
+	if h.multiTenant {
+		http.NotFound(w, r)
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
 	var req struct {
 		Name     string `json:"name"`

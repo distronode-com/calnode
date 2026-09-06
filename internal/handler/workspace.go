@@ -287,6 +287,27 @@ func (h *Handler) workspaceByHost(ctx context.Context, requestHost string) (*Wor
 	return &ws, nil
 }
 
+// workspaceOfUser resolves the workspace a user belongs to, through the platform
+// handle.
+//
+// ⛔ It exists for the INSERTs on Platform-wrapped routes. The platform handle
+// binds ”, and the workspace_id column defaults to
+// COALESCE(current_setting('app.workspace_id', true), 'default') — so a write that
+// omits the column lands in the DEFAULT workspace, silently, rather than failing.
+// A Platform route that writes a tenant row therefore has to name workspace_id,
+// and this is where it comes from.
+func (h *Handler) workspaceOfUser(ctx context.Context, userID string) (string, error) {
+	if !h.multiTenant {
+		return db.DefaultWorkspaceID, nil
+	}
+	var ws string
+	if err := h.platformDB().QueryRowContext(ctx,
+		`SELECT workspace_id FROM users WHERE id = ?`, userID).Scan(&ws); err != nil {
+		return "", fmt.Errorf("resolve the workspace of user %s: %w", userID, err)
+	}
+	return ws, nil
+}
+
 // workspaceByID reads a workspace by id, through the platform handle.
 func (h *Handler) workspaceByID(ctx context.Context, id string) (*Workspace, error) {
 	var ws Workspace

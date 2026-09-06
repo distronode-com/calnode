@@ -951,3 +951,104 @@ workspace id, not `default`.
 table, which is a tenant table. At integration it must read through `Platform()`:
 on the application handle it would report one workspace's queue, and on the unbound
 handle, zero.
+
+## The identity-resolution sweep
+
+Every read whose PURPOSE is to resolve an identity or a tenant **before one is
+bound**. Three had already been fixed one at a time (`RequireAuth`,
+`MCPCallerMiddleware`, `VerifyMCPBearer`); this is the enumeration, so the fourth
+is not found by another failing test.
+
+The rule the table applies: **a read whose job is to discover the tenant cannot be
+bound to it.** The corollary, which is what the (c) rows are: **a write on a
+Platform-wrapped route must NAME `workspace_id`**, because the platform handle
+binds `''` and the column default is
+`COALESCE(current_setting('app.workspace_id', true), 'default')` — so an omitted
+column does not fail, it lands the row in the default workspace.
+
+| # | site | credential / lookup | route class | verdict |
+|---|---|---|---|---|
+| 1 | `auth.go:85,97` | `api_keys.key_hash` → user | any (middleware) | **(a)** `platformDB()` |
+| 2 | `auth.go:113` | `sessions.id` → user | any (middleware) | **(a)** `platformDB()` |
+| 3 | `mcp_oauth.go:86` | `users` role + workspace | `/mcp` | **(a)** `platformDB()` |
+| 4 | `mcp_oauth.go:133,141` | `oauth_access_tokens.token_hash` | `/mcp` | **(a)** `platformDB()` |
+| 5 | `mcp_oauth.go:148,151` | `api_keys.key_hash` (bearer) | `/mcp` | **(a)** `platformDB()` |
+| 6 | `mcp_oauth_authorize.go:409` | `sessions.id` → consenting user | Platform | **(a)** `h.db` **is** the platform handle inside `Platform()` |
+| 7 | `mcp_oauth_authorize.go:216,223` | `oauth_auth_codes.code_hash` | Platform | **(a)** same |
+| 8 | `mcp_oauth_authorize.go:250` | `oauth_access_tokens.refresh_hash` | Platform | **(a)** same |
+| 9 | `mcp_oauth.go:284`, `:220`, `mcp_oauth_authorize.go:344` | `oauth_clients.client_id` | Platform | **(a)** global table, no `workspace_id`, exempt from RLS by design (D2) |
+| 10 | `magic_link.go:68,100,115` | `magic_link_tokens.token_hash` | HostWorkspace | **(b)** the link was mailed from that workspace's own public host |
+| 11 | `invites.go:228,278` | `invite_tokens.token_hash` | HostWorkspace | **(b)** same |
+| 12 | `booking/service.go:386` | `booking_manage_tokens.token_hash` | HostWorkspace | **(b)** and this is how D10's "the token's booking belongs to that workspace" is enforced — by the policy, not a predicate |
+| 13 | `idempotency.go:37,51,63,73` | `idempotency_keys` PK | HostWorkspace | **(b)** PK is now `(workspace_id, key)`; two tenants may reuse a key |
+| 14 | `auth_google.go:105` | `sessions.id` (logout) | HostWorkspace | **(b)** a session of B on A's host matches nothing, which is the right answer |
+| 15 | `apikey.go`, `invites.go` admin, `mcp_oauth_admin.go` | by `user_id` / `id` | CredentialWorkspace | **(b)** bound, and that is what scopes them |
+| 16 | **`mcp_oauth_authorize.go:163`** | `INSERT oauth_auth_codes` | Platform | ⛔ **(c)** named no `workspace_id` |
+| 17 | **`mcp_oauth_authorize.go:279`** | `INSERT oauth_access_tokens` | Platform | ⛔ **(c)** named no `workspace_id` |
+| 18 | **`setup.go:75,84`** | `INSERT users` + `api_keys` | Platform | ⛔ **(c)** would seat the first owner and a live key in `default` |
+
+### (c) 16 and 17 — the OAuth grant landed in the wrong tenant
+
+⛔ **And it still worked, which is why nothing caught it.** `VerifyMCPBearer` reads
+on the platform handle, which bypasses the policies, so an agent could complete
+the Connect flow and call tools normally. What broke was **ownership**: the
+workspace's Connected-apps page (`GET /v1/oauth/connections`, a
+CredentialWorkspace route on the bound handle) could neither list nor revoke the
+grant, and deleting the workspace would not have cascaded it. A revocation UI that
+silently cannot revoke is worse than one that is absent.
+
+Fixed by naming `workspace_id`, resolved through a new
+`(*Handler).workspaceOfUser` on the platform handle.
+
+`TestSweep_oauthGrantLandsInTheOwnersWorkspace` drives the real flow — `POST
+/oauth/register`, the consent page and its CSRF cookie, the decision POST, then
+`POST /oauth/token` with PKCE S256 — and asserts the issued row's `workspace_id`
+through the platform handle, plus the observable consequence: A's Connected-apps
+page lists the grant and B's does not.
+
+### (c) 18 — `POST /v1/setup` in multi-tenant mode
+
+Platform-wrapped, and it creates the first user **plus a live API key**. Both would
+land in `default`: a working credential in a tenant nobody owns and no host
+reaches. It now 404s when `MULTI_TENANT` is set — 404 rather than 403 because on a
+multi-tenant instance the endpoint does not exist; workspaces and their owners come
+from the platform API.
+
+⚠️ **Honest scope: this is reachable only before any user exists in any
+workspace.** Setup's own "workspace already configured" guard (409) fires once
+there is one, which the negative control below shows. So it is a narrow window —
+a freshly provisioned multi-tenant database between migration and the first
+platform-API call — and defence in depth after that.
+
+### Controls
+
+Positive: all three sweep tests pass on the PostgreSQL lane.
+
+Negative, both fixes reverted:
+
+```
+--- FAIL: TestSweep_oauthGrantLandsInTheOwnersWorkspace
+    tenancy_sweep_test.go:81: no code in the redirect
+    "http://127.0.0.1:9999/cb?error=server_error&error_description=could+not+issue+code&…"
+--- FAIL: TestSweep_setupIsRefusedInMultiTenantMode
+    tenancy_sweep_test.go:149: POST /v1/setup: status = 409, want 404: {"error":"workspace already configured"}
+```
+
+⚠️ Both controls fail, but neither fails at the assertion I predicted, and that is
+worth recording rather than smoothing over. The OAuth one fails **earlier**: with
+`workspace_id` unnamed the auth-code write does not complete at all, surfacing as
+`could not issue code`. I did not have time to establish whether that is the policy
+refusing the write or an artifact of the reverted statement, so **the mechanism is
+unconfirmed** — what is confirmed is that the test distinguishes fixed from
+unfixed. The setup one fails on the status code only, because the fixture has
+users and the 409 guard fires first; it does **not** demonstrate a row being
+written, for the reason in the scope note above.
+
+### ⚠️ One assertion I had to correct, and it is a trap worth knowing
+
+The manage-page test first asserted `status != 200` for B's token on A's host. It
+failed: `ManagePage` renders **200 with `TokenInvalid: true`** for an unknown
+token, by design — it is a booker-facing page, not an API. The isolation was
+working; the assertion was wrong. It now asserts on content (none of B's booking
+id, host name or attendee address appears). A status-code assertion against a
+surface that renders its own errors proves nothing.

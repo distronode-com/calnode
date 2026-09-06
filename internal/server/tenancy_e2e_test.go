@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +167,30 @@ func seedTenant(t *testing.T, app, platform *db.DB, id, host string) tenant {
 	}
 
 	return tn
+}
+
+// newRequest builds a request bound to a host, for the cases that need to add
+// cookies or headers before it is served.
+func newRequest(t *testing.T, method, host, path string, body io.Reader) *http.Request {
+	t.Helper()
+	r := httptest.NewRequest(method, path, body)
+	r.Host = host
+	return r
+}
+
+// serve runs a prepared request through the real mux.
+func (f *tenancyFixture) serve(r *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, r)
+	return rec
+}
+
+// postForm sends a urlencoded form through the real mux.
+func (f *tenancyFixture) postForm(t *testing.T, host, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	r := newRequest(t, http.MethodPost, host, path, strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return f.serve(r)
 }
 
 // do sends a request through the real mux.
