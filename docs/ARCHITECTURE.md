@@ -771,10 +771,24 @@ as the desired state:
   **original `Host` header**. The CSRF same-origin check (§6) compares the request's
   `Origin`/`Referer` against `Host`, so a proxy that rewrites Host would *false-block
   admin writes* (403). Fly and Railway preserve Host by default; a hand-rolled nginx
-  needs `proxy_set_header Host $host;`. Related: per-IP rate limits (§8) key on the
-  **TCP remote address** (proxy headers like `X-Forwarded-For` are intentionally
-  ignored as forgeable), so behind a shared proxy the limit keys on the proxy's
-  connection — fine for per-instance Fly/Railway, worth knowing for a fronting proxy.
+  needs `proxy_set_header Host $host;`.
+- **Per-IP rate limits (§8) key on the TCP remote address by default**, and
+  `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` are not read at all. That is not
+  an oversight: those headers are client-chosen values, so believing them unconditionally
+  would let anyone split their own rate-limit bucket by sending a different one each
+  request. Behind a shared proxy the limit therefore keys on the proxy's connection —
+  fine for a per-instance Fly/Railway deploy, worth knowing for a fronting CDN.
+  **`TRUSTED_PROXY_CIDRS`** (comma-separated CIDRs, a bare address meaning one host)
+  opts in per network: for a peer inside one of those ranges, `TrustClientIP`
+  (`internal/server/middleware.go`) resolves the client IP from `CF-Connecting-IP` if
+  present, else by walking `X-Forwarded-For` **right to left past trusted hops** and
+  taking the first untrusted address, else the peer. ⛔ Not the leftmost entry: the left
+  of that header is whatever the original client sent, and every well-behaved proxy
+  preserves it. A hop that does not parse ends the walk and falls back to the peer rather
+  than being skipped, so one malformed entry cannot push the walk onto a value the client
+  chose. Headers from an **untrusted** peer are never read, which is what keeps the
+  default un-weakenable by a header. Resolution happens once, in the outermost
+  middleware, and is carried in the request context.
 
 ---
 

@@ -12,6 +12,18 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 ## [Unreleased]
 
 ### Added
+- **`TRUSTED_PROXY_CIDRS`: per-IP rate limits that work behind a CDN.** Rate limits key
+  on the TCP peer, which is right for a directly-reachable instance and useless behind a
+  fronting CDN, where every visitor arrives from the same handful of addresses and shares
+  one bucket. List the networks you control and the client IP is taken from
+  `CF-Connecting-IP`, or from `X-Forwarded-For` walked right to left past your own hops.
+
+  Nothing changes if you do not set it: a header from a peer you have not listed is still
+  not read at all, because it is a value the client chose. Within the header the *leftmost*
+  entry is likewise client-chosen, so the walk stops at the rightmost address one of your
+  proxies actually observed, and a malformed hop ends the walk on the peer rather than
+  being stepped over.
+
 - **Sign out everywhere.** `POST /v1/auth/sessions/revoke-all` ends every session you
   have except the one you asked from, so losing a laptop no longer means waiting out a
   30-day cookie. Pass `{"user_id": "..."}` and an admin can do the same for someone
