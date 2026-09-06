@@ -335,7 +335,8 @@ func (h *Handler) seedWorkspaceSettings(ctx context.Context, tx *db.Tx, req *pla
 	return err
 }
 
-// seedWorkspaceEventType writes the default event type and its availability rules.
+// seedWorkspaceEventType writes the default event type, its owner host row and its
+// availability rules.
 //
 // location_type 'link' and routing_mode 'fixed' are the schema's own defaults (the CHECK
 // constraints in migration 00001 admit no 'none' or 'single'), which is what a
@@ -360,6 +361,27 @@ func (h *Handler) seedWorkspaceEventType(ctx context.Context, tx *db.Tx, req *pl
 		et.MinNoticeMinutes, et.MaxFutureDays); err != nil {
 		return fmt.Errorf("insert event type: %w", err)
 	}
+
+	// Seed the owner as the single required host, exactly as POST /v1/event-types does.
+	//
+	// ⛔ LOAD-BEARING, and silent when it is missing. resolveEventTypeHosts reads
+	// event_type_hosts and nothing else, so an event type with no row here has no host
+	// pool: GET /v1/event-types/{slug}/slots answers 200 with {"hosts":{},"slots":[]} and
+	// nothing can ever be booked. Nothing else says so — the booking page renders, the
+	// public payload lists the owner by another path, and the workspace reads healthy —
+	// so a tenancy provisioned without it looks complete and is not.
+	//
+	// workspace_id is named for the same reason the two statements around it name it:
+	// provisioning runs on the PLATFORM handle, which binds '', so the column's default
+	// (COALESCE(current_setting('app.workspace_id', true), 'default')) would not resolve
+	// to this tenant.
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO event_type_hosts (id, workspace_id, event_type_id, user_id, role, priority)
+		VALUES (?, ?, ?, ?, 'required', 0)`,
+		uid.New(), req.ID, etID, ownerID); err != nil {
+		return fmt.Errorf("insert event type host: %w", err)
+	}
+
 	for _, a := range et.Availability {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO availability_rules
