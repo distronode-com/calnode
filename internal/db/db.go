@@ -18,21 +18,15 @@ import (
 //go:embed migrations/sqlite/*.sql migrations/postgres/*.sql
 var migrations embed.FS
 
-// Open connects to the database at the given URL and returns the bare handle.
-//
-// Kept for callers that have not moved to OpenDB yet; it is the same connection,
-// without the dialect. Statements issued through it are not rebound, so on
-// Postgres they must already use $n.
-func Open(databaseURL string) (*sql.DB, error) {
-	h, err := OpenDB(databaseURL)
-	if err != nil {
-		return nil, err
-	}
-	return h.DB, nil
-}
-
 // OpenDB connects to the database named by databaseURL and configures the pool
 // for the engine it names.
+//
+// There is deliberately no bare-handle sibling. An Open returning *sql.DB
+// existed through the port "for callers that have not moved over yet", and it
+// was a foot-gun with no upside: statements issued through it are not rebound,
+// so every ? in them is a syntax error on Postgres, found at runtime and far
+// from the call. Anything that genuinely needs the bare pool (goose, Litestream)
+// reaches it as handle.DB, which at least says so at the call site.
 //
 // URL formats:
 //
@@ -217,6 +211,21 @@ func SchemaReady(ctx context.Context, db *sql.DB) (bool, error) {
 		return false, err
 	}
 	return applied >= target, nil
+}
+
+// SchemaReady is the handle-level spelling, for callers that hold a *DB — which
+// is every caller in the tree. The package-level functions above stay for the
+// bare-pool cases (goose's own bookkeeping, the tests that open an unmigrated
+// pool), but a handler reaching into h.db.DB to answer a readiness probe was one
+// more place where the exported embedded field looked like the normal way to do
+// things.
+func (h *DB) SchemaReady(ctx context.Context) (bool, error) {
+	return SchemaReady(ctx, h.DB)
+}
+
+// AppliedVersion is the handle-level spelling of the package function.
+func (h *DB) AppliedVersion(ctx context.Context) (int64, error) {
+	return AppliedVersion(ctx, h.DB)
 }
 
 func parseDSN(url string) string {

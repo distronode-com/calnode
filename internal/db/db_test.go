@@ -8,10 +8,10 @@ import (
 	"github.com/calnode/calnode/internal/db"
 )
 
-func TestOpen_inMemory(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+func TestOpenDB_inMemory(t *testing.T) {
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenDB: %v", err)
 	}
 	defer database.Close()
 
@@ -21,40 +21,40 @@ func TestOpen_inMemory(t *testing.T) {
 }
 
 func TestMigrate_runsClean(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenDB: %v", err)
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	if err := db.Migrate(database.DB); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 }
 
 func TestMigrate_idempotent(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenDB: %v", err)
 	}
 	defer database.Close()
 
 	// Running twice should not error (goose is idempotent).
 	for range 2 {
-		if err := db.Migrate(database); err != nil {
+		if err := db.Migrate(database.DB); err != nil {
 			t.Fatalf("db.Migrate (run 2): %v", err)
 		}
 	}
 }
 
 func TestMigrate_tablesExist(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenDB: %v", err)
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	if err := db.Migrate(database.DB); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 
@@ -80,24 +80,24 @@ func TestMigrate_tablesExist(t *testing.T) {
 }
 
 func TestSchemaReady_falseBeforeMigrate_trueAfter(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenDB: %v", err)
 	}
 	defer database.Close()
 
 	ctx := context.Background()
 
 	// Before migrating, the goose bookkeeping table is absent → not ready.
-	if ready, _ := db.SchemaReady(ctx, database); ready {
+	if ready, _ := db.SchemaReady(ctx, database.DB); ready {
 		t.Error("SchemaReady = true before migrations ran; want false")
 	}
 
-	if err := db.Migrate(database); err != nil {
+	if err := db.Migrate(database.DB); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 
-	ready, err := db.SchemaReady(ctx, database)
+	ready, err := db.SchemaReady(ctx, database.DB)
 	if err != nil {
 		t.Fatalf("SchemaReady after migrate: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestSchemaReady_falseBeforeMigrate_trueAfter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TargetVersion: %v", err)
 	}
-	applied, err := db.AppliedVersion(ctx, database)
+	applied, err := db.AppliedVersion(ctx, database.DB)
 	if err != nil {
 		t.Fatalf("AppliedVersion: %v", err)
 	}
@@ -120,16 +120,34 @@ func TestSchemaReady_falseBeforeMigrate_trueAfter(t *testing.T) {
 	if target < 17 {
 		t.Errorf("target version = %d; want >= 17 (sanity check against known migrations)", target)
 	}
+
+	// The handle-level spellings are what the tree uses now that there is no bare
+	// Open; they must agree with the package-level ones they delegate to. This is
+	// the path /readyz takes (internal/handler/health.go).
+	handleReady, err := database.SchemaReady(ctx)
+	if err != nil {
+		t.Fatalf("(*DB).SchemaReady: %v", err)
+	}
+	if handleReady != ready {
+		t.Errorf("(*DB).SchemaReady = %v; want %v (same as the package function)", handleReady, ready)
+	}
+	handleApplied, err := database.AppliedVersion(ctx)
+	if err != nil {
+		t.Fatalf("(*DB).AppliedVersion: %v", err)
+	}
+	if handleApplied != applied {
+		t.Errorf("(*DB).AppliedVersion = %d; want %d", handleApplied, applied)
+	}
 }
 
 func TestDoubleBookingIndex_exists(t *testing.T) {
-	database, err := db.Open("sqlite://:memory:")
+	database, err := db.OpenDB("sqlite://:memory:")
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenDB: %v", err)
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database); err != nil {
+	if err := db.Migrate(database.DB); err != nil {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 
