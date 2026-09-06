@@ -434,6 +434,68 @@ func TestTenancy_mcpToolCallOverHTTP(t *testing.T) {
 	}
 }
 
+// mcpSession opens an MCP session as one workspace, lists the tools the server offers, and
+// returns a caller for them. Both halves are DERIVED from the running server: the proof suite
+// asks what tools exist rather than naming them, so a tool added without scoping is covered the
+// moment it is registered.
+//
+// The caller passes no arguments: a tool that needs one returns an error result, which is fine
+// — the assertion is that nothing of the other workspace's appears in whatever comes back, and
+// an error body is as good a place for a leak as a success body.
+func (f *tenancyFixture) mcpSession(t *testing.T, apiKey string) (tools []string, call func(*testing.T, string) string) {
+	t.Helper()
+	ctx := context.Background()
+
+	srv := httptest.NewServer(f.mux)
+	t.Cleanup(srv.Close)
+
+	connect := func(t *testing.T) *mcp.ClientSession {
+		t.Helper()
+		transport := &mcp.StreamableClientTransport{
+			Endpoint:             srv.URL + "/mcp",
+			HTTPClient:           &http.Client{Transport: bearerTransport{key: apiKey}},
+			DisableStandaloneSSE: true,
+		}
+		client := mcp.NewClient(&mcp.Implementation{Name: "tenancy-proof", Version: "0"}, nil)
+		session, err := client.Connect(ctx, transport, nil)
+		if err != nil {
+			t.Fatalf("connect to /mcp: %v", err)
+		}
+		return session
+	}
+
+	listing := connect(t)
+	res, err := listing.ListTools(ctx, nil)
+	if err != nil {
+		listing.Close()
+		t.Fatalf("tools/list: %v", err)
+	}
+	for _, tool := range res.Tools {
+		tools = append(tools, tool.Name)
+	}
+	listing.Close()
+
+	call = func(t *testing.T, name string) string {
+		t.Helper()
+		session := connect(t)
+		defer session.Close()
+		out, err := session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: map[string]any{}})
+		if err != nil {
+			// A transport-level failure is not a leak; report it and let the caller scan the
+			// message, which is all this function promises.
+			return err.Error()
+		}
+		var sb strings.Builder
+		for _, c := range out.Content {
+			if tc, ok := c.(*mcp.TextContent); ok {
+				sb.WriteString(tc.Text)
+			}
+		}
+		return sb.String()
+	}
+	return tools, call
+}
+
 func (f *tenancyFixture) countBookings(t *testing.T, workspace string) int {
 	t.Helper()
 	var n int

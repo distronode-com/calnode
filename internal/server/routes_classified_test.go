@@ -57,21 +57,69 @@ var (
 	handleRe     = regexp.MustCompile(`mux\.Handle\("([^"]+)",\s*(.*)$`)
 )
 
+// ClassifiedRoute is one registration as the scan below found it: the mux pattern, and the
+// class the registration declares.
+//
+// It is exported from a _test.go file so the tenancy PROOF suite (package server_test) can
+// derive its table from the same scan this gate uses, rather than keeping a second copy of the
+// route list. Two lists would drift, and the one that drifted would be the one asserting
+// isolation.
+type ClassifiedRoute struct {
+	Pattern string
+	Expr    string
+	Class   string // "host" | "credential" | "platform" | "allowlisted"
+}
+
+// ScanClassifiedRoutes reads server.go and classifies every registration in it.
+//
+// ⛔ A source scan rather than a runtime walk because http.ServeMux exposes no way to enumerate
+// its patterns, and the thing to catch is a registration written without a wrapper — a property
+// of the text. See the file header.
+func ScanClassifiedRoutes(src string) []ClassifiedRoute {
+	var out []ClassifiedRoute
+	for _, line := range strings.Split(src, "\n") {
+		for _, re := range []*regexp.Regexp{handleFuncRe, handleRe} {
+			m := re.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			r := ClassifiedRoute{Pattern: m[1], Expr: m[2]}
+			switch {
+			case strings.Contains(r.Expr, "handler.HostWorkspace"):
+				r.Class = "host"
+			case strings.Contains(r.Expr, "handler.CredentialWorkspace"):
+				r.Class = "credential"
+			case strings.Contains(r.Expr, "h.Platform("):
+				r.Class = "platform"
+			default:
+				if _, ok := unscopedAllowlist[r.Pattern]; ok {
+					r.Class = "allowlisted"
+				}
+			}
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ReadServerSource returns server.go's text, for a caller in another package that cannot reach
+// the file by a relative path of its own.
+func ReadServerSource() (string, error) {
+	b, err := os.ReadFile("server.go")
+	return string(b), err
+}
+
 // TestEveryRouteIsClassified reads server.go and insists on it.
 func TestEveryRouteIsClassified(t *testing.T) {
-	src, err := os.ReadFile("server.go")
+	src, err := ReadServerSource()
 	if err != nil {
 		t.Fatalf("read server.go: %v", err)
 	}
 
 	type route struct{ pattern, expr string }
 	var routes []route
-	for _, line := range strings.Split(string(src), "\n") {
-		for _, re := range []*regexp.Regexp{handleFuncRe, handleRe} {
-			if m := re.FindStringSubmatch(line); m != nil {
-				routes = append(routes, route{pattern: m[1], expr: m[2]})
-			}
-		}
+	for _, r := range ScanClassifiedRoutes(src) {
+		routes = append(routes, route{pattern: r.Pattern, expr: r.Expr})
 	}
 
 	// A floor, so a regexp that stopped matching cannot pass vacuously.
