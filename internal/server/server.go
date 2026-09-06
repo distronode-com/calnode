@@ -135,7 +135,15 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	} else {
 		h.SetWebhookSvc(whs)
 		// Pass live so the worker picks up SMTP changes automatically.
-		wrk := worker.New(db, whs, logger, worker.WithMailer(live))
+		// ⛔ The PLATFORM handle. jobs is a tenant table, so a worker holding the
+		// application handle claims nothing on a multi-tenant instance: reminders and
+		// webhook deliveries would simply never fire, with no error anywhere.
+		wrk := worker.New(db.Platform(), whs, logger,
+			worker.WithMailer(live),
+			worker.WithTenantResolver(func(workspaceID string) worker.TenantDeps {
+				bound, m, wh := h.TenantRuntime(workspaceID)
+				return worker.TenantDeps{DB: bound, Mailer: m, Webhook: wh}
+			}))
 		// Notetaker jobs live in the handler package (they need LLM/S3/encKey).
 		wrk.RegisterHandler("notetaker.transcribe", h.JobNotetakerTranscribe)
 		wrk.RegisterHandler("notetaker.summarize", h.JobNotetakerSummarize)

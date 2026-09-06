@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/calnode/calnode/internal/db"
+	"github.com/calnode/calnode/internal/mailer"
+	"github.com/calnode/calnode/internal/webhook"
 )
 
 // errNoRows is sql.ErrNoRows under a shorter name, because the two workspace
@@ -115,6 +117,32 @@ func (h *Handler) forWorkspace(ws *Workspace) *Handler {
 	scoped.bookingSvc = h.bookingSvc.ForDB(scoped.db)
 	scoped.webhookSvc = h.webhookSvc.ForDB(scoped.db)
 	return &scoped
+}
+
+// workspaceForJob returns a handler scoped to a workspace named by a background
+// job rather than by a request. The id comes from the jobs row (migration 00060),
+// so it has already been through validation on the way in; an id that no longer
+// names a workspace still yields a bound handle, which under the policies matches
+// no row — the safe answer for a job whose tenant was deleted.
+//
+// Identity in single-tenant mode, where there is one workspace and nothing to bind.
+func (h *Handler) workspaceForJob(workspaceID string) *Handler {
+	if !h.multiTenant || workspaceID == "" {
+		return h
+	}
+	return h.forWorkspace(&Workspace{ID: workspaceID, Status: "active"})
+}
+
+// TenantRuntime returns the per-workspace dependencies a background job needs: the
+// bound database handle, and the mailer and webhook service built from THAT
+// workspace's settings row.
+//
+// It is exported for internal/server to adapt into worker.TenantDeps. The handler
+// deliberately does not import the worker package: the worker owns the queue, the
+// handler owns the per-tenant state, and one closure in server.New joins them.
+func (h *Handler) TenantRuntime(workspaceID string) (*db.DB, mailer.Mailer, *webhook.Service) {
+	scoped := h.workspaceForJob(workspaceID)
+	return scoped.db, scoped.getMailer(), scoped.webhookSvc
 }
 
 // Resolver decides which workspace a request belongs to. The two that exist are

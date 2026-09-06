@@ -102,7 +102,13 @@ func (h *Handler) maybeStartNotetaker(ctx context.Context, recordingID string) {
 
 // JobNotetakerTranscribe (worker job) transcribes a finished recording via Deepgram, stores the
 // transcript, and enqueues summarisation. Returns an error to retry on transient failures.
-func (h *Handler) JobNotetakerTranscribe(ctx context.Context, payload string) error {
+func (h *Handler) JobNotetakerTranscribe(ctx context.Context, workspaceID, payload string) error {
+	// ⛔ Scoped first, before anything reads a row. The worker claims on the
+	// platform handle, so the receiver it calls this on is unbound; every read and
+	// write below has to be this job's workspace. In single-tenant mode
+	// workspaceForJob is the identity function.
+	h = h.workspaceForJob(workspaceID)
+
 	var p struct {
 		RecordingID string `json:"recording_id"`
 	}
@@ -156,7 +162,13 @@ func (h *Handler) JobNotetakerTranscribe(ctx context.Context, payload string) er
 
 // JobNotetakerSummarize (worker job) summarises a booking's transcript(s) into notes. Thin wrapper
 // over summarizeBooking, which is shared with the manual regenerate endpoint.
-func (h *Handler) JobNotetakerSummarize(ctx context.Context, payload string) error {
+func (h *Handler) JobNotetakerSummarize(ctx context.Context, workspaceID, payload string) error {
+	// ⛔ Scoped first, before anything reads a row. The worker claims on the
+	// platform handle, so the receiver it calls this on is unbound; every read and
+	// write below has to be this job's workspace. In single-tenant mode
+	// workspaceForJob is the identity function.
+	h = h.workspaceForJob(workspaceID)
+
 	var p struct {
 		BookingID string `json:"booking_id"`
 	}

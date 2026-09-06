@@ -1242,3 +1242,101 @@ cases pass **under `-race`**:
    handle from `DATABASE_URL`. `rotate-key` and `recover-key` are genuinely
    platform-wide (`crypto_keystore` is exempt, one DEK per process, D3);
    `reset-admin` and `mcp` stdio are per-workspace and have no way to say which.
+
+## Boundary 5, part two — the worker claims across tenants and works inside one
+
+⚠️ **Deliverables 3 (reconciler) and 5 (CLI) are NOT in this commit.**
+
+### The claim loop and the work are on opposite sides of the boundary
+
+That is the whole shape of it, and getting either side wrong is silent:
+
+| | handle | why |
+|---|---|---|
+| claim, reaper, housekeeping sweeps | **platform** | one queue ordered by `run_at` across every tenant; a bound handle would serve one workspace and starve the rest |
+| processing a claimed job | **`ForWorkspace(job.workspace_id)`** | every read is one tenant's; the platform handle would read across them |
+
+⛔ **The claim query carries no workspace predicate**, deliberately, and now selects
+`workspace_id` alongside. This is what migration 00060's workspace-free
+`idx_jobs_pending_global` exists for — a workspace-leading index cannot serve an
+ordered global scan.
+
+`worker.TenantDeps{DB, Mailer, Webhook}` is what a job is processed with, supplied
+by `WithTenantResolver`. Unset — single-tenant — `depsFor` returns the Worker's own
+handle and mailer, so nothing changes. `sendReminder` and `deliverWebhook` take
+`deps` and use `deps.DB` / `deps.Mailer` / `deps.Webhook` rather than the Worker's
+fields.
+
+### Custom handlers took a new signature, not a context value
+
+`RegisterHandler` is now `func(ctx, workspaceID, payload) error`. The packet offered
+context smuggling or a signature change and asked for the smaller: the signature is
+**two call sites** in `server.New` and two method heads in `notetaker.go`, versus a
+context key that every future handler author has to know exists. Each notetaker job
+starts with `h = h.workspaceForJob(workspaceID)` — **before any row is read**,
+because the receiver the worker calls it on is unbound.
+
+`handler.TenantRuntime(workspaceID)` returns `(*db.DB, mailer.Mailer,
+*webhook.Service)` and `server.New` adapts it into `worker.TenantDeps`. The handler
+deliberately does **not** import the worker package: the worker owns the queue, the
+handler owns the per-tenant state, and one closure joins them.
+
+### The tests
+
+`TestWorker_processesEachJobInItsOwnWorkspace` — one reminder each, both due, one
+`Poll`. Both jobs reach `done` (the "one poll delivers both" half), each was sent
+with its **own** workspace's mailer, to its own attendee, and a cross-check asserts
+neither mailer saw the other's.
+
+`TestWorker_webhookSignsWithItsOwnWorkspacesSecret` — each workspace registers a
+webhook at its own path on one `httptest` server, so the signature that arrives can
+be attributed. The two signatures must differ, and the two issued secrets must
+differ. A shared `webhook.Service` would sign one tenant's payloads with another's
+secret and every subscriber's verification would start failing — which is the kind
+of break that gets reported as "your webhooks are broken", not as a tenancy bug.
+
+`TestWorker_customHandlersReceiveTheWorkspace` — the signature change, asserted by
+job rather than by inspection.
+
+### The negative control is the old shape
+
+```
+tenancy_test.go:340: negative control: a worker on the application handle claimed 0 of 1 due jobs,
+with no error — reminders and webhook deliveries would silently never fire
+```
+
+It runs the same due job twice: once through the platform handle (1 reminder sent),
+then requeued and run through the **application** handle (0 sent, job still
+`pending`). `jobs` is a tenant table and the application handle is unbound, so it
+matches no row — the loop runs, finds nothing, logs nothing. That is the third
+failure mode, distinct from leakage and from starvation, and it is what this
+deliverable removed.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean. The whole worker
+package passes **under `-race`**, pre-existing cases included:
+
+```
+--- PASS: TestWorker_processesEachJobInItsOwnWorkspace (1.75s)
+--- PASS: TestWorker_webhookSignsWithItsOwnWorkspacesSecret (1.76s)
+--- PASS: TestWorker_theOldShapeClaimsNothing (1.69s)
+--- PASS: TestWorker_customHandlersReceiveTheWorkspace (1.93s)
+--- PASS: TestWorker_sendsReminderForConfirmedBooking (1.39s)
+--- PASS: TestWorker_deliversSuccessfully (1.25s)
+--- PASS: TestWorker_purgesExpiredManageTokens (1.36s)
+    … and the rest of the package
+```
+
+### ⚠️ Housekeeping sweeps stay cross-tenant, and that is correct
+
+The `Poll` preamble deletes expired manage tokens, sessions, magic links,
+idempotency keys and auth codes, purges old webhook deliveries, and releases stale
+Stripe payment holds — all on the platform handle, all without a workspace
+predicate. That is deliberate: they are retention rules, not tenant logic, and
+running them per workspace would mean N times the statements to express one policy.
+The Stripe hold backstop is the one worth naming, because it **writes**
+(`bookings.status = 'cancelled'`) across tenants — it is keyed on
+`payment_status = 'pending' AND created_at < cutoff`, which is a property of the
+row and not of the tenant, so a global sweep is the right shape. If that ever needs
+to differ per workspace it has to move.

@@ -24,21 +24,45 @@ import (
 // only ever shows the 50 most recent, so this is not what limits what anyone can see.
 const webhookDeliveryRetention = 30 * 24 * time.Hour
 
+// TenantDeps is everything processing a job needs that differs per workspace: the
+// bound database handle, and the two services built from that workspace's own
+// server_settings row.
+//
+// ⛔ It exists because the claim loop and the work are on opposite sides of the
+// tenancy boundary. Claiming has to see every workspace's jobs — the queue is one
+// queue, ordered by run_at globally — so it runs on the PLATFORM handle. Doing the
+// work has to see exactly one workspace, so it runs on ForWorkspace(job's id) with
+// that workspace's mailer and webhook secret. Running the work on the platform
+// handle would read across tenants; running the claim on a bound handle would claim
+// only one tenant's jobs and starve the rest.
+type TenantDeps struct {
+	DB      *db.DB
+	Mailer  mailer.Mailer
+	Webhook *webhook.Service
+}
+
 // Worker polls the jobs table and processes pending jobs (webhooks, reminders).
 type Worker struct {
+	// db is the PLATFORM handle: the claim loop, the reaper and the housekeeping
+	// sweeps all run across every workspace through it.
 	db         *db.DB
 	svc        *webhook.Service
 	mailer     mailer.Mailer
 	logger     *slog.Logger
 	httpClient *http.Client
-	handlers   map[string]func(context.Context, string) error // custom job types (e.g. notetaker)
+	handlers   map[string]func(context.Context, string, string) error // custom job types; (workspaceID, payload)
+	tenant     func(workspaceID string) TenantDeps
 	done       chan struct{}
 }
 
 // RegisterHandler registers a processor for a custom job type whose logic lives outside this
 // package (e.g. the notetaker jobs in the handler package, which need LLM/S3/encKey). Call before
 // Run; processJob falls back to these for any type it doesn't handle natively.
-func (w *Worker) RegisterHandler(typ string, fn func(context.Context, string) error) {
+//
+// The handler receives the claimed job's workspace id as well as its payload, so
+// it can bind its own database handle and per-tenant clients. In single-tenant mode
+// the id is "default".
+func (w *Worker) RegisterHandler(typ string, fn func(ctx context.Context, workspaceID, payload string) error) {
 	w.handlers[typ] = fn
 }
 
@@ -47,9 +71,17 @@ func WithHTTPClient(c *http.Client) func(*Worker) {
 	return func(w *Worker) { w.httpClient = c }
 }
 
-// WithMailer configures the mailer used to send reminder emails.
+// WithMailer configures the mailer used to send reminder emails. In multi-tenant
+// mode it is only the fallback: WithTenantResolver's mailer wins.
 func WithMailer(m mailer.Mailer) func(*Worker) {
 	return func(w *Worker) { w.mailer = m }
+}
+
+// WithTenantResolver supplies the per-workspace dependencies a claimed job is
+// processed with. Unset — single-tenant mode — every job is processed with the one
+// handle and the one mailer the Worker was built with, exactly as before.
+func WithTenantResolver(fn func(workspaceID string) TenantDeps) func(*Worker) {
+	return func(w *Worker) { w.tenant = fn }
 }
 
 func New(db *db.DB, svc *webhook.Service, logger *slog.Logger, opts ...func(*Worker)) *Worker {
@@ -58,7 +90,7 @@ func New(db *db.DB, svc *webhook.Service, logger *slog.Logger, opts ...func(*Wor
 		svc:      svc,
 		mailer:   &mailer.Noop{},
 		logger:   logger,
-		handlers: map[string]func(context.Context, string) error{},
+		handlers: map[string]func(context.Context, string, string) error{},
 		httpClient: &http.Client{
 			Timeout:   10 * time.Second,
 			Transport: netutil.SafeTransport(logger, "worker: webhook SSRF block"),
@@ -171,8 +203,13 @@ func (w *Worker) Poll(ctx context.Context) {
 		w.logger.Error("worker: reaper: fail exhausted", "error", err)
 	}
 
+	// ⛔ No workspace predicate, deliberately. This is ONE queue ordered by run_at
+	// across every tenant, which is why it runs on the platform handle and why
+	// migration 00060 keeps a workspace-free idx_jobs_pending_global alongside the
+	// workspace-leading one. A bound handle here would serve one tenant and starve
+	// the rest.
 	rows, err := w.db.QueryContext(ctx, `
-		SELECT id, type, payload, attempts, max_attempts
+		SELECT id, workspace_id, type, payload, attempts, max_attempts
 		FROM jobs
 		WHERE status = 'pending' AND run_at <= ?
 		LIMIT 10`, now)
@@ -182,13 +219,13 @@ func (w *Worker) Poll(ctx context.Context) {
 	}
 
 	type job struct {
-		id, typ, payload      string
-		attempts, maxAttempts int
+		id, workspaceID, typ, payload string
+		attempts, maxAttempts         int
 	}
 	var jobs []job
 	for rows.Next() {
 		var j job
-		if err := rows.Scan(&j.id, &j.typ, &j.payload, &j.attempts, &j.maxAttempts); err != nil {
+		if err := rows.Scan(&j.id, &j.workspaceID, &j.typ, &j.payload, &j.attempts, &j.maxAttempts); err != nil {
 			w.logger.Error("worker: scan job", "error", err)
 			continue
 		}
@@ -211,8 +248,8 @@ func (w *Worker) Poll(ctx context.Context) {
 		}
 		j.attempts++
 
-		if err := w.processJob(ctx, j.typ, j.payload); err != nil {
-			w.logger.Error("worker: process job", "error", err, "job_id", j.id, "type", j.typ)
+		if err := w.processJob(ctx, j.workspaceID, j.typ, j.payload); err != nil {
+			w.logger.Error("worker: process job", "error", err, "job_id", j.id, "type", j.typ, "workspace", j.workspaceID)
 			if j.attempts >= j.maxAttempts {
 				if _, uerr := w.db.ExecContext(ctx,
 					`UPDATE jobs SET status = 'failed', last_error = ? WHERE id = ?`,
@@ -242,21 +279,42 @@ func backoff(attempt int) time.Duration {
 	return 5 * time.Minute
 }
 
-func (w *Worker) processJob(ctx context.Context, typ, payload string) error {
-	if fn, ok := w.handlers[typ]; ok {
-		return fn(ctx, payload)
+// depsFor returns the dependencies a job of workspaceID is processed with. Without
+// a resolver — single-tenant mode — it is the Worker's own handle and mailer, so
+// nothing changes.
+func (w *Worker) depsFor(workspaceID string) TenantDeps {
+	if w.tenant == nil {
+		return TenantDeps{DB: w.db, Mailer: w.mailer, Webhook: w.svc}
 	}
+	d := w.tenant(workspaceID)
+	if d.DB == nil {
+		d.DB = w.db
+	}
+	if d.Mailer == nil {
+		d.Mailer = w.mailer
+	}
+	if d.Webhook == nil {
+		d.Webhook = w.svc
+	}
+	return d
+}
+
+func (w *Worker) processJob(ctx context.Context, workspaceID, typ, payload string) error {
+	if fn, ok := w.handlers[typ]; ok {
+		return fn(ctx, workspaceID, payload)
+	}
+	deps := w.depsFor(workspaceID)
 	switch typ {
 	case "webhook.deliver":
-		return w.deliverWebhook(ctx, payload)
+		return w.deliverWebhook(ctx, deps, payload)
 	case "reminder.send":
-		return w.sendReminder(ctx, payload)
+		return w.sendReminder(ctx, deps, payload)
 	default:
 		return fmt.Errorf("worker: unknown job type %q", typ)
 	}
 }
 
-func (w *Worker) sendReminder(ctx context.Context, payload string) error {
+func (w *Worker) sendReminder(ctx context.Context, deps TenantDeps, payload string) error {
 	var p struct {
 		BookingID string `json:"booking_id"`
 	}
@@ -272,7 +330,7 @@ func (w *Worker) sendReminder(ctx context.Context, payload string) error {
 	var startAt, endAt, status string
 	var locVal, msgReminder, subjReminder sql.NullString
 	var notifyReminder int
-	err := w.db.QueryRowContext(ctx, `
+	err := deps.DB.QueryRowContext(ctx, `
 		SELECT b.status, b.start_at, b.end_at, b.location_value,
 		       et.name, et.slug, et.msg_reminder, et.subj_reminder,
 		       u.name, u.email, COALESCE(u.notify_reminder, 1)
@@ -315,7 +373,7 @@ func (w *Worker) sendReminder(ctx context.Context, payload string) error {
 
 	// Load organizer attendee.
 	var locale string
-	orgErr := w.db.QueryRowContext(ctx, `
+	orgErr := deps.DB.QueryRowContext(ctx, `
 		SELECT name, email, iana_timezone, locale
 		FROM booking_attendees WHERE booking_id = ? AND is_organizer = 1`, p.BookingID).
 		Scan(&d.OrganizerName, &d.OrganizerEmail, &d.OrganizerTimezone, &locale)
@@ -328,17 +386,17 @@ func (w *Worker) sendReminder(ctx context.Context, payload string) error {
 	d.Locale = i18n.Get(locale)
 
 	// Brand the reminder email with the instance wordmark/logo.
-	_ = w.db.QueryRowContext(ctx, `
+	_ = deps.DB.QueryRowContext(ctx, `
 		SELECT COALESCE(business_name,''), COALESCE(logo_url,'')
 		FROM server_settings WHERE id = 1`).Scan(&d.BrandName, &d.LogoURL)
 
-	if err := mailer.SendReminder(ctx, w.mailer, d); err != nil {
+	if err := mailer.SendReminder(ctx, deps.Mailer, d); err != nil {
 		return fmt.Errorf("worker: reminder: send: %w", err)
 	}
 	return nil
 }
 
-func (w *Worker) deliverWebhook(ctx context.Context, jobPayload string) error {
+func (w *Worker) deliverWebhook(ctx context.Context, deps TenantDeps, jobPayload string) error {
 	var p struct {
 		WebhookDeliveryID string `json:"webhook_delivery_id"`
 	}
@@ -352,7 +410,7 @@ func (w *Worker) deliverWebhook(ctx context.Context, jobPayload string) error {
 		webhookURL      string
 		secretEnc       string
 	)
-	err := w.db.QueryRowContext(ctx, `
+	err := deps.DB.QueryRowContext(ctx, `
 		SELECT d.payload, d.event, wh.url, wh.secret_enc
 		FROM webhook_deliveries d
 		JOIN webhooks wh ON wh.id = d.webhook_id
@@ -365,7 +423,7 @@ func (w *Worker) deliverWebhook(ctx context.Context, jobPayload string) error {
 		return fmt.Errorf("worker: fetch delivery: %w", err)
 	}
 
-	secret, err := w.svc.DecryptSecret(secretEnc)
+	secret, err := deps.Webhook.DecryptSecret(secretEnc)
 	if err != nil {
 		return fmt.Errorf("worker: decrypt secret: %w", err)
 	}
@@ -386,7 +444,7 @@ func (w *Worker) deliverWebhook(ctx context.Context, jobPayload string) error {
 	resp, err := w.httpClient.Do(req)
 	now := time.Now().UTC().Format(time.RFC3339)
 	if err != nil {
-		if _, uerr := w.db.ExecContext(ctx, `
+		if _, uerr := deps.DB.ExecContext(ctx, `
 			UPDATE webhook_deliveries
 			SET status = 'failed', attempt_count = attempt_count + 1, last_attempted_at = ?
 			WHERE id = ?`, now, p.WebhookDeliveryID); uerr != nil {
@@ -404,7 +462,7 @@ func (w *Worker) deliverWebhook(ctx context.Context, jobPayload string) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		status = "failed"
 	}
-	if _, uerr := w.db.ExecContext(ctx, `
+	if _, uerr := deps.DB.ExecContext(ctx, `
 		UPDATE webhook_deliveries
 		SET status = ?, response_status = ?, attempt_count = attempt_count + 1, last_attempted_at = ?
 		WHERE id = ?`, status, resp.StatusCode, now, p.WebhookDeliveryID); uerr != nil {
