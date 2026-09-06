@@ -40,3 +40,15 @@ func (l *Live) IsEnabled() bool {
 	l.mu.RUnlock()
 	return !noop
 }
+
+// From delegates to the current transport, so a Live-wrapped mailer answers the
+// same question its target does. Empty when the target has no sender (Noop).
+func (l *Live) From() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	type fromer interface{ From() string }
+	if f, ok := l.current.(fromer); ok {
+		return f.From()
+	}
+	return ""
+}

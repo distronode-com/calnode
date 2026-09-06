@@ -1052,3 +1052,95 @@ token, by design — it is a booker-facing page, not an API. The isolation was
 working; the assertion was wrong. It now asserts on content (none of B's booking
 id, host name or attendee address appears). A status-code assertion against a
 surface that renders its own errors proves nothing.
+
+## Boundary 4 — per-tenant runtime state — DONE (with one documented gap)
+
+Five Set/get singleton pairs on `shared`, each behind its own `sync.RWMutex`,
+became five `*tenantCache[T]`: **mailer, LLM, Zoom, Stripe, LiveKit**. Each value
+is built lazily from **that workspace's** `server_settings` row through the
+**bound** handle, and replaced when that workspace saves. The settings-save
+handlers needed **no edit**: they already call `SetX(...)` after writing, and
+`SetX` now writes at `h.cacheKey()`, so a save on a credential-scoped handler
+primes its own key and nobody else's.
+
+`internal/handler/tenantcache.go` is 90 lines and generic. Three things in it are
+deliberate:
+
+- **The key is `""` in single-tenant mode, not `"default"`.** One entry, built on
+  first ask, replaced by `SetX` exactly as before — so the map cannot grow past
+  one and nothing that calls `ForWorkspace` can make it.
+- **`present` is separate from `entries`, because nil is a MEANINGFUL value.** A
+  workspace with no Stripe credentials caches a nil `*stripe.Client`; if absence
+  and nil were the same thing, every request would rebuild it. A test pins that a
+  read after `SetStripe(nil)` does not grow the cache.
+- **The builder runs OUTSIDE the lock**, because every builder reads
+  `server_settings` — holding the write lock across a round trip would serialise
+  every tenant behind the slowest. The cost is that two concurrent
+  first-requests may both build; the first store wins and the loser is discarded.
+  Clients are stateless value wrappers, so that is waste, not incorrectness, and
+  `TestTenantCache_getBuildsOnceUnderContention` asserts all 32 callers get **one
+  value** (measured: 32 gets, 1 builder).
+
+### `mailer.From()` is new, and it is what makes the assertion possible
+
+The sender address is the only per-workspace value a built mailer exposes from
+outside, so `*SMTP`, `*Resend` and `*Live` (delegating) gained a `From()`.
+Without it the test could only assert that two mailers are different pointers,
+which a shared cache would also satisfy.
+
+### The negative control lives in the tree
+
+`TestTenantCache_keyIsWhatSeparatesThem` builds the same two mailers twice: once
+under the real keys, once under a key stubbed to `""`. Both halves are asserted,
+so the test fails if the real keys collide **and** if the stubbed key does not:
+
+```
+tenantcache_test.go:143: key stubbed to "": B would send as "bookings@acme.example" instead of "hello@globex.example"
+```
+
+That is the bug in one line — B's booking confirmations going out as A.
+
+### ⛔ A single handle cannot tell two workspaces apart, and the first draft of these tests did not
+
+`db.ForWorkspace` is the **identity function** on a handle that did not come from
+`OpenPair`, so every "scoped" copy read the same rows and the first version of
+this file compared a value with itself — it failed as
+`mailer *mailer.Noop exposes no From address`, which reads like a builder bug
+rather than a harness one. The four workspace-distinguishing cases now take a real
+pair through `dbtest.RequireTenantPair` and skip loudly on SQLite; the two
+pure-cache cases (`singleTenantKeepsOneEntry`, `getBuildsOnceUnderContention`) do
+not need one and run on both lanes.
+
+### ⚠️ The gap: the calendar Service is still a process-wide singleton
+
+`getCal` is unchanged. This is a scope decision, stated rather than hidden:
+
+- The `calendar.Service` is a registry of **providers** keyed by the instance's
+  Google/Microsoft OAuth **app** credentials, and D7 keeps `googleAuth` /
+  `microsoftAuth` platform-level. So the thing being cached is not obviously
+  per-tenant in the way an SMTP transport is.
+- Each provider (`gcal.New`, `microsoft.New`, `caldav.New`) **captures a `*db.DB`
+  at construction**. Making the Service per-tenant needs a `ForDB` on the Service
+  and on all three providers, plus the config plumbing to rebuild them per
+  workspace — more than this boundary.
+- **What that means today, measured against the design rather than guessed:** on a
+  multi-tenant instance the captured handle is the **unbound** application handle,
+  which under the policies matches no row. So calendar reads return nothing and
+  the integration is **inert**, not cross-tenant. That is the safe failure, but it
+  is a failure: a multi-tenant deployment has no working calendar sync until this
+  is finished. It belongs with B5, which touches the reconciler anyway.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+All seven cases pass **under `-race`** on the PostgreSQL lane:
+
+```
+--- PASS: TestTenantCache_mailerIsPerWorkspace (1.11s)
+--- PASS: TestTenantCache_keyIsWhatSeparatesThem (1.14s)
+--- PASS: TestTenantCache_saveInvalidatesOnlyThatWorkspace (1.14s)
+--- PASS: TestTenantCache_singleTenantKeepsOneEntry (0.78s)
+--- PASS: TestTenantCache_concurrentWorkspaces (1.33s)
+--- PASS: TestTenantCache_getBuildsOnceUnderContention (0.00s)
+--- PASS: TestTenantCache_llmAndStripeBuildFromTheirOwnRow (1.11s)
+```

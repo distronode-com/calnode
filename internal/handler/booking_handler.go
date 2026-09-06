@@ -1097,7 +1097,7 @@ func (h *Handler) createHostEventsAndNotify(ctx context.Context, b *booking.Book
 			if livekitHostURL != "" {
 				hd.LocationValue = livekitHostURL // host email gets the controls-enabled link
 			}
-			if err := mailer.SendConfirmationToHost(ctx, h.mailer, hd); err != nil {
+			if err := mailer.SendConfirmationToHost(ctx, h.getMailer(), hd); err != nil {
 				h.logger.Error("booking confirmation email (host)", "error", err, "booking_id", b.ID, "host", host.UserID)
 			}
 		}
@@ -1162,7 +1162,7 @@ func (h *Handler) dispatchBookingConfirmation(b *booking.Booking, in bookingConf
 	bData.AttachICS = h.noConnectedDestination(ctx, b.HostID)
 	bData.ICSSequence = int(b.UpdatedAt.Unix())
 	if primaryPrefs.NotifyConfirmation {
-		if err := mailer.SendConfirmationToAttendee(ctx, h.mailer, bData); err != nil {
+		if err := mailer.SendConfirmationToAttendee(ctx, h.getMailer(), bData); err != nil {
 			h.logger.Error("booking confirmation email (attendee)", "error", err, "booking_id", b.ID)
 		}
 	}
@@ -1575,7 +1575,7 @@ func (h *Handler) cancelSideEffects(b booking.Booking) {
 		}
 		if prefs.NotifyHostCancel {
 			hd := h.hostBookingData(ctx, d, host, b.UpdatedAt)
-			if err := mailer.SendCancellationToHost(ctx, h.mailer, hd); err != nil {
+			if err := mailer.SendCancellationToHost(ctx, h.getMailer(), hd); err != nil {
 				h.logger.Error("booking cancellation email (host)", "error", err, "booking_id", b.ID, "host", host.UserID)
 			}
 		}
@@ -1583,7 +1583,7 @@ func (h *Handler) cancelSideEffects(b booking.Booking) {
 	d.AttachICS = h.noConnectedDestination(ctx, b.HostID)
 	d.ICSSequence = int(b.UpdatedAt.Unix())
 	if primaryPrefs.NotifyCancellation {
-		if err := mailer.SendCancellationToAttendee(ctx, h.mailer, d); err != nil {
+		if err := mailer.SendCancellationToAttendee(ctx, h.getMailer(), d); err != nil {
 			h.logger.Error("booking cancellation email (attendee)", "error", err, "booking_id", b.ID)
 		}
 	}

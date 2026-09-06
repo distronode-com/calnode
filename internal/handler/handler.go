@@ -46,9 +46,7 @@ type Handler struct {
 // SetLiveKit swaps the active LiveKit client (nil disables built-in video rooms).
 // Hot-reloadable from the LiveKit settings page.
 func (h *Handler) SetLiveKit(c *livekit.Client) {
-	h.livekitMu.Lock()
-	h.livekit = c
-	h.livekitMu.Unlock()
+	h.livekitCache.set(h.cacheKey(), c)
 	// Self-heal: any recording still 'active' is an orphan from before this restart (its egress
 	// is no longer tracked), and would otherwise block the idempotent guard on its room forever.
 	if c != nil {
@@ -60,66 +58,132 @@ func (h *Handler) SetLiveKit(c *livekit.Client) {
 	}
 }
 
-// getLiveKit returns the active LiveKit client, or nil when video is unconfigured.
+// getLiveKit returns this workspace's LiveKit client, or nil when video is
+// unconfigured for it. Built lazily from the workspace's own settings row.
 func (h *Handler) getLiveKit() *livekit.Client {
-	h.livekitMu.RLock()
-	defer h.livekitMu.RUnlock()
-	return h.livekit
+	return h.livekitCache.get(h.cacheKey(), func() *livekit.Client {
+		cfg, err := LoadLiveKitSettingsFromDB(h.db, h.encKey)
+		if err != nil {
+			h.logger.Warn("livekit: could not load settings", "workspace", h.cacheKey(), "error", err)
+			return nil
+		}
+		if cfg == nil {
+			return nil
+		}
+		return livekit.New(cfg.URL, cfg.APIKey, cfg.APISecret, h.encKey)
+	})
 }
 
 // SetStripe swaps the active Stripe client (nil disables paid bookings). Hot-reloadable
 // from the Payments settings page.
 func (h *Handler) SetStripe(c *stripe.Client) {
-	h.stripeMu.Lock()
-	h.stripe = c
-	h.stripeMu.Unlock()
+	h.stripeCache.set(h.cacheKey(), c)
 }
 
-// getStripe returns the active Stripe client, or nil when payments are unconfigured.
+// getStripe returns this workspace's Stripe client, or nil when payments are
+// unconfigured for it.
 func (h *Handler) getStripe() *stripe.Client {
-	h.stripeMu.RLock()
-	defer h.stripeMu.RUnlock()
-	return h.stripe
+	return h.stripeCache.get(h.cacheKey(), func() *stripe.Client {
+		cfg, err := LoadStripeSettingsFromDB(h.db, h.encKey)
+		if err != nil {
+			h.logger.Warn("stripe: could not load settings", "workspace", h.cacheKey(), "error", err)
+			return nil
+		}
+		if cfg == nil {
+			return nil
+		}
+		sc, err := stripe.New(cfg.SecretKey, cfg.PublishableKey, cfg.WebhookSecret)
+		if err != nil {
+			h.logger.Warn("stripe: init failed", "workspace", h.cacheKey(), "error", err)
+			return nil
+		}
+		return sc
+	})
 }
 
 // SetZoom swaps the active Zoom client (nil disables Zoom auto-minting). Hot-reloadable
 // from the Zoom settings page.
 func (h *Handler) SetZoom(c *zoom.Client) {
-	h.zoomMu.Lock()
-	h.zoom = c
-	h.zoomMu.Unlock()
+	h.zoomCache.set(h.cacheKey(), c)
 }
 
-// getZoom returns the active Zoom client, or nil when no Zoom app is configured.
+// getZoom returns this workspace's Zoom client, or nil when it has no Zoom app.
+//
+// zoom.New captures the handle it is given, so it gets h.db — the BOUND one —
+// and the per-host tokens it later reads are this workspace's.
 func (h *Handler) getZoom() *zoom.Client {
-	h.zoomMu.RLock()
-	defer h.zoomMu.RUnlock()
-	return h.zoom
+	return h.zoomCache.get(h.cacheKey(), func() *zoom.Client {
+		cfg, err := LoadZoomSettingsFromDB(h.db, h.encKey)
+		if err != nil {
+			h.logger.Warn("zoom: could not load settings", "workspace", h.cacheKey(), "error", err)
+			return nil
+		}
+		if cfg == nil || cfg.ClientID == "" || cfg.ClientSecret == "" {
+			return nil
+		}
+		zc, err := zoom.New(h.db, cfg.ClientID, cfg.ClientSecret, h.baseURL+"/v1/zoom/callback", hex.EncodeToString(h.encKey[:]))
+		if err != nil {
+			h.logger.Warn("zoom: init failed", "workspace", h.cacheKey(), "error", err)
+			return nil
+		}
+		return zc
+	})
 }
 
 // SetLLM swaps the active LLM client (nil disables AI features). Hot-reloadable from
 // the settings page.
 func (h *Handler) SetLLM(c *llm.Client) {
-	h.llmMu.Lock()
-	h.llm = c
-	h.llmMu.Unlock()
+	h.llmCache.set(h.cacheKey(), c)
 }
 
-// getLLM returns the active LLM client, or nil when AI is off — callers MUST nil-check
-// and fall back to the deterministic path.
+// getLLM returns this workspace's LLM client, or nil when AI is off for it —
+// callers MUST nil-check and fall back to the deterministic path.
 func (h *Handler) getLLM() *llm.Client {
-	h.llmMu.RLock()
-	defer h.llmMu.RUnlock()
-	return h.llm
+	return h.llmCache.get(h.cacheKey(), func() *llm.Client {
+		cfg, err := LoadLLMSettingsFromDB(h.db, h.encKey)
+		if err != nil {
+			h.logger.Warn("llm: could not load settings", "workspace", h.cacheKey(), "error", err)
+			return nil
+		}
+		if cfg == nil || !cfg.Enabled || cfg.Endpoint == "" {
+			return nil
+		}
+		return llm.New(llm.Config{Endpoint: cfg.Endpoint, Model: cfg.Model, APIKey: cfg.APIKey})
+	})
+}
+
+// getMailer returns this workspace's mailer.
+//
+// In single-tenant mode the entry is the process-wide *mailer.Live that boot
+// installed, so nothing changes. In multi-tenant mode each workspace's transport
+// is chosen by BuildMailer from its OWN settings row — which is what keeps one
+// tenant's SMTP credentials and From address out of another's email.
+func (h *Handler) getMailer() mailer.Mailer {
+	return h.mailerCache.get(h.cacheKey(), func() mailer.Mailer {
+		cfg, err := LoadEmailSettingsFromDB(h.db, h.encKey)
+		if err != nil {
+			h.logger.Warn("mailer: could not load settings", "workspace", h.cacheKey(), "error", err)
+			return &mailer.Noop{}
+		}
+		if cfg == nil {
+			return &mailer.Noop{}
+		}
+		m, _ := BuildMailer(*cfg)
+		return m
+	})
 }
 
 func New(database *db.DB, logger *slog.Logger) *Handler {
 	whs, _ := webhook.New(database, "") // ephemeral key when no encryption key configured
 	return &Handler{
 		shared: &shared{
-			logger:   logger,
-			mailer:   &mailer.Noop{},
-			calNudge: make(chan struct{}, 1),
+			logger:       logger,
+			calNudge:     make(chan struct{}, 1),
+			mailerCache:  newTenantCache[mailer.Mailer](),
+			llmCache:     newTenantCache[*llm.Client](),
+			zoomCache:    newTenantCache[*zoom.Client](),
+			stripeCache:  newTenantCache[*stripe.Client](),
+			livekitCache: newTenantCache[*livekit.Client](),
 		},
 		db:         database,
 		ws:         DefaultWorkspace,
@@ -131,7 +195,7 @@ func New(database *db.DB, logger *slog.Logger) *Handler {
 // SetMailer configures the email sender and the base URL used in email links.
 // If m is a *mailer.Live, it is also stored as h.live for hot-swap support.
 func (h *Handler) SetMailer(m mailer.Mailer, baseURL string) {
-	h.mailer = m
+	h.mailerCache.set(h.cacheKey(), m)
 	h.baseURL = baseURL
 	if l, ok := m.(*mailer.Live); ok {
 		h.live = l
@@ -250,8 +314,9 @@ func (h *Handler) isEmailEnabled() bool {
 	if h.live != nil {
 		return h.live.IsEnabled()
 	}
-	// Fallback for tests that inject a direct stub mailer (not wrapped in Live).
-	_, isNoop := h.mailer.(*mailer.Noop)
+	// Fallback for tests that inject a direct stub mailer (not wrapped in Live),
+	// and the multi-tenant path, where each workspace has its own.
+	_, isNoop := h.getMailer().(*mailer.Noop)
 	return !isNoop
 }
 

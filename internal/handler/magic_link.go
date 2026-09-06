@@ -72,8 +72,8 @@ func (h *Handler) sendMagicLink(ctx context.Context, userID, email string) {
 	}
 
 	link := h.baseURL + "/v1/auth/magic-link/verify?token=" + raw
-	if h.mailer != nil {
-		if err := h.mailer.Send(ctx, magicLinkMessage(email, link)); err != nil {
+	if h.getMailer() != nil {
+		if err := h.getMailer().Send(ctx, magicLinkMessage(email, link)); err != nil {
 			h.logger.ErrorContext(ctx, "magic link: send email", "error", err, "user_id", userID)
 		}
 	}

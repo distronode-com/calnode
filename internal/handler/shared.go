@@ -32,10 +32,27 @@ import (
 // `h.livekitMu` and the rest compiling unchanged across the package.
 type shared struct {
 	logger *slog.Logger
-	mailer mailer.Mailer
 	live   *mailer.Live // non-nil in production; nil in tests using a direct stub
 	encKey [32]byte     // AES-256 key for encrypting secrets stored in the DB
 
+	// The per-workspace runtime state (D7). Each is built lazily from THAT
+	// workspace's server_settings row through the bound handle, and replaced when
+	// that workspace saves its settings. One entry keyed "" in single-tenant mode.
+	mailerCache  *tenantCache[mailer.Mailer]
+	llmCache     *tenantCache[*llm.Client]
+	zoomCache    *tenantCache[*zoom.Client]
+	stripeCache  *tenantCache[*stripe.Client]
+	livekitCache *tenantCache[*livekit.Client]
+
+	// ⚠️ cal is STILL a process-wide singleton, and this is a documented gap
+	// rather than an oversight. The calendar Service is a registry of PROVIDERS
+	// keyed by the instance's Google/Microsoft OAuth app, which D7 keeps
+	// platform-level, and each provider captures a *db.DB at construction. Making
+	// it per-tenant needs a ForDB on the Service and on all three providers plus
+	// the config plumbing to build them per workspace; until then, on a
+	// multi-tenant instance the captured handle is unbound, so calendar reads
+	// return nothing and the integration is INERT rather than cross-tenant. See
+	// PROGRESS.md.
 	calMu    sync.RWMutex
 	cal      *calendar.Service
 	calNudge chan struct{} // buffered(1): wakes the calendar reconciler after a failed inline op
@@ -48,18 +65,6 @@ type shared struct {
 	googleAuth    *oauth2.Config
 	microsoftAuth *oauth2.Config
 	secureCookie  bool
-
-	llmMu sync.RWMutex
-	llm   *llm.Client // nil when the optional LLM layer is off/unconfigured
-
-	zoomMu sync.RWMutex
-	zoom   *zoom.Client // nil when no Zoom app is configured
-
-	stripeMu sync.RWMutex
-	stripe   *stripe.Client // nil when payments are unconfigured
-
-	livekitMu sync.RWMutex
-	livekit   *livekit.Client // nil when LiveKit video is unconfigured
 
 	demoMode          bool // true on the public demo instance: disables calendar/Zoom connect
 	demoResetInterval time.Duration

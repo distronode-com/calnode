@@ -207,12 +207,12 @@ func (h *Handler) ReassignBooking(w http.ResponseWriter, r *http.Request) {
 
 		prefs := h.hostPrefsOrDefault(ctx, bCopy.ID, newHostID)
 		if prefs.NotifyConfirmation {
-			if err := mailer.SendConfirmationToAttendee(ctx, h.mailer, d); err != nil {
+			if err := mailer.SendConfirmationToAttendee(ctx, h.getMailer(), d); err != nil {
 				h.logger.Error("reassign: email attendee", "error", err, "booking_id", bCopy.ID)
 			}
 		}
 		if prefs.NotifyHostBooking {
-			if err := mailer.SendConfirmationToHost(ctx, h.mailer, d); err != nil {
+			if err := mailer.SendConfirmationToHost(ctx, h.getMailer(), d); err != nil {
 				h.logger.Error("reassign: email new host", "error", err, "booking_id", bCopy.ID)
 			}
 		}

@@ -111,7 +111,7 @@ func (h *Handler) SendTestEmail(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if err := h.mailer.Send(r.Context(), mailer.Message{
+	if err := h.getMailer().Send(r.Context(), mailer.Message{
 		To:      []string{user.Email},
 		Subject: "[TEST] " + subject,
 		Text:    body,

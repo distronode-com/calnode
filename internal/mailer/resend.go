@@ -163,3 +163,6 @@ func resendErrorDetail(body io.Reader) string {
 	}
 	return string(raw)
 }
+
+// From returns the envelope sender this transport was built with. See SMTP.From.
+func (r *Resend) From() string { return r.from }

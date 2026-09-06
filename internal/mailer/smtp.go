@@ -277,3 +277,10 @@ func base64Wrap(b []byte) string {
 	sb.WriteString(enc)
 	return sb.String()
 }
+
+// From returns the envelope sender this transport was built with.
+//
+// It exists because the sender is the only per-workspace value a built mailer
+// exposes from outside, and multi-tenant mode has to be able to assert that one
+// workspace's transport is not another's (internal/handler/tenantcache_test.go).
+func (s *SMTP) From() string { return s.from }

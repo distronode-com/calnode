@@ -103,7 +103,7 @@ func (h *Handler) issueInvite(ctx context.Context, email, adminName, adminID str
 
 	inviteURL = h.baseURL + "/admin/invite/" + token
 	if h.isEmailEnabled() {
-		_ = h.mailer.Send(ctx, mailer.Message{
+		_ = h.getMailer().Send(ctx, mailer.Message{
 			To:      []string{email},
 			Subject: "You've been invited to Calnode",
 			Text: "You've been invited to join Calnode by " + adminName + ".\n\n" +

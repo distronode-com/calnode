@@ -297,12 +297,12 @@ func (h *Handler) rescheduleSideEffects(bCopy booking.Booking, capturedEtID stri
 		d.SubjectOverride = subjNote.String
 	}
 	if prefs.NotifyReschedule {
-		if err := mailer.SendRescheduleToAttendee(ctx, h.mailer, d); err != nil {
+		if err := mailer.SendRescheduleToAttendee(ctx, h.getMailer(), d); err != nil {
 			h.logger.Error("reschedule email (attendee)", "error", err, "booking_id", bCopy.ID)
 		}
 	}
 	if prefs.NotifyHostReschedule {
-		if err := mailer.SendRescheduleToHost(ctx, h.mailer, d); err != nil {
+		if err := mailer.SendRescheduleToHost(ctx, h.getMailer(), d); err != nil {
 			h.logger.Error("reschedule email (host)", "error", err, "booking_id", bCopy.ID)
 		}
 	}
