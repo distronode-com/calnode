@@ -46,7 +46,48 @@ func (h *Handler) nudgeCalendarReconcile() {
 	}
 }
 
+// reconcileCalendar runs one pass per workspace.
+//
+// ⛔ The enumeration is on the PLATFORM handle and the passes are on bound ones.
+// Every query in a pass reads bookings, booking_hosts and calendar_connections,
+// which are tenant tables: one pass on the platform handle would reconcile every
+// workspace's bookings against whichever workspace's calendar connections it
+// happened to resolve, and one pass on the unbound application handle would read
+// nothing at all and heal nothing, silently. Before this, on a multi-tenant
+// instance, it was the second of those.
 func (h *Handler) reconcileCalendar() {
+	for _, scoped := range h.reconcileTargets() {
+		scoped.reconcileCalendarPass()
+	}
+}
+
+// reconcileTargets returns one handler per workspace a pass should run for.
+//
+// Suspended workspaces are skipped: a suspended tenant answers 503 on its public
+// and admin surfaces (D12), and healing its calendar in the background would be
+// doing work on its behalf that it cannot see or stop.
+func (h *Handler) reconcileTargets() []*Handler {
+	if !h.multiTenant {
+		return []*Handler{h}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	ids, err := h.activeWorkspaceIDs(ctx)
+	if err != nil {
+		h.logger.Error("reconcile: enumerate workspaces", "error", err)
+		return nil
+	}
+	targets := make([]*Handler, 0, len(ids))
+	for _, id := range ids {
+		targets = append(targets, h.forWorkspace(&Workspace{ID: id, Status: "active"}))
+	}
+	return targets
+}
+
+// reconcileCalendarPass is one workspace's sweep. The receiver must already be
+// bound; reconcileCalendar is the only caller.
+func (h *Handler) reconcileCalendarPass() {
 	gc := h.getCal()
 	if gc == nil {
 		return // calendar not configured — nothing to reconcile

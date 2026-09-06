@@ -1340,3 +1340,50 @@ The Stripe hold backstop is the one worth naming, because it **writes**
 `payment_status = 'pending' AND created_at < cutoff`, which is a property of the
 row and not of the tenant, so a global sweep is the right shape. If that ever needs
 to differ per workspace it has to move.
+
+## Boundary 5, part three — the reconciler sweeps per workspace
+
+`reconcileCalendar` is now a dispatcher: `reconcileTargets()` enumerates active
+workspaces on the **platform** handle, and each `reconcileCalendarPass()` runs on a
+handler bound to one of them. `activeWorkspaceIDs` lives beside the other workspace
+reads and filters `status = 'active'` **there** rather than at each call site, so a
+new periodic loop cannot forget.
+
+⛔ Suspended workspaces are skipped, and that is a decision rather than an
+optimisation: a suspended tenant answers 503 on its own public and admin surfaces
+(D12), so healing its calendar in the background would be doing work on its behalf
+that it can neither see nor stop.
+
+Single-tenant short-circuits before the query — one target, the handler itself, no
+round trip per sweep.
+
+### The tests, and what each half proves
+
+`TestReconciler_enumeratesActiveWorkspacesOnly` — three workspaces, one suspended.
+It asserts the target set **and** that each target's handle is bound to the same
+workspace it is labelled with (`target.db.Workspace() == id`), because a target
+list that is right while the handles are wrong would pass a weaker check.
+
+`TestReconciler_healsItsOwnWorkspaceAndSkipsSuspended` — a cancelled booking still
+carrying a calendar event id, in each of an active and a suspended workspace. The
+host has no calendar connection, so `CancelEvent` has nothing to call and the pass
+clears the id without a network. Positive control on the fixture first: both rows
+start stale. After the sweep the active one is cleared and the suspended one is
+byte-identical.
+
+`TestReconciler_theOldShapeHealsNothing` is the negative control — one
+`reconcileCalendarPass()` on the unbound application handle, which is what the
+reconciler was until this commit:
+
+```
+calendar_reconcile_tenancy_test.go:183: negative control: a reconciler pass on the unbound
+application handle healed 0 of 1 diverged bookings, with no error — every stale calendar
+event would stay stale forever
+```
+
+It then runs the fixed sweep over the same fixture and asserts the row IS healed, so
+the difference is demonstrably the binding and not the fixture.
+
+Measured sweep target set with a suspended tenant present:
+`map[acme:true default:true initech:true]` — the suspended `globex` absent, and the
+seeded `default` workspace present because it is active in every migrated database.

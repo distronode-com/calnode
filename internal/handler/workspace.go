@@ -315,6 +315,38 @@ func (h *Handler) workspaceByHost(ctx context.Context, requestHost string) (*Wor
 	return &ws, nil
 }
 
+// activeWorkspaceIDs lists every workspace a background loop should act for, on the
+// platform handle.
+//
+// Suspended workspaces are excluded here rather than at each call site, so a new
+// periodic loop cannot forget. In single-tenant mode it answers with the one
+// workspace, so a caller needs no branch — though reconcileTargets short-circuits
+// before reaching it, to avoid a query per sweep on an instance that has one tenant.
+func (h *Handler) activeWorkspaceIDs(ctx context.Context) ([]string, error) {
+	if !h.multiTenant {
+		return []string{db.DefaultWorkspaceID}, nil
+	}
+	rows, err := h.platformDB().QueryContext(ctx,
+		`SELECT id FROM workspaces WHERE status = 'active' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list active workspaces: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan workspace id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspaces: %w", err)
+	}
+	return ids, nil
+}
+
 // workspaceOfUser resolves the workspace a user belongs to, through the platform
 // handle.
 //
