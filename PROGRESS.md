@@ -1474,5 +1474,253 @@ inside a pass.
 | site | state |
 |---|---|
 | `POST /v1/livekit/webhook` + its alias, `POST /v1/stripe/webhook` | `Platform`-wrapped so they can find the row they name; the processing after that is **not** yet bound. Must resolve the workspace from the room / session and hand off to `forWorkspace` |
-| `/v1/auth/sso` hand-off (D11), `clientIP` rate-limit keys (D14) | blocked on `feat/platform-hooks` |
-| `/metrics` | reads `jobs`; must use `Platform()` at integration |
+| ~~`/v1/auth/sso` hand-off (D11), `clientIP` rate-limit keys (D14)~~ | ✅ **the VERIFY halves landed with the merge below.** What remains of D11 is the MINT half: no OAuth callback issues an SSO token yet, so nothing exercises the endpoint in production. Plan at the end of this file |
+| ~~`/metrics`~~ | ✅ reads `jobs` through `Platform()` |
+
+---
+
+## Integration — `feat/platform-hooks` merged (commit `8a93fad`)
+
+Merged **into** `feat/multi-tenant` with `--no-ff` before B6, because three of that
+branch's four features are things B6 was otherwise going to have to fake: the SSO
+endpoint D11 hands off to, the trusted-proxy client IP D14 keys on, and `/metrics`.
+
+Six conflicted files, ten hunks. The commit message carries the per-file resolution; what
+belongs here is the part that was a **decision** rather than a merge.
+
+### The three new routes, classified
+
+```
+172 routes: 31 host-scoped, 107 credential-scoped, 26 platform, 8 allowlisted
+```
+
+| route | class | why |
+|---|---|---|
+| `GET /metrics` | **Platform** | queue depth is an INSTANCE number. Its `jobs` read goes through `Platform()` inside the handler as well as being registered unscoped — a bound read would report one workspace's backlog as if it were the whole queue, an unbound one zero, and both are wrong in a way a dashboard cannot show you |
+| `GET /v1/auth/sso` | **Platform** | no tenant Host and no credential yet. The TOKEN is the credential and the workspace is its `wid` claim |
+| `POST /v1/auth/sessions/revoke-all` | **credential-scoped** | whose sessions to cut is a question about one workspace's users. All three of its statements (`users`, `sessions`, `oauth_access_tokens`) are then scoped by the bind, which is what makes a target id from another workspace a 404 rather than a revocation |
+
+⚠️ **The classification gate caught the third one, and the cause is worth knowing:
+`routes_classified_test.go` scans `server.go` LINE BY LINE.** The platform branch had
+written the registration across two lines, so the scanner saw a pattern with an empty
+expression and reported it unclassified. A wrapper on a continuation line is invisible to
+the gate. Every registration in that file is therefore one line, however long.
+
+### `sso_nonces` is EXEMPT, not a tenant table
+
+The migration is renumbered `00059` → **`00061`** in both dirs (00060 is tenancy);
+`knownMigrationCount` 60 → 61.
+
+A jti is **global**. The question the table answers is "has this exact token been spent",
+and the answer must not depend on which workspace the token names — per workspace, the
+same jti could be replayed once per tenant, which is strictly weaker for no benefit. It
+also has no owner at the moment the row is written: the nonce is claimed *before* the
+`wid` claim has been trusted. So it joins `workspaces`, `crypto_keystore`,
+`goose_db_version` and `oauth_clients` in `db.ExemptTables`, and
+`TestTenancy_tableListsCoverTheSchema` is updated with it.
+
+⛔ **The Postgres file declares `expires_at TEXT COLLATE "C"`, and without it the merge
+would have redded a gate nobody was thinking about.** The worker purges the table with a
+lexicographic `expires_at < ?` — exactly what migration 00059 pinned the other 54 TEXT
+timestamps for — and `collation_test.go`'s audit matches by column NAME, so a new `_at`
+column is caught whether or not anyone remembers. `wantTimestampColumns` 56 → 57.
+
+### ⛔ The `wid` claim was documentation, and the merge made it load-bearing
+
+The platform branch parsed `wid` and **deliberately ignored** it ("an instance is a
+single workspace today"). In multi-tenant mode it is now required, validated against
+`db.ValidWorkspaceID`, and read back through the platform handle, so a token naming a
+deleted, suspended or public-host-less workspace is refused instead of seating a user
+nobody can reach. Single-tenant is untouched: `wid` is ignored, `aud` is `BASE_URL`.
+
+**The audience is the WORKSPACE's public host, not `BASE_URL` (D11).** The hand-off exists
+precisely because the identity host cannot set a cookie on a tenant's domain, so the token
+is minted for that domain — and a token for tenant A must not be spendable on tenant B's
+host, which would seat a session on B for a person A vouched for.
+
+**Every statement the endpoint runs now names the workspace**, and this is the finding
+rather than a tidy-up. `/v1/auth/sso` is Platform-wrapped, so `h.db` is the platform
+handle: it bypasses the policies and binds `''`. Since D9 the unique on `users` is
+`(workspace_id, email)`, so one address legitimately exists in several workspaces — and
+an unqualified `WHERE email = ?` resolves an **arbitrary** one of them. It is the
+`reset-admin` hole again, reachable here by anyone holding the shared secret. Same fix
+for `ssoOwnerExists`, which counted owners instance-wide: unscoped, the first SSO user of
+every workspace after the first would silently never be its owner.
+
+`createSessionIn(…, workspaceID)` is how the session names its tenant. An empty
+`workspaceID` keeps the original statement, so the other seven callers — all on handles
+already bound to the request's workspace, where the bind fills the column — are untouched.
+⚠️ It matters beyond bookkeeping: every later request for that user runs on a **bound**
+handle, which could neither read that session nor delete it on logout.
+
+Negative control, the workspace predicate removed from the lookup only:
+
+```
+--- FAIL: TestSSOHandoff_multiTenantLandsInTheTokensWorkspace
+    sso_tenancy_test.go:100: no user shared@example.test in workspace globex: sql: no rows in result set
+```
+
+That is the bug stated exactly: the second workspace's hand-off found the FIRST
+workspace's user by email, so no globex user was ever created — and the session it minted
+pointed at acme's person. `sessions.user_id` is global, so the foreign key would not have
+complained.
+
+### D14 wired, and the two halves pull in opposite directions
+
+`rateLimitKey` is `(workspace host, client IP)` when `SetMultiTenantLimits` is on, the IP
+alone otherwise. Both halves are load-bearing and each is useless without the other:
+
+- **without the workspace**, two tenants' bookers behind one address — a shared office, a
+  corporate NAT, a CDN — share a bucket, so the busier workspace spends the quieter one's
+  allowance. One tenant degrading another's service through no fault of either.
+- **without `TRUSTED_PROXY_CIDRS`**, the "IP" behind a proxy IS the proxy, so adding the
+  workspace prefix would make things WORSE: a whole tenant becomes ONE bucket and its
+  first 20 bookers a minute exhaust it for everyone else in that tenant. The prefix is
+  only safe because `remoteIP` resolves the client's own address when a trusted hop
+  forwarded it. This is why D14 waited for this branch instead of being approximated.
+
+The workspace comes from the **Host**, not from a resolved `*Workspace`: the limiter runs
+before any handler and rejecting a request must not cost a database read. An unrecognised
+host keys on the host string itself, which is the safe direction — a Host-rotating
+attacker gets a bucket per value and spends no real tenant's allowance.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test ./...` **rc=0 on SQLite (30/30)** and **rc=0 on PostgreSQL (30/30)**.
+`go test -race -count=1 ./internal/handler/ ./internal/worker/` rc=0 on PostgreSQL
+(585.5s / 31.8s).
+
+The platform branch's own tests, all PASS on both lanes: `sso_test` (11),
+`session_test` (9 `RevokeAllSessions` cases), `metrics_test` (3),
+`notetaker_settings_test` (2), `trustedproxy_test` (10), `reminder_test` (9 including
+`reminderFiresBookingReminderWebhook` and `reminderWebhookCarriesTheFiringOffset`, which
+is rule 5: the webhook fires from the worker's **bound** per-workspace path through
+`deps.Webhook`, so it is signed with that workspace's secret), `i18n` and `stt`
+(fr-CA and `STT_BASE_URL` need no tenancy change and are confirmed only by building and
+passing).
+
+The tenancy suites still hold with the platform routes in the mux:
+
+```
+--- PASS: TestTenancy_readSurfaces (1.02s)          --- PASS: TestSweep_oauthGrantLandsInTheOwnersWorkspace (0.97s)
+--- PASS: TestTenancy_bookingByIDIsNotFoundAcrossWorkspaces (1.02s)
+--- PASS: TestTenancy_credentialOnTheWrongHostIs403 (1.07s)
+--- PASS: TestTenancy_writeLandsInItsOwnWorkspace (1.17s)
+--- PASS: TestTenancy_mcpToolCallOverHTTP (1.00s)   --- PASS: TestSweep_setupIsRefusedInMultiTenantMode (1.07s)
+--- PASS: TestEveryRouteIsClassified               --- PASS: TestSweep_tenantLocalTokensDoNotResolveAcrossHosts (1.03s)
+--- PASS: TestCredentialScopedRoutesAuthenticateFirst   (107 credential-scoped routes checked)
+--- PASS: TestPlatformRoutesAreTheIdentityHostSet
+```
+
+New multi-tenant cases, running rather than skipping on the PostgreSQL lane:
+
+```
+--- PASS: TestSSOHandoff_multiTenantLandsInTheTokensWorkspace (0.92s)
+--- PASS: TestSSOHandoff_multiTenantRefusesABadWID (3.80s)   [missing, empty, unknown, not an id]
+--- PASS: TestSSOHandoff_multiTenantAudienceIsThePublicHost (2.84s)   [identity host, another tenant, bare hostname]
+--- PASS: TestSSOHandoff_multiTenantRefusesASuspendedWorkspace (1.03s)
+--- PASS: TestRateLimit_workspacesBehindOneProxyDoNotShareABucket (0.00s)
+--- PASS: TestRateLimit_twoBookersOfOneWorkspaceKeepTheirOwnBuckets (0.00s)
+--- PASS: TestRateLimit_singleTenantIgnoresTheHost (0.00s)
+--- PASS: TestRateLimitKey_portIsNotPartOfTheBucket (0.00s)
+```
+
+Negative control, the same PostgreSQL command with the password changed to `wrong` —
+these FAIL rather than skip, which is what says they were really talking to a server:
+
+```
+--- FAIL: TestPostgres_timestampColumnsCollateC
+    failed SASL auth: FATAL: password authentication failed for user "postgres" (SQLSTATE 28P01)
+--- FAIL: TestSSOHandoff_multiTenantLandsInTheTokensWorkspace
+    failed SASL auth: FATAL: password authentication failed for user "postgres" (SQLSTATE 28P01)
+```
+
+### ⚠️ One correction to this file, found while merging
+
+Several notes above (the B3 carry-over list, the sweep's rule, `workspaceOfUser`'s doc)
+say that a write omitting `workspace_id` on a Platform route "lands in `default`,
+silently". That is true of a handle that never sets the parameter at all. It is **not**
+what the platform handle does: `OpenPair` binds `''` before every statement, so
+`current_setting('app.workspace_id', true)` returns the empty string rather than NULL,
+`COALESCE` keeps it, and the row fails the foreign key to `workspaces(id)` with 23503.
+The sweep's own negative control is consistent with this — it failed at "could not issue
+code" rather than by landing a row in `default`, and PROGRESS recorded the mechanism as
+unconfirmed at the time. **The remedy is identical either way** (name `workspace_id`), so
+nothing built on that reasoning is wrong; but "silently lands in `default`" overstates how
+quiet the failure is, and the distinction matters to anyone debugging a 23503 from a
+Platform route. Not corrected in place above, because those notes are the record of what
+was believed when each boundary was written.
+
+## D11, the remaining half — the plan for B6
+
+The verify side is in. What is missing is that **nothing mints an SSO token yet**, so the
+endpoint is unreachable in a real login. Three specifics, so B6 does not re-derive them:
+
+1. **Which callback.** `finishOAuthLogin` in `internal/handler/auth_oauth.go`, the single
+   tail both `CallbackGoogle` and `CallbackMicrosoft` funnel into — it is where
+   `createSession` is called today. In multi-tenant mode it must not set a cookie at all:
+   the callback runs on the identity host (`GET /v1/auth/callback`, Platform), and a
+   cookie for the identity host is no use to a tenant on its own domain. It mints a token
+   and redirects instead. Single-tenant keeps setting the cookie, unchanged.
+
+   ⛔ **And it carries the same hole the SSO endpoint just had, live, today:** its lookup
+   is `SELECT id, archived_at FROM users WHERE email = ?` on the platform handle. For an
+   address that exists in two workspaces that resolves an arbitrary one and starts a
+   session for it. It is not a regression from this merge — it predates the branch — and
+   it cannot be fixed in place, because a Platform route with no `wid` has nothing to
+   scope BY. That is the argument for doing D11's mint half rather than deferring it:
+   until the workspace reaches this function, OAuth login on a multi-tenant instance is
+   guessing.
+
+2. **Which state field carries the workspace.** ⚠️ **Not `EncryptState` — that is a
+   provider-client helper (`internal/zoom`, `internal/caldav`, gcal) for the CONNECT
+   flows, and it encrypts a user id.** The login flow's state is different and simpler:
+   `newOAuthState` mints a 16-byte random nonce, returns it as the `state` URL parameter
+   and sets the same value in the HttpOnly `calnode_oauth_state` cookie; the callback
+   compares the two and consumes the cookie. There is no room in it for a workspace and
+   no signature over it.
+
+   So the workspace goes in the **cookie half**, not the URL half: make the cookie value
+   `<nonce>|<wid>`, keep sending the bare nonce as the `state` parameter, and have the
+   callback split the cookie, compare the nonce, and take the `wid`. The visitor can
+   rewrite the URL parameter, which then simply fails the comparison; the half that is
+   trusted is the half only we ever wrote. `consumeOAuthReturn` (defined in
+   `mcp_oauth_authorize.go`, called from `finishOAuthLogin`) is the precedent: a second
+   piece of callback context riding a cookie rather than a URL.
+
+   The workspace is known at the login START (`GET /v1/auth/login`), from the Host the
+   person clicked "sign in with Google" on. ⚠️ That route is **Platform** today because
+   the callbacks have to be, so B6 must resolve the workspace there explicitly with
+   `workspaceByHost` and 404 an unknown host exactly as `HostWorkspace` would — a resolver
+   cannot do it, or the callback would need a tenant Host it does not have.
+
+3. **How the token is minted.** Reuse `sso.go`'s own claim shape, signed with
+   `CALNODE_SSO_SHARED_SECRET` (HS256, the verifier is deliberately not a JWT library) —
+   ⛔ which means the SSO endpoint must be CONFIGURED for multi-tenant OAuth login to
+   work at all, and `config.Validate` should refuse `MULTI_TENANT` + a Google or Microsoft
+   OAuth app + an empty `CALNODE_SSO_SHARED_SECRET` rather than letting every social login
+   500 at the last step. Claims: `iss` = this instance's `BASE_URL`, `aud` =
+   `https://<ws.public_host>` (what `ssoAudience` checks), `wid` = the state's workspace,
+   `sub` = the verified email from the provider, `name`, `role` = `member` (the OAuth
+   callback is not an authority on roles; `ssoResolveUser` leaves an existing user's role
+   alone and a new one is a member unless an invite said otherwise), `iat`/`exp` = now and
+   now + 30s, `jti` = `uid.New()`. Then
+   `302 https://<ws.public_host>/v1/auth/sso?token=…&next=<destination>`, where
+   `<destination>` is what `finishOAuthLogin` would have redirected to itself: `/admin`,
+   or the `consumeOAuthReturn` value when the login was started by an MCP Connect flow
+   (already validated by `safeLocalPath`, which permits only `/oauth/authorize`).
+   ⚠️ **That second case needs a decision, not a copy.** `/oauth/authorize` is an identity-host
+   endpoint and its consent-step cookies were set there, so sending it to the tenant's public
+   host would arrive with none of them. Either keep the Connect flow's tail on the identity
+   host (mint no token, set the cookie there as today, since an MCP consent is not a
+   booker-facing surface) or hand off first and bounce back — the first is smaller and is
+   what the shape of the rest of D11 suggests.
+   ⚠️ The `next` value must go through `ssoNextPath`'s rules on the way in, not just on
+   the way out, or the redirect the callback builds is an open redirect that happens to be
+   validated one hop later.
+   ⚠️ And the calendar connect callbacks are the same shape but NOT the same fix: they
+   store tokens rather than mint a session, so they need the state's `wid` to write the
+   `calendar_connections` row through `forWorkspace(ws)` and then redirect to that
+   workspace's `/admin/calendar?connected=true` — no SSO token involved.
+
