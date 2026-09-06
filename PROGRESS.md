@@ -2209,6 +2209,30 @@ At boot, in this order: migrate on the platform handle → `EnableRLS` → suspe
 workspace → `VerifyRoles` on the application handle. The first, second and fourth are fatal on
 failure; the third is logged.
 
+## The cost of a tenant, measured (B7)
+
+`internal/server/rss_proof_test.go`, opt-in behind `CALNODE_RSS_PROOF=1`. It provisions 200
+workspaces through the real platform API in one process, serves one request to each on its own
+public host, and reads `/proc/self/status`. A test rather than a script because the number wanted
+is the RSS of a process that has the handler, the caches and the pool in it.
+
+| | VmRSS |
+|---|---|
+| baseline (handler + worker, no tenants) | **28 936 KB** |
+| after provisioning 200 workspaces | **33 676 KB** |
+| after one request to each | **35 860 KB** |
+
+**Growth: 6 924 KB for 200 tenants — 34.6 KB each.** `runtime.MemStats.Sys` 39 354 → 43 722 KB.
+Pool after all of it: application `open=1 idle=1`, platform `open=1 idle=1`.
+
+⛔ **This CORRECTS the plan's claim, which said "a few MB per tenant".** It is a few MB for
+*hundreds*: ~7 MB bought 200 workspaces including their settings rows, owners, keys, webhooks,
+event types and availability. The per-tenant cost is the cache entries plus the workspace row, and
+`ForWorkspace` returning a value over a shared pool is why the connection count does not move —
+200 tenants, one connection each side. The test asserts both: a ceiling of 1 MB per tenant (a
+per-workspace allocation that never came back would breach it) and a ceiling of 20 pool
+connections.
+
 ## The two known follow-ups
 
 1. ⛔ **Per-tenant DEKs.** `crypto_keystore` is exempt and holds one wrapped DEK per process
