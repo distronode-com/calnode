@@ -1965,75 +1965,125 @@ webhooks resolving their workspace from the row they name. D13 and D14 are done.
 
 ---
 
-## D11, the remaining half — the plan for B6
+## Boundary 6, part three — the SSO hand-off and the OAuth login, both halves (D11)
 
-The verify side is in. What is missing is that **nothing mints an SSO token yet**, so the
-endpoint is unreachable in a real login. Three specifics, so B6 does not re-derive them:
+The verify half arrived with the platform-hooks merge; this is the mint half, plus the
+correction that makes the verify half safe on a public host.
 
-1. **Which callback.** `finishOAuthLogin` in `internal/handler/auth_oauth.go`, the single
-   tail both `CallbackGoogle` and `CallbackMicrosoft` funnel into — it is where
-   `createSession` is called today. In multi-tenant mode it must not set a cookie at all:
-   the callback runs on the identity host (`GET /v1/auth/callback`, Platform), and a
-   cookie for the identity host is no use to a tenant on its own domain. It mints a token
-   and redirects instead. Single-tenant keeps setting the cookie, unchanged.
+### ⛔ The workspace comes from the HOST, and `wid` is CHECKED against it
 
-   ⛔ **And it carries the same hole the SSO endpoint just had, live, today:** its lookup
-   is `SELECT id, archived_at FROM users WHERE email = ?` on the platform handle. For an
-   address that exists in two workspaces that resolves an arbitrary one and starts a
-   session for it. It is not a regression from this merge — it predates the branch — and
-   it cannot be fixed in place, because a Platform route with no `wid` has nothing to
-   scope BY. That is the argument for doing D11's mint half rather than deferring it:
-   until the workspace reaches this function, OAuth login on a multi-tenant instance is
-   guessing.
+The endpoint is reached at `https://<public_host>/v1/auth/sso`, because landing the cookie on
+the tenant's own domain is the entire reason the hand-off exists. So resolving the workspace
+from the token's `wid` — which is what the merge left — is wrong: a token for workspace A
+presented on **B's** host has a valid signature, a `wid` that resolves, and an `aud` that
+matches A's host, so it would quietly create **A's session on B's domain**.
 
-2. **Which state field carries the workspace.** ⚠️ **Not `EncryptState` — that is a
-   provider-client helper (`internal/zoom`, `internal/caldav`, gcal) for the CONNECT
-   flows, and it encrypts a user id.** The login flow's state is different and simpler:
-   `newOAuthState` mints a 16-byte random nonce, returns it as the `state` URL parameter
-   and sets the same value in the HttpOnly `calnode_oauth_state` cookie; the callback
-   compares the two and consumes the cookie. There is no room in it for a workspace and
-   no signature over it.
+Now: resolve by `workspaceByHost`, then require `wid == that workspace's id` (403
+`{"error":"workspace mismatch"}`, D10's body) and `aud == "https://" + that public host`, no
+trailing slash. Unknown host 404, suspended 503. Single-tenant unchanged: `wid` ignored, `aud`
+is `BASE_URL`.
 
-   So the workspace goes in the **cookie half**, not the URL half: make the cookie value
-   `<nonce>|<wid>`, keep sending the bare nonce as the `state` parameter, and have the
-   callback split the cookie, compare the nonce, and take the `wid`. The visitor can
-   rewrite the URL parameter, which then simply fails the comparison; the half that is
-   trusted is the half only we ever wrote. `consumeOAuthReturn` (defined in
-   `mcp_oauth_authorize.go`, called from `finishOAuthLogin`) is the precedent: a second
-   piece of callback context riding a cookie rather than a URL.
+Negative control, the resolution put back on `wid`:
 
-   The workspace is known at the login START (`GET /v1/auth/login`), from the Host the
-   person clicked "sign in with Google" on. ⚠️ That route is **Platform** today because
-   the callbacks have to be, so B6 must resolve the workspace there explicitly with
-   `workspaceByHost` and 404 an unknown host exactly as `HostWorkspace` would — a resolver
-   cannot do it, or the callback would need a tenant Host it does not have.
+```
+--- FAIL: TestSSOHandoff_tokenForAnotherWorkspaceIsRefusedOnThisHost
+    status = 302; want 403 — <a href="/admin/">Found</a>.
+--- FAIL: TestOAuthHandoff_mintedTokenIsRefusedOnAnotherWorkspacesHost
+    status = 302; want 403
+```
 
-3. **How the token is minted.** Reuse `sso.go`'s own claim shape, signed with
-   `CALNODE_SSO_SHARED_SECRET` (HS256, the verifier is deliberately not a JWT library) —
-   ⛔ which means the SSO endpoint must be CONFIGURED for multi-tenant OAuth login to
-   work at all, and `config.Validate` should refuse `MULTI_TENANT` + a Google or Microsoft
-   OAuth app + an empty `CALNODE_SSO_SHARED_SECRET` rather than letting every social login
-   500 at the last step. Claims: `iss` = this instance's `BASE_URL`, `aud` =
-   `https://<ws.public_host>` (what `ssoAudience` checks), `wid` = the state's workspace,
-   `sub` = the verified email from the provider, `name`, `role` = `member` (the OAuth
-   callback is not an authority on roles; `ssoResolveUser` leaves an existing user's role
-   alone and a new one is a member unless an invite said otherwise), `iat`/`exp` = now and
-   now + 30s, `jti` = `uid.New()`. Then
-   `302 https://<ws.public_host>/v1/auth/sso?token=…&next=<destination>`, where
-   `<destination>` is what `finishOAuthLogin` would have redirected to itself: `/admin`,
-   or the `consumeOAuthReturn` value when the login was started by an MCP Connect flow
-   (already validated by `safeLocalPath`, which permits only `/oauth/authorize`).
-   ⚠️ **That second case needs a decision, not a copy.** `/oauth/authorize` is an identity-host
-   endpoint and its consent-step cookies were set there, so sending it to the tenant's public
-   host would arrive with none of them. Either keep the Connect flow's tail on the identity
-   host (mint no token, set the cookie there as today, since an MCP consent is not a
-   booker-facing surface) or hand off first and bounce back — the first is smaller and is
-   what the shape of the rest of D11 suggests.
-   ⚠️ The `next` value must go through `ssoNextPath`'s rules on the way in, not just on
-   the way out, or the redirect the callback builds is an open redirect that happens to be
-   validated one hop later.
-   ⚠️ And the calendar connect callbacks are the same shape but NOT the same fix: they
-   store tokens rather than mint a session, so they need the state's `wid` to write the
-   `calendar_connections` row through `forWorkspace(ws)` and then redirect to that
-   workspace's `/admin/calendar?connected=true` — no SSO token involved.
+That 302 IS the bug: one tenant's session created on another tenant's domain.
 
+### The state cookie carries the workspace; the URL carries only the nonce
+
+`newOAuthState(w, workspaceID)` writes `<nonce>|<workspace_id>` into the HttpOnly
+`calnode_oauth_state` cookie and sends only the nonce to the provider.
+`verifyOAuthState` compares the nonce and **reads** the workspace.
+
+⛔ That split is the security property. A visitor can rewrite the `state` query parameter —
+doing so produces a failed login. The value that decides which tenant a Google identity is
+admitted to never left this server's cookie. Putting the workspace in the URL instead would let
+anyone choose the tenant they are let into.
+
+The workspace is resolved at the login START (`GET /v1/auth/login`, from the Host the person
+clicked on), because the callback arrives on the identity host and cannot know it. That route
+is `Platform`-wrapped — it has to be, since its callback is — so it calls `workspaceByHost`
+explicitly and 404s an unrecognised host, doing by hand exactly what `HostWorkspace` would.
+
+### `finishOAuthLogin`: two bugs, one of them live before this
+
+1. ⛔ **The lookup was `WHERE email = ?` on the platform handle.** Since D9 the unique on
+   `users` is `(workspace_id, email)`, so the same address in several workspaces is ordinary —
+   and that statement resolves an **arbitrary** one of them and starts a session for a
+   stranger. Now scoped by `workspace_id`, in both modes (`'default'` in single-tenant, where
+   every row carries it), so there is one statement and no branch to drift.
+2. **The session is no longer set here in multi-tenant mode.** The callback runs on the
+   identity host; a cookie for it is no use to a person whose admin UI is on their own domain.
+   It mints a 30 s HS256 token (`iss` = BASE_URL, `aud` = `https://<public_host>`, `wid`,
+   `role = member`, `jti`) and redirects to that workspace's `/v1/auth/sso`.
+
+`role = member` always: the callback knows that Google or Microsoft vouched for an address,
+which says nothing about what that person may do here. `ssoResolveUser` leaves an existing
+user's role alone, so the value only ever applies to a user it creates.
+
+⛔ **No shared secret ⇒ refuse.** With `CALNODE_SSO_SHARED_SECRET` unset the hand-off endpoint
+404s, so there is nowhere to land; setting a cookie on the identity host instead would produce
+a session the person's own admin UI cannot see. `error=sso`, no session.
+
+⚠️ **The MCP Connect return keeps its identity-host cookie tail**, deliberately:
+`/oauth/authorize` is an identity-host endpoint whose consent-step cookies were set there, so
+handing it to a tenant's public host would arrive with none of them.
+
+### The calendar callback resolves its workspace from the state's USER
+
+`p.Exchange` writes `calendar_connections` through a provider that captured a handle at
+construction. On this `Platform` route that is the **unbound** handle, so the connection
+appeared to succeed and no row existed. Now the workspace comes from `workspaceOfUser` on the
+state's user id — the state is encrypted, so the id cannot be forged — the exchange runs
+through `forWorkspace(ws).getCal()`'s provider (B5's `Provider.ForDB`), and the redirect goes
+to that workspace's `publicURL()` rather than `h.baseURL`, which would have sent the person
+somewhere their session does not exist.
+
+⚠️ The workspace is deliberately **not** also carried in the calendar state: it would be a
+second copy of a fact the user id already settles, and two sources of one truth is how they
+come to disagree.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean.
+`go test -count=1 ./...` **rc=0 on SQLite (30/30)**. PostgreSQL: `internal/handler` **rc=0**
+(302.5s), `internal/server` **rc=0**.
+
+```
+--- PASS: TestSSOHandoff_multiTenantLandsInTheTokensWorkspace (0.96s)
+--- PASS: TestSSOHandoff_tokenForAnotherWorkspaceIsRefusedOnThisHost (0.90s)
+--- PASS: TestSSOHandoff_multiTenantRefusesABadWID (3.49s)     [missing, empty, unknown, not an id]
+--- PASS: TestSSOHandoff_multiTenantAudienceIsThePublicHost (2.40s)  [identity host, bare host, trailing slash]
+--- PASS: TestSSOHandoff_multiTenantReplayIsRefused (0.77s)
+--- PASS: TestSSOHandoff_unknownHostIs404 (0.73s)
+--- PASS: TestSSOHandoff_multiTenantRefusesASuspendedWorkspace (0.71s)
+--- PASS: TestOAuthHandoff_callbackMintsATokenTheSSOEndpointAccepts (0.76s)
+--- PASS: TestOAuthHandoff_mintedTokenIsRefusedOnAnotherWorkspacesHost (0.72s)
+--- PASS: TestOAuthHandoff_refusesWithoutTheSharedSecret (0.76s)
+```
+
+⚠️ **A trap the test bridge paid for.** Driving `finishOAuthLogin` on the bare handler reported
+`no_account` for a user that exists: the tail's lookup runs on whatever handle the route gives
+it, and on the bare handler that is the **unbound application** handle, which matches no row.
+The bridge goes through `h.Platform(...)` as `server.New` does. A test that had accepted the
+bare handler would have been asserting against the wrong handle.
+
+### Still owed by B6
+
+Only the vendor webhooks: `POST /v1/livekit/webhook` (+ its alias) and `POST /v1/stripe/webhook`
+must resolve their workspace from the room or session row they name, then hand off to
+`forWorkspace`. D12, D13 and D14 are done.
+
+## D11 — the plan this replaced
+
+⚠️ This file carried a plan for the SSO mint half between the merge and part three above.
+It is now BUILT, and part three is the record; the plan is deleted rather than annotated,
+because a plan left beside its implementation is the next reader's wrong answer. Two of its
+three points survived contact unchanged (the callback to change, and the `<nonce>|<wid>`
+state cookie). The third did not: the plan had the SSO endpoint resolving its workspace from
+`wid`, and doing that on a public host is what part three had to fix.

@@ -91,6 +91,43 @@ func (h *Handler) CalendarCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ⛔ The workspace comes from the STATE, via the user it names, and the exchange runs
+	// bound to it. This route is Platform-wrapped — the callback arrives on the identity host
+	// with no tenant Host and no session — so h and its calendar providers hold the UNBOUND
+	// handle, which under the policies writes nothing: the connection would appear to succeed
+	// and no calendar_connections row would exist.
+	//
+	// The state is encrypted (the provider's own EncryptState), so the user id inside it
+	// cannot be forged, and workspaceOfUser resolves the tenant from it on the platform
+	// handle. That is why the workspace is not ALSO carried in the state: it would be a second
+	// copy of a fact the user id already settles, and two sources of one truth is how they
+	// come to disagree.
+	scoped := h
+	if h.multiTenant {
+		wsID, wsErr := h.workspaceOfUser(r.Context(), userID)
+		if wsErr != nil {
+			h.logger.ErrorContext(r.Context(), "calendar callback: resolve workspace",
+				"error", wsErr, "user_id", userID)
+			h.writeError(w, http.StatusBadRequest, "invalid or missing state")
+			return
+		}
+		ws, wsErr := h.workspaceByID(r.Context(), wsID)
+		if wsErr != nil {
+			h.logger.ErrorContext(r.Context(), "calendar callback: read workspace",
+				"error", wsErr, "workspace_id", wsID)
+			h.writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		scoped = h.forWorkspace(ws)
+		// The provider has to be the workspace's own, not the process-wide registry's: each
+		// captures a *db.DB at construction (B5, calendar.Provider.ForDB).
+		if svcScoped := scoped.getCal(); svcScoped != nil {
+			if pr := svcScoped.Provider(p.Name()); pr != nil {
+				p = pr
+			}
+		}
+	}
+
 	if err := p.Exchange(r.Context(), userID, code, "primary"); err != nil {
 		h.logger.ErrorContext(r.Context(), "calendar callback: exchange", "error", err, "user_id", userID)
 		h.writeError(w, http.StatusInternalServerError, "internal error")
@@ -99,7 +136,9 @@ func (h *Handler) CalendarCallback(w http.ResponseWriter, r *http.Request) {
 	// Multi-calendar: connecting is additive. The first connection becomes the destination
 	// (handled in the provider's saveToken); subsequent ones are conflict-check only.
 
-	http.Redirect(w, r, h.baseURL+"/admin/calendar?connected=true", http.StatusFound)
+	// Back to the workspace's own admin UI, which is on its public host — h.baseURL is the
+	// identity host and would send the person somewhere their session does not exist.
+	http.Redirect(w, r, scoped.publicURL()+"/admin/calendar?connected=true", http.StatusFound)
 }
 
 // ConnectCalDAV handles POST /v1/calendar/caldav/connect (auth required). CalDAV is

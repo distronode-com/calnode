@@ -59,6 +59,24 @@ type ssoClaims struct {
 	WID string `json:"wid"`
 }
 
+// signSSOToken produces the compact HS256 JWS the verifier below accepts. It is the mint
+// half of D11, used by the OAuth callbacks.
+//
+// ⛔ Deliberately NOT a JWT library, for the same reason verifySSOToken is not one: one
+// algorithm, one key, a fixed claim set, and no dependency to keep current. The two halves
+// live beside each other so a change to either is made looking at the other.
+func signSSOToken(claims ssoClaims, secret string) (string, error) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("sso: marshal claims: %w", err)
+	}
+	signingInput := header + "." + base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signingInput))
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
 // The three ways the wid claim fails. All three are 401 with the message in the body:
 // the token is the caller's, and so is the mistake. They are sentinels rather than
 // strings so SSOHandoff can tell them from a database error, which is a 500.
@@ -121,9 +139,12 @@ func (h *Handler) SSOHandoff(w http.ResponseWriter, r *http.Request) {
 	// The workspace comes from the token, after the signature and before anything is
 	// written. Resolved here rather than in Scoped because this route is Platform: no
 	// tenant Host, no credential yet, so the `wid` claim is the only source (D11).
-	ws, err := h.ssoWorkspace(r.Context(), claims)
+	ws, err := h.ssoWorkspace(r.Context(), r, claims)
 	switch {
-	case errors.Is(err, errWorkspaceSuspended):
+	case errors.Is(err, errWorkspaceSuspended), errors.Is(err, errUnknownHost), errors.Is(err, errWorkspaceMismatch):
+		// 503, 404 and 403 respectively, from the one place that maps a resolution failure
+		// to a response. A mismatch is 403 {"error":"workspace mismatch"} (D10), the same
+		// answer an API key from another workspace gets on this host.
 		h.writeResolveError(w, r, err)
 		return
 	case errors.Is(err, errSSOWIDRequired), errors.Is(err, errSSOUnknownWID), errors.Is(err, errSSONoPublicHost):
@@ -195,28 +216,18 @@ func (h *Handler) SSOHandoff(w http.ResponseWriter, r *http.Request) {
 //
 // Single-tenant: the one workspace, and `wid` is ignored (see the claim's comment).
 //
-// Multi-tenant: the `wid` claim, read back through the platform handle so a token
-// naming a deleted or suspended workspace is refused rather than creating a user
-// nothing can reach. A workspace with no public_host is refused too: the hand-off
-// exists to set a cookie on a tenant's own domain, and a tenant without one has no
-// domain for the token to be bound to.
-func (h *Handler) ssoWorkspace(ctx context.Context, claims ssoClaims) (*Workspace, error) {
+// ⛔ Multi-tenant: the workspace of the REQUEST HOST, with the token's `wid` checked against
+// it. Resolving from the host rather than from the token is what makes a stolen or
+// misdirected token useless: this endpoint is reached at `https://<public_host>/v1/auth/sso`
+// precisely so the session cookie lands on the tenant's own domain, so a token for workspace
+// A presented on workspace B's host must be REFUSED (403) rather than quietly creating A's
+// session on B's domain. Trusting `wid` alone would do exactly that.
+func (h *Handler) ssoWorkspace(ctx context.Context, r *http.Request, claims ssoClaims) (*Workspace, error) {
 	if !h.multiTenant {
 		return DefaultWorkspace, nil
 	}
-	wid := strings.TrimSpace(claims.WID)
-	if wid == "" {
-		return nil, errSSOWIDRequired
-	}
-	if !db.ValidWorkspaceID(wid) {
-		return nil, errSSOUnknownWID
-	}
-	ws, err := h.workspaceByID(ctx, wid)
-	switch {
-	case errors.Is(err, errNoWorkspace):
-		// The id is well-formed and names nothing. The caller's mistake, not a fault.
-		return nil, errSSOUnknownWID
-	case err != nil:
+	ws, err := h.workspaceByHost(ctx, r.Host)
+	if err != nil {
 		return nil, err
 	}
 	if ws.Suspended() {
@@ -224,6 +235,13 @@ func (h *Handler) ssoWorkspace(ctx context.Context, claims ssoClaims) (*Workspac
 	}
 	if ws.PublicHost == "" {
 		return nil, errSSONoPublicHost
+	}
+	wid := strings.TrimSpace(claims.WID)
+	if wid == "" {
+		return nil, errSSOWIDRequired
+	}
+	if wid != ws.ID {
+		return nil, fmt.Errorf("%w: token names %s, host %s is %s", errWorkspaceMismatch, wid, ws.PublicHost, ws.ID)
 	}
 	return ws, nil
 }

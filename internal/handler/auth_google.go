@@ -43,7 +43,21 @@ func (h *Handler) LoginGoogle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Google OAuth not configured — set GOOGLE_CLIENT_ID", http.StatusServiceUnavailable)
 		return
 	}
-	state, err := h.newOAuthState(w)
+	// ⛔ The workspace is resolved HERE, from the Host the person clicked "sign in" on. The
+	// callback arrives on the identity host and cannot resolve it, which is why it rides the
+	// state cookie. /v1/auth/login is Platform-wrapped (it has to be, because its callback
+	// is), so this does explicitly what HostWorkspace would have done — including 404 on a
+	// host that names no workspace, rather than defaulting to a tenant nobody chose.
+	loginWorkspace := ""
+	if h.multiTenant {
+		ws, wsErr := h.workspaceByHost(r.Context(), r.Host)
+		if wsErr != nil {
+			h.writeResolveError(w, r, wsErr)
+			return
+		}
+		loginWorkspace = ws.ID
+	}
+	state, err := h.newOAuthState(w, loginWorkspace)
 	if err != nil {
 		h.logger.ErrorContext(r.Context(), "auth: generate state", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -62,7 +76,8 @@ func (h *Handler) CallbackGoogle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify CSRF state (cookie must match the URL param) and consume it.
-	if !h.verifyOAuthState(w, r) {
+	stateWorkspace, stateOK := h.verifyOAuthState(w, r)
+	if !stateOK {
 		http.Redirect(w, r, "/admin/login?error=state", http.StatusFound)
 		return
 	}
@@ -88,7 +103,7 @@ func (h *Handler) CallbackGoogle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Only existing users can log in — no self-registration.
-	h.finishOAuthLogin(w, r, info.Email)
+	h.finishOAuthLogin(w, r, info.Email, stateWorkspace)
 }
 
 // Logout deletes the session record and clears the session cookie.
