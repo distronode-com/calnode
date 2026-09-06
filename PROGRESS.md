@@ -2176,6 +2176,32 @@ what says the `appDB` change did not move anything else.
 
 ---
 
+# Boundaries 1–7 — COMPLETE. Phase 1 of the fork is gated
+
+B1 config + schema, B2 the two handles, B3 handler scoping and resolution, B4 per-tenant state,
+B5 the background loops, B6 the platform API + hand-off + vendor webhooks, **B7 the proof, the
+cost measurement and `docs/MULTI_TENANT.md`**.
+
+The B7 gate lines, in one place:
+
+```
+gofmt -l .                          empty
+go vet ./...                        clean
+go build ./...                      clean
+go test -count=1 ./...              rc=0 on SQLite, 30/30 packages
+PostgreSQL, per package:            internal/server rc=0, internal/handler rc=0,
+                                    internal/db rc=0, internal/worker rc=0, internal/webhook rc=0
+go test -race ./internal/server/ -run TestProof     rc=0, no data race
+
+--- PASS: TestProof_noRouteLeaksAnotherWorkspace     138 tenant routes as A, 61 answered 2xx
+--- PASS: TestProof_everyMCPToolIsScoped             10 tools, derived from tools/list
+--- PASS: TestProof_everyWorkerJobTypeIsCoveredAndScoped   4 job types, derived from two sources
+--- PASS: TestProof_unscopedQueryReturnsNothing      6 tables, both halves
+--- PASS: TestRSS_200Workspaces                      34.6 KB per tenant
+
+negative control (wrong password): internal/db FAILS with SQLSTATE 28P01 rather than skipping
+```
+
 # Boundary 6 — done. D11, D12, D13, D14 all closed
 
 | decision | state |
