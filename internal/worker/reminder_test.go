@@ -2,12 +2,15 @@ package worker_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/calnode/calnode/internal/db"
 	"github.com/calnode/calnode/internal/mailer"
 	"github.com/calnode/calnode/internal/worker"
 )
@@ -224,5 +227,174 @@ func TestWorker_reminderNotFiredBeforeRunAt(t *testing.T) {
 	database.QueryRowContext(ctx, `SELECT status FROM jobs WHERE id = 'job-f1'`).Scan(&jobStatus)
 	if jobStatus != "pending" {
 		t.Errorf("job status = %q; want pending", jobStatus)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// reminder.send → booking.reminder webhook
+// ---------------------------------------------------------------------------
+
+// seedReminderBooking creates an event type, a confirmed booking 25h out, its organizer,
+// and a due reminder.send job carrying hoursBefore.
+func seedReminderBooking(t *testing.T, database *db.DB, suffix string, hoursBefore int) {
+	t.Helper()
+	ctx := context.Background()
+	pastRunAt := time.Now().UTC().Add(-time.Second).Format(time.RFC3339)
+	start := time.Now().UTC().Add(25 * time.Hour).Format(time.RFC3339)
+
+	stmts := []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO event_types (id, user_id, slug, name, duration_minutes) VALUES (?, 'host-01', ?, 'Reminder Meeting', 30)`,
+			[]any{"et-" + suffix, "rem-hook-" + suffix}},
+		{`INSERT INTO bookings (id, event_type_id, host_id, start_at, end_at, status) VALUES (?, ?, 'host-01', ?, ?, 'confirmed')`,
+			[]any{"bk-" + suffix, "et-" + suffix, start, start}},
+		{`INSERT INTO booking_attendees (id, booking_id, name, email, iana_timezone, is_organizer) VALUES (?, ?, 'Alice', 'alice@example.com', 'UTC', 1)`,
+			[]any{"att-" + suffix, "bk-" + suffix}},
+		{`INSERT INTO jobs (id, type, payload, run_at, status, attempts, max_attempts) VALUES (?, 'reminder.send', ?, ?, 'pending', 0, 3)`,
+			[]any{"job-" + suffix,
+				fmt.Sprintf(`{"booking_id":"bk-%s","hours_before":%d}`, suffix, hoursBefore),
+				pastRunAt}},
+	}
+	for _, s := range stmts {
+		if _, err := database.ExecContext(ctx, s.sql, s.args...); err != nil {
+			t.Fatalf("seed %s: %v", suffix, err)
+		}
+	}
+}
+
+// deliveryPayloadFor returns the single webhook delivery payload for an event.
+func deliveryPayloadFor(t *testing.T, database *db.DB, event string) string {
+	t.Helper()
+	var payload string
+	if err := database.QueryRow(
+		`SELECT payload FROM webhook_deliveries WHERE event = ?`, event).Scan(&payload); err != nil {
+		t.Fatalf("no %s delivery: %v", event, err)
+	}
+	return payload
+}
+
+func TestWorker_reminderFiresBookingReminderWebhook(t *testing.T) {
+	database, svc := setup(t)
+	ctx := context.Background()
+	seedReminderBooking(t, database, "rw1", 24)
+
+	if _, _, err := svc.Create(ctx, "host-01", "https://hook.example.test/x",
+		[]string{"booking.reminder"}); err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+
+	w := worker.New(database, svc, slog.Default(),
+		worker.WithMailer(&captureMailer{}), worker.WithHTTPClient(&http.Client{}))
+	w.Poll(ctx)
+
+	payload := deliveryPayloadFor(t, database, "booking.reminder")
+	var env struct {
+		Event string `json:"event"`
+		Data  struct {
+			ID            string `json:"id"`
+			HostID        string `json:"host_id"`
+			Status        string `json:"status"`
+			EventTypeSlug string `json:"event_type_slug"`
+			StartAt       string `json:"start_at"`
+			HoursBefore   int    `json:"hours_before"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(payload), &env); err != nil {
+		t.Fatalf("decode payload %s: %v", payload, err)
+	}
+	if env.Event != "booking.reminder" {
+		t.Errorf("event = %q; want booking.reminder", env.Event)
+	}
+	// Booking-shaped, exactly like the other booking events.
+	if env.Data.ID != "bk-rw1" || env.Data.HostID != "host-01" || env.Data.Status != "confirmed" {
+		t.Errorf("data = %+v; want the booking's own id/host/status", env.Data)
+	}
+	if env.Data.EventTypeSlug != "rem-hook-rw1" || env.Data.StartAt == "" {
+		t.Errorf("data = %+v; want the event type slug and start time", env.Data)
+	}
+	// Plus the one field that makes the event useful: which reminder fired.
+	if env.Data.HoursBefore != 24 {
+		t.Errorf("hours_before = %d; want 24", env.Data.HoursBefore)
+	}
+}
+
+// An event type can have several reminders, so the delivery has to say which one this is.
+func TestWorker_reminderWebhookCarriesTheFiringOffset(t *testing.T) {
+	database, svc := setup(t)
+	ctx := context.Background()
+	seedReminderBooking(t, database, "rw2", 1)
+
+	if _, _, err := svc.Create(ctx, "host-01", "https://hook.example.test/x",
+		[]string{"booking.reminder"}); err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+
+	w := worker.New(database, svc, slog.Default(),
+		worker.WithMailer(&captureMailer{}), worker.WithHTTPClient(&http.Client{}))
+	w.Poll(ctx)
+
+	if payload := deliveryPayloadFor(t, database, "booking.reminder"); !strings.Contains(payload, `"hours_before":1`) {
+		t.Errorf("payload = %s; want hours_before 1", payload)
+	}
+}
+
+// A webhook subscribed to other events must not start receiving reminders.
+func TestWorker_reminderWebhookOnlyForSubscribers(t *testing.T) {
+	database, svc := setup(t)
+	ctx := context.Background()
+	seedReminderBooking(t, database, "rw3", 24)
+
+	if _, _, err := svc.Create(ctx, "host-01", "https://hook.example.test/x",
+		[]string{"booking.created", "booking.cancelled"}); err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+
+	w := worker.New(database, svc, slog.Default(),
+		worker.WithMailer(&captureMailer{}), worker.WithHTTPClient(&http.Client{}))
+	w.Poll(ctx)
+
+	var n int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM webhook_deliveries WHERE event = 'booking.reminder'`).Scan(&n); err != nil {
+		t.Fatalf("count deliveries: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("deliveries = %d; want 0 for a webhook not subscribed to booking.reminder", n)
+	}
+}
+
+// The host turned reminder emails off, so no reminder happened and there is nothing to
+// announce. The event means "the attendee has been reminded", not "a job ran".
+func TestWorker_noReminderWebhookWhenTheEmailIsSuppressed(t *testing.T) {
+	database, svc := setup(t)
+	ctx := context.Background()
+	seedReminderBooking(t, database, "rw4", 24)
+	if _, err := database.ExecContext(ctx,
+		`UPDATE users SET notify_reminder = 0 WHERE id = 'host-01'`); err != nil {
+		t.Fatalf("disable reminder emails: %v", err)
+	}
+
+	if _, _, err := svc.Create(ctx, "host-01", "https://hook.example.test/x",
+		[]string{"booking.reminder"}); err != nil {
+		t.Fatalf("create webhook: %v", err)
+	}
+
+	m := &captureMailer{}
+	w := worker.New(database, svc, slog.Default(),
+		worker.WithMailer(m), worker.WithHTTPClient(&http.Client{}))
+	w.Poll(ctx)
+
+	if len(m.sent) != 0 {
+		t.Fatalf("sent %d emails; want 0", len(m.sent))
+	}
+	var n int
+	if err := database.QueryRow(
+		`SELECT COUNT(*) FROM webhook_deliveries WHERE event = 'booking.reminder'`).Scan(&n); err != nil {
+		t.Fatalf("count deliveries: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("deliveries = %d; want 0 when no reminder was sent", n)
 	}
 }

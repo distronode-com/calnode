@@ -57,6 +57,9 @@ const (
 	FieldPaymentStatus   = "payment_status"
 	FieldAmountPaid      = "amount_paid_cents"
 	FieldCurrency        = "amount_paid_currency"
+	// FieldHoursBefore only ever has a value on booking.reminder, where it says which
+	// configured reminder fired (an event type may have several). Omitted elsewhere.
+	FieldHoursBefore = "hours_before"
 )
 
 // AllFields is every selectable field, in payload order. Used to validate config
@@ -68,16 +71,20 @@ var AllFields = []string{
 	FieldHostID, FieldHostName, FieldHostEmail,
 	FieldAttendeeName, FieldAttendeeEmail, FieldAttendeeTZ, FieldAnswers,
 	FieldPaymentStatus, FieldAmountPaid, FieldCurrency,
+	FieldHoursBefore,
 }
 
 // defaultFields reproduces the original payload (no PII, no answers) so a webhook with no
 // field config (fields IS NULL) keeps its historical shape. Payment fields are included but
 // omitempty, so free bookings are byte-identical to before; only paid bookings gain them.
+// hours_before is the same bargain: it is zero on every event except booking.reminder,
+// which did not exist when a webhook with no field config was created.
 var defaultFields = []string{
 	FieldID, FieldEventTypeSlug, FieldHostID, FieldStartAt, FieldEndAt,
 	FieldStatus, FieldLocation, FieldCancelReason, FieldCreatedAt,
 	FieldPreviousStartAt, FieldPreviousEndAt,
 	FieldPaymentStatus, FieldAmountPaid, FieldCurrency,
+	FieldHoursBefore,
 }
 
 var validField = func() map[string]bool {
@@ -127,6 +134,9 @@ type BookingPayload struct {
 	PaymentStatus      string `json:"payment_status,omitempty"`
 	AmountPaidCents    int    `json:"amount_paid_cents,omitempty"`
 	AmountPaidCurrency string `json:"amount_paid_currency,omitempty"`
+	// HoursBefore is set only on booking.reminder: which of the event type's configured
+	// reminders this delivery is for.
+	HoursBefore int `json:"hours_before,omitempty"`
 }
 
 type Service struct {
@@ -357,6 +367,11 @@ func buildData(bd enrichedBooking, fields []string) map[string]any {
 			out[f] = v
 		} else if f == FieldAmountPaid && bd.core.AmountPaidCents > 0 {
 			out[f] = bd.core.AmountPaidCents
+		} else if f == FieldHoursBefore && bd.core.HoursBefore > 0 {
+			// Same rule as the paid amount: the two numeric fields are omitted at zero
+			// rather than emitted as 0, which on an event that has no reminder attached
+			// would read as "0 hours before".
+			out[f] = bd.core.HoursBefore
 		}
 	}
 	return out

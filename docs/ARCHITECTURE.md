@@ -745,14 +745,27 @@ as the desired state:
   reset to pending +1 min). Retry **backoff is a fixed two-step: 60s then 5 min**
   (not exponential), `max_attempts` 3. Atomic claim via
   `UPDATE … WHERE status='pending'` + RowsAffected.
-- `internal/webhook`: enqueues `booking.created` / `.cancelled` / `.rescheduled`
-  plus the notetaker events `recording.completed` / `transcript.ready` / `notes.ready`
+- `internal/webhook`: enqueues `booking.created` / `.cancelled` / `.rescheduled` /
+  `.reminder` plus the notetaker events `recording.completed` / `transcript.ready` /
+  `notes.ready`
   (reference payloads — booking-shaped, keyed by id; consumers fetch the artifact body
-  via REST/MCP). There is **no** `booking.reminder` webhook event. Deliveries are signed
+  via REST/MCP). Deliveries are signed
   **HMAC-SHA256**, header `X-Calnode-Signature` (+ `X-Calnode-Event`/`-Delivery`),
   secret stored encrypted. The worker's HTTP client is **SSRF-guarded** (resolves
   DNS, blocks private/loopback/CGNAT/ULA IPs, dials the resolved IP to avoid
   re-resolution) since webhook URLs are user-supplied.
+- **`booking.reminder`** is fired by the `reminder.send` job (`internal/worker`), booking-shaped
+  like its siblings plus **`hours_before`** — an event type can configure several reminders, so
+  the payload has to say which one this is. It carries no payment fields: those come from
+  create/cancel, and `paymentStatusForWebhook`'s mapping lives in the handler package.
+  ⛔ **Fired after the email and only on success**, because the event means "the attendee has
+  been reminded". Emitting it beside a failed send would be untrue, and the job retries — which
+  would deliver it twice for one reminder. Conversely an *enqueue* failure does **not** fail the
+  job: the email has already gone and a retry would send a second one, so it is logged and
+  dropped. `sendReminder`'s early returns (booking deleted, no longer confirmed, host has
+  reminder emails off) are all "no reminder happened", so none of them fires it either.
+  ⚠️ The event needs the **booking's** `host_id`, not the event type's owner — a rotation or a
+  reassignment moves it, and `Enqueue` selects a subscriber's webhooks by that id.
 - **Per-webhook payload fields:** each webhook chooses which fields land in the `data`
   object (`webhooks.fields` JSON, migration 00027) — incl. attendee PII + intake
   answers. NULL ⇒ the original default set (so existing webhooks are unchanged and

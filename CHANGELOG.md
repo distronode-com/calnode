@@ -12,6 +12,17 @@ exact tag (`ghcr.io/calnode/calnode:0.1.0`) if you need stability between upgrad
 ## [Unreleased]
 
 ### Added
+- **`booking.reminder` webhook event.** Reminders were email-only, so an integration had no
+  way to know one had gone out — you could hear about a booking being made, moved or
+  cancelled, but not about the nudge before it. Subscribe to it in Settings → Webhooks.
+
+  The payload is booking-shaped like the other booking events plus `hours_before`, because
+  an event type can configure several reminders and a subscriber needs to know which one
+  fired. It is sent after the email and only when the email succeeded: the event means the
+  attendee has been reminded, and the job retries, so firing it on a failed send would be
+  both untrue and eventually duplicated. A host who has reminder emails switched off sends
+  no reminder, so there is no event either.
+
 - **`STT_BASE_URL`: choose which speech-to-text endpoint transcribes your recordings.**
   The host was hardcoded, so meeting audio always went to the provider's global endpoint —
   a problem if you need it transcribed inside one jurisdiction. The default is unchanged.

@@ -15,7 +15,7 @@ import (
 )
 
 var validWebhookEvents = []string{
-	"booking.created", "booking.cancelled", "booking.rescheduled",
+	"booking.created", "booking.cancelled", "booking.rescheduled", "booking.reminder",
 	"recording.completed", "transcript.ready", "notes.ready",
 }
 

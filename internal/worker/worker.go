@@ -265,7 +265,8 @@ func (w *Worker) processJob(ctx context.Context, typ, payload string) error {
 
 func (w *Worker) sendReminder(ctx context.Context, payload string) error {
 	var p struct {
-		BookingID string `json:"booking_id"`
+		BookingID   string `json:"booking_id"`
+		HoursBefore int    `json:"hours_before"`
 	}
 	if err := json.Unmarshal([]byte(payload), &p); err != nil {
 		return fmt.Errorf("worker: reminder: parse payload: %w", err)
@@ -279,15 +280,19 @@ func (w *Worker) sendReminder(ctx context.Context, payload string) error {
 	var startAt, endAt, status string
 	var locVal, msgReminder, subjReminder sql.NullString
 	var notifyReminder int
+	// hostID and createdAt are for the booking.reminder webhook below, not the email:
+	// Enqueue selects a subscriber's webhooks by the BOOKING's host, which is not
+	// necessarily the event type's owner (a rotation or a reassignment moves it).
+	var hostID, createdAt string
 	err := w.db.QueryRowContext(ctx, `
-		SELECT b.status, b.start_at, b.end_at, b.location_value,
+		SELECT b.status, b.start_at, b.end_at, b.location_value, b.host_id, b.created_at,
 		       et.name, et.slug, et.msg_reminder, et.subj_reminder,
 		       u.name, u.email, COALESCE(u.notify_reminder, 1)
 		FROM bookings b
 		JOIN event_types et ON et.id = b.event_type_id
 		JOIN users u ON u.id = et.user_id
 		WHERE b.id = ?`, p.BookingID).
-		Scan(&status, &startAt, &endAt, &locVal,
+		Scan(&status, &startAt, &endAt, &locVal, &hostID, &createdAt,
 			&d.EventTypeName, &d.EventTypeSlug, &msgReminder, &subjReminder,
 			&d.HostName, &d.HostEmail, &notifyReminder)
 	if err == sql.ErrNoRows {
@@ -341,6 +346,34 @@ func (w *Worker) sendReminder(ctx context.Context, payload string) error {
 
 	if err := mailer.SendReminder(ctx, w.mailer, d); err != nil {
 		return fmt.Errorf("worker: reminder: send: %w", err)
+	}
+
+	// booking.reminder fires AFTER the email and only on success, because the event means
+	// "this booking's attendee has been reminded". Emitting it beside a failed send would
+	// tell a subscriber something untrue, and the job retries, which would then deliver it
+	// twice for one reminder.
+	//
+	// Conversely, an enqueue failure here must NOT fail the job: the email has already
+	// gone, and a retry would send a second one. Logged and dropped, the same trade every
+	// other webhook enqueue in the tree makes after a committed side effect.
+	//
+	// The early returns above are all "no reminder happened" — booking deleted, no longer
+	// confirmed, host has reminder emails off — so none of them fires this either.
+	if w.svc != nil {
+		if err := w.svc.Enqueue(ctx, "booking.reminder", webhook.BookingPayload{
+			ID:            p.BookingID,
+			EventTypeSlug: d.EventTypeSlug,
+			HostID:        hostID,
+			StartAt:       d.StartAt.UTC().Format(time.RFC3339),
+			EndAt:         d.EndAt.UTC().Format(time.RFC3339),
+			Status:        status,
+			LocationValue: d.LocationValue,
+			CreatedAt:     createdAt,
+			HoursBefore:   p.HoursBefore,
+		}); err != nil {
+			w.logger.Error("worker: reminder: enqueue booking.reminder webhook",
+				"error", err, "booking_id", p.BookingID)
+		}
 	}
 	return nil
 }
