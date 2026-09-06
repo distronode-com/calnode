@@ -65,6 +65,19 @@ func (h *Handler) platformAuthorized(w http.ResponseWriter, r *http.Request) boo
 	return true
 }
 
+// provisionedWebhookEvents is what a provisioned workspace subscribes to: every event this
+// codebase emits. Kept as one named list so the set is reviewable and testable rather than
+// inline in a marshal call.
+var provisionedWebhookEvents = []string{
+	"booking.created",
+	"booking.cancelled",
+	"booking.rescheduled",
+	"booking.reminder",
+	"recording.completed",
+	"transcript.ready",
+	"notes.ready",
+}
+
 // platformWorkspaceRequest is the create body (D12), settled against the website client.
 type platformWorkspaceRequest struct {
 	ID            string `json:"id"`
@@ -214,9 +227,18 @@ func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		events, _ := json.Marshal([]string{
-			"booking.created", "booking.cancelled", "booking.rescheduled", "booking.reminder",
-		})
+		// ⛔ All SEVEN events this codebase emits, not just the booking four. The receiver
+		// on the other side of a provisioned tenancy handles all of them, and a
+		// subscription written with four means the three media events are silently never
+		// delivered — a gap that shows up as "recordings never appear" long after
+		// provisioning, with nothing in either system to point at.
+		//
+		// The three media events fire only when recording or the notetaker is switched on,
+		// so a tenancy without them simply never receives them: subscribing is free, and
+		// not subscribing is a decision the operator cannot see or undo without an API
+		// call nobody knows to make. Enumerated from the tree, not from memory - every
+		// Enqueue call site in internal/ emits one of these and nothing else.
+		events, _ := json.Marshal(provisionedWebhookEvents)
 		// A NULL fields column means "the default payload set" (migration 00027), which
 		// is not the same as an empty selection — so an empty list stays NULL rather than
 		// becoming [], and the webhook keeps the original booking-metadata shape.

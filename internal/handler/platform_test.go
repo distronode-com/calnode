@@ -206,6 +206,46 @@ func TestPlatform_createProvisionsTheWholeWorkspace(t *testing.T) {
 	}
 }
 
+// The event set the provisioned subscription carries, pinned exactly.
+//
+// ⛔ It has to be every event this codebase emits. The receiver on the other side handles
+// all seven, and a subscription short of that means those events are silently never
+// delivered — noticed weeks later as "recordings never appear", with nothing in either
+// system to point at. The three media events fire only when recording or the notetaker is
+// on, so subscribing to them costs a tenancy nothing.
+func TestPlatform_createSubscribesToEveryEmittedEvent(t *testing.T) {
+	routes, _, platform := newPlatformAPI(t)
+
+	if rec := doPlatform(t, routes["create"], http.MethodPost, "/v1/platform/workspaces",
+		platformCreateBody("acme", "book.acme.example"), platformToken); rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d — %s", rec.Code, rec.Body.String())
+	}
+
+	var eventsJSON string
+	if err := platform.QueryRow(
+		`SELECT events FROM webhooks WHERE workspace_id = 'acme'`).Scan(&eventsJSON); err != nil {
+		t.Fatalf("read the subscription: %v", err)
+	}
+	var got []string
+	if err := json.Unmarshal([]byte(eventsJSON), &got); err != nil {
+		t.Fatalf("decode events %q: %v", eventsJSON, err)
+	}
+
+	want := []string{
+		"booking.created", "booking.cancelled", "booking.rescheduled", "booking.reminder",
+		"recording.completed", "transcript.ready", "notes.ready",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("subscribed events = %v; want all %d: %v", got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event %d = %q; want %q (the order is the stored order, so this pins the "+
+				"whole list rather than its membership)", i, got[i], want[i])
+		}
+	}
+}
+
 // Two workspaces provisioned through the same endpoint must not see each other. This is
 // the assertion that would fail if any INSERT above had left workspace_id to the column
 // default.
