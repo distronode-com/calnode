@@ -51,6 +51,21 @@ type Provider interface {
 	Name() string        // "google" | "microsoft"
 	InvitesGuests() bool // provider emails guests itself → suppress our own .ics
 
+	// ForDB returns a copy of this provider reading and writing through handle.
+	//
+	// ⛔ Every provider captures a *db.DB at construction, and every one of its
+	// operations reads calendar_connections / connection_calendars — which are
+	// TENANT tables. On a multi-tenant instance a provider built at boot holds the
+	// UNBOUND application handle, which matches no row, so the whole integration
+	// would be silently inert. This is how a per-request handler gets providers
+	// bound to its workspace.
+	//
+	// The OAuth APP configuration — client id, secret, redirect, encryption key —
+	// is deliberately NOT per workspace (D7): it identifies the Calnode instance to
+	// Google or Microsoft, not the tenant. So this is a shallow copy: same config,
+	// different handle.
+	ForDB(handle *db.DB) Provider
+
 	// OAuth
 	AuthURL(state string) string
 	EncryptState(userID string) (string, error)
@@ -91,6 +106,20 @@ type Service struct {
 // NewService returns an empty Service. Register one provider per configured backend.
 func NewService(db *db.DB) *Service {
 	return &Service{db: db, providers: map[string]Provider{}}
+}
+
+// ForDB returns a copy of s, and of every provider registered in it, bound to
+// handle.
+//
+// The provider map is rebuilt rather than shared, because a Provider owns its own
+// handle. primary is carried over, so which backend claims a new connection does
+// not change per workspace.
+func (s *Service) ForDB(handle *db.DB) *Service {
+	bound := &Service{db: handle, providers: make(map[string]Provider, len(s.providers)), primary: s.primary}
+	for name, p := range s.providers {
+		bound.providers[name] = p.ForDB(handle)
+	}
+	return bound
 }
 
 // Register adds a provider (keyed by Name()); the first registered becomes primary.

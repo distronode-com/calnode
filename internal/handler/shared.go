@@ -44,17 +44,13 @@ type shared struct {
 	stripeCache  *tenantCache[*stripe.Client]
 	livekitCache *tenantCache[*livekit.Client]
 
-	// ⚠️ cal is STILL a process-wide singleton, and this is a documented gap
-	// rather than an oversight. The calendar Service is a registry of PROVIDERS
-	// keyed by the instance's Google/Microsoft OAuth app, which D7 keeps
-	// platform-level, and each provider captures a *db.DB at construction. Making
-	// it per-tenant needs a ForDB on the Service and on all three providers plus
-	// the config plumbing to build them per workspace; until then, on a
-	// multi-tenant instance the captured handle is unbound, so calendar reads
-	// return nothing and the integration is INERT rather than cross-tenant. See
-	// PROGRESS.md.
+	// calBase is the PLATFORM-level provider registry: one Service holding the
+	// instance's Google/Microsoft OAuth apps and the CalDAV client, per D7. It is
+	// never used to read a tenant table directly — calCache holds the per-workspace
+	// copies that Service.ForDB produces, and getCal is the only reader.
 	calMu    sync.RWMutex
-	cal      *calendar.Service
+	calBase  *calendar.Service
+	calCache *tenantCache[*calendar.Service]
 	calNudge chan struct{} // buffered(1): wakes the calendar reconciler after a failed inline op
 
 	baseURL       string

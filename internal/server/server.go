@@ -83,7 +83,23 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	live := mailer.NewLive(&mailer.Noop{})
 
 	// DB settings take priority over env vars — they're what the UI controls.
+	// ⛔ Every LoadXSettingsFromDB below reads server_settings, which is a TENANT
+	// table, through the UNBOUND application handle. In multi-tenant mode that
+	// matches no row, so priming would install nothing and log "not configured" for
+	// an instance whose tenants are all configured — a misleading boot log and a
+	// pointless round trip. The per-workspace caches (D7) build each client from its
+	// own workspace's row on first use instead, so there is nothing to prime.
+	//
+	// Made single-tenant-only rather than removed: it is the only path that seeds
+	// env-var SMTP into the database on first boot, and it is what makes a
+	// single-tenant instance's first request fast rather than lazy.
+	primeFromDB := !cfg.MultiTenant
+
 	dbSMTP, dbErr := handler.LoadEmailSettingsFromDB(db, encKey)
+	if !primeFromDB {
+		dbSMTP, dbErr = nil, nil
+		logger.Info("multi-tenant mode: per-workspace settings are built on first use, not primed at boot")
+	}
 	if dbErr != nil {
 		logger.Warn("mailer: could not load settings from database", "error", dbErr)
 	}
@@ -131,7 +147,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	// DB Google settings take priority over env vars.
 	googleClientID := cfg.GoogleClientID
 	googleClientSecret := cfg.GoogleClientSecret
-	if dbGoogle, dbGoogleErr := handler.LoadGoogleSettingsFromDB(db, encKey); dbGoogleErr != nil {
+	if dbGoogle, dbGoogleErr := loadIfSingleTenant(primeFromDB, func() (*handler.GoogleOAuthConfig, error) { return handler.LoadGoogleSettingsFromDB(db, encKey) }); dbGoogleErr != nil {
 		logger.Warn("google settings: could not load from database", "error", dbGoogleErr)
 	} else if dbGoogle != nil {
 		googleClientID = dbGoogle.ClientID
@@ -190,7 +206,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	}
 
 	// Optional LLM layer (PRD §8.11) — off unless configured + enabled in Settings.
-	if llmCfg, err := handler.LoadLLMSettingsFromDB(db, encKey); err != nil {
+	if llmCfg, err := loadIfSingleTenant(primeFromDB, func() (*handler.LLMConfig, error) { return handler.LoadLLMSettingsFromDB(db, encKey) }); err != nil {
 		logger.Warn("llm: could not load settings from database", "error", err)
 	} else if llmCfg != nil && llmCfg.Enabled && llmCfg.Endpoint != "" {
 		h.SetLLM(llm.New(llm.Config{Endpoint: llmCfg.Endpoint, Model: llmCfg.Model, APIKey: llmCfg.APIKey}))
@@ -203,7 +219,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	// auto-mint meeting links. DB settings take priority over env vars.
 	zoomClientID := cfg.ZoomClientID
 	zoomClientSecret := cfg.ZoomClientSecret
-	if dbZoom, dbZoomErr := handler.LoadZoomSettingsFromDB(db, encKey); dbZoomErr != nil {
+	if dbZoom, dbZoomErr := loadIfSingleTenant(primeFromDB, func() (*handler.ZoomOAuthConfig, error) { return handler.LoadZoomSettingsFromDB(db, encKey) }); dbZoomErr != nil {
 		logger.Warn("zoom settings: could not load from database", "error", dbZoomErr)
 	} else if dbZoom != nil {
 		zoomClientID = dbZoom.ClientID
@@ -223,7 +239,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	}
 
 	// Optional Stripe payments — paid bookings. Off unless configured in Settings → Payments.
-	if dbStripe, dbStripeErr := handler.LoadStripeSettingsFromDB(db, encKey); dbStripeErr != nil {
+	if dbStripe, dbStripeErr := loadIfSingleTenant(primeFromDB, func() (*handler.StripeConfig, error) { return handler.LoadStripeSettingsFromDB(db, encKey) }); dbStripeErr != nil {
 		logger.Warn("stripe settings: could not load from database", "error", dbStripeErr)
 	} else if dbStripe != nil {
 		if sc, err := stripe.New(dbStripe.SecretKey, dbStripe.PublishableKey, dbStripe.WebhookSecret); err != nil {
@@ -237,7 +253,7 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 	}
 
 	// Optional LiveKit video — built-in meeting rooms. Off unless configured in Settings → Video.
-	if dbLK, dbLKErr := handler.LoadLiveKitSettingsFromDB(db, encKey); dbLKErr != nil {
+	if dbLK, dbLKErr := loadIfSingleTenant(primeFromDB, func() (*handler.LiveKitConfig, error) { return handler.LoadLiveKitSettingsFromDB(db, encKey) }); dbLKErr != nil {
 		logger.Warn("livekit settings: could not load from database", "error", dbLKErr)
 	} else if dbLK != nil {
 		h.SetLiveKit(livekit.New(dbLK.URL, dbLK.APIKey, dbLK.APISecret, encKey))
@@ -251,6 +267,17 @@ func BuildHandler(ctx context.Context, cfg *config.Config, db *db.DB, logger *sl
 
 // New wires services via BuildHandler, then registers all HTTP routes. It returns the
 // http.Handler and the worker drain func.
+// loadIfSingleTenant runs a boot-time settings loader only when this instance has
+// one tenant. In multi-tenant mode it returns (nil, nil), which every caller
+// already treats as "not configured in the database" — so the per-workspace cache
+// builds it on first use instead.
+func loadIfSingleTenant[T any](prime bool, load func() (*T, error)) (*T, error) {
+	if !prime {
+		return nil, nil
+	}
+	return load()
+}
+
 // H is handler.Handler under a shorter name, so a registration reads
 // (*H).ListBookings rather than (*handler.Handler).ListBookings 163 times.
 //

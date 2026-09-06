@@ -180,6 +180,7 @@ func New(database *db.DB, logger *slog.Logger) *Handler {
 			logger:       logger,
 			calNudge:     make(chan struct{}, 1),
 			mailerCache:  newTenantCache[mailer.Mailer](),
+			calCache:     newTenantCache[*calendar.Service](),
 			llmCache:     newTenantCache[*llm.Client](),
 			zoomCache:    newTenantCache[*zoom.Client](),
 			stripeCache:  newTenantCache[*stripe.Client](),
@@ -275,18 +276,39 @@ func (h *Handler) getDemoNextResetAt() time.Time {
 	return h.demoNextResetAt
 }
 
-// SetCalendar configures the multi-provider calendar service.
+// SetCalendar installs the platform-level provider registry (nil disables calendar
+// integration). Every cached per-workspace copy is dropped, because each was
+// derived from the registry being replaced.
 func (h *Handler) SetCalendar(c *calendar.Service) {
 	h.calMu.Lock()
-	h.cal = c
+	h.calBase = c
 	h.calMu.Unlock()
+	h.calCache.invalidate(h.cacheKey())
 }
 
-// getCal returns the current calendar service under a read lock (nil if unconfigured).
+// getCal returns this workspace's calendar service, or nil when the instance has
+// no providers configured.
+//
+// ⛔ It must not return calBase. Every provider operation reads
+// calendar_connections and connection_calendars, which are TENANT tables, and the
+// registry holds whichever handle boot gave it — the unbound one on a multi-tenant
+// instance, which matches no row. Service.ForDB rebinds the Service and every
+// provider in it, keeping the OAuth app configuration (D7).
 func (h *Handler) getCal() *calendar.Service {
-	h.calMu.RLock()
-	defer h.calMu.RUnlock()
-	return h.cal
+	return h.calCache.get(h.cacheKey(), func() *calendar.Service {
+		h.calMu.RLock()
+		base := h.calBase
+		h.calMu.RUnlock()
+		if base == nil {
+			return nil
+		}
+		if !h.multiTenant {
+			// One workspace, one handle: rebinding would allocate a second Service
+			// and every provider in it for no behaviour change.
+			return base
+		}
+		return base.ForDB(h.db)
+	})
 }
 
 // getGoogleAuth returns the current Google OAuth config under a read lock.

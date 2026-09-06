@@ -461,3 +461,13 @@ func (c *Client) decryptEncoding(ciphertext string, enc *base64.Encoding) ([]byt
 	}
 	return plain, nil
 }
+
+// ForDB returns a copy of c reading and writing through handle, so a per-request
+// handler can bind Microsoft Graph to its workspace. The OAuth app configuration and
+// the encryption key are instance-level (D7) and are carried over unchanged; only
+// the database handle differs.
+func (c *Client) ForDB(handle *db.DB) calendar.Provider {
+	copied := *c
+	copied.db = handle
+	return &copied
+}

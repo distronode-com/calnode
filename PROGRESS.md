@@ -1144,3 +1144,101 @@ All seven cases pass **under `-race`** on the PostgreSQL lane:
 --- PASS: TestTenantCache_getBuildsOnceUnderContention (0.00s)
 --- PASS: TestTenantCache_llmAndStripeBuildFromTheirOwnRow (1.11s)
 ```
+
+## Boundary 5, part one — the calendar gap closed, and boot priming gated
+
+⚠️ **B5 deliverables 2, 3 and 5 are NOT in this commit** — the worker's claim loop,
+the reconciler, and the CLI subcommands. This lands 1 and 4, which separate
+cleanly from the rest and close the gap B4 left open.
+
+### The calendar gap (deliverable 1) — `ForDB` through the Provider interface
+
+B4 left `getCal` as a process-wide singleton and called it "inert rather than
+cross-tenant". Inert is not shippable: calendar connections are the product.
+
+`calendar.Provider` gains **`ForDB(handle *db.DB) Provider`**, implemented by all
+three backends as a shallow copy with the handle replaced. No import cycle: all
+three already import `internal/calendar` for `CalendarInfo`, and `calendar` imports
+none of them. `calendar.Service.ForDB` rebuilds its provider map through each
+provider's own `ForDB` and carries `primary` over, so which backend claims a new
+connection does not change per workspace.
+
+⛔ **The OAuth APP configuration stays platform-level, per D7** — client id,
+secret, redirect, encryption key identify the *Calnode instance* to Google and
+Microsoft, not the tenant. So `ForDB` is deliberately a shallow copy: same config,
+different handle. `shared` now holds `calBase` (the registry boot installs) and
+`calCache` (the per-workspace bound copies), and **`getCal` is the only reader** —
+returning `calBase` directly is the bug this splits apart.
+
+Single-tenant returns `calBase` itself rather than a rebound copy: one workspace,
+one handle, so rebinding would allocate a second Service and every provider in it
+for no behaviour change. `SetCalendar` invalidates the cache, so `SetCalendar(nil)`
+is visible immediately instead of being shadowed.
+
+**Why CalDAV carries the test:** it needs no instance-level OAuth app, so the test
+is about the handle and not about credentials. Two workspaces, one
+`calendar_connections` row each, then per workspace: `Connected` and
+`HasDestination` are true for its own user and **false for the other's**, with a
+positive control through the platform handle that both rows exist (so a `false` is
+the policy, not an empty table). `Disconnect` is the write half — A asking to
+disconnect B's user must leave B's row intact, whether or not it errors.
+
+Negative control, same shape as the mailer's and in the tree:
+
+```
+calendar_tenancy_test.go:229: key stubbed to "": B's service sees A's connection = true, its own = false
+```
+
+That is one tenant's free/busy deciding another's availability — the failure mode
+that matters here, and it is worse than the mailer's, because it is silent.
+
+### Boot priming (deliverable 4) — made single-tenant-only, not removed
+
+Every `LoadXSettingsFromDB(db, encKey)` in `server.New` reads `server_settings`
+through the **unbound** application handle. In multi-tenant mode that matches no
+row, so priming installed nothing and logged "not configured" for an instance whose
+tenants are all configured — a misleading boot log and six pointless round trips.
+
+`primeFromDB := !cfg.MultiTenant` gates all six through a small
+`loadIfSingleTenant` generic that returns `(nil, nil)` when priming is off, which
+every call site already treats as "not configured in the database". Multi-tenant
+boot now logs once, plainly:
+
+```
+multi-tenant mode: per-workspace settings are built on first use, not primed at boot
+```
+
+**Gated rather than removed**, and the reason is specific: it is the only path that
+seeds env-var SMTP into the database on first boot (`seedSMTPToDB`), and on a
+single-tenant instance it is what makes the first request fast instead of lazy.
+
+### Gates
+
+`gofmt -l .` empty, `go vet ./...` clean, `go build ./...` clean. The four calendar
+cases pass **under `-race`**:
+
+```
+--- PASS: TestCalendar_providersSeeOnlyTheirWorkspace (1.27s)
+    --- PASS: TestCalendar_providersSeeOnlyTheirWorkspace/acme
+    --- PASS: TestCalendar_providersSeeOnlyTheirWorkspace/globex
+--- PASS: TestCalendar_disconnectCannotReachAnotherWorkspace (1.39s)
+--- PASS: TestCalendar_keyIsWhatSeparatesThem (1.35s)
+--- PASS: TestCalendar_singleTenantReusesTheRegistry (0.89s)
+```
+
+### Still owed by B5
+
+2. **Worker.** The claim loop must run on the platform handle across tenants and
+   process each job on `ForWorkspace(job.workspace_id)` with the per-tenant caches.
+   Today it holds one handle from `worker.New(db, …)` and one `*mailer.Live`, so on
+   a multi-tenant instance it claims nothing (`jobs` is a tenant table, the handle
+   is unbound). Two-workspace claim-loop test owed.
+3. **Reconciler.** `StartCalendarReconciler` iterates state on one handle; it needs
+   to enumerate `workspaces` on the platform handle and then run each pass bound.
+   ⚠️ It is started from `server.New` only when `calSvc.Any()`, which after
+   deliverable 4 is still true (providers are registered from env/CalDAV, not from
+   `server_settings`) — so it does run, and it currently runs unbound.
+4. **CLI.** `mcp` (stdio), `reset-admin`, `rotate-key`, `recover-key` still open one
+   handle from `DATABASE_URL`. `rotate-key` and `recover-key` are genuinely
+   platform-wide (`crypto_keystore` is exempt, one DEK per process, D3);
+   `reset-admin` and `mcp` stdio are per-workspace and have no way to say which.
